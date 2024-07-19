@@ -1,0 +1,6 @@
+.git/
+.gitignore
+config.yaml
+Dockerfile
+.dockerignore
+.idea/

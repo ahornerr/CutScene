@@ -63,7 +63,19 @@ func (a *Application) GetUserSessions(user string) ([]operations.GetSessionsMeta
 	return userSessions, nil
 }
 
-func (a *Application) Clip(metadata operations.GetSessionsMetadata, from, to string) (string, error) {
+func (a *Application) Clip(sessionMetadata operations.GetSessionsMetadata, from, to string) (string, error) {
+	ratingKey, err := strconv.ParseFloat(*sessionMetadata.RatingKey, 0)
+	if err != nil {
+		return "", fmt.Errorf("could not parse rating key: %w", err)
+	}
+
+	libraryMetadata, err := a.plex.Library.GetMetadata(context.Background(), ratingKey)
+	if err != nil {
+		return "", fmt.Errorf("could not get library metadata: %w", err)
+	}
+
+	metadata := libraryMetadata.Object.MediaContainer.Metadata[0]
+
 	fileURL := fmt.Sprintf("%s%s?X-Plex-Token=%s",
 		a.config.Plex.Host,
 		*metadata.Media[0].Part[0].Key,
@@ -78,7 +90,7 @@ func (a *Application) Clip(metadata operations.GetSessionsMetadata, from, to str
 	outputMetadata := map[string]string{
 		"title":   *metadata.Title,
 		"comment": from,
-		"artist":  *metadata.User.Title,
+		"artist":  *sessionMetadata.User.Title,
 	}
 
 	var fileName string

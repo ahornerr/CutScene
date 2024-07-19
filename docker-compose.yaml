@@ -1,0 +1,9 @@
+services:
+  cutscene:
+    build:
+      dockerfile: Dockerfile
+      context: .
+    ports:
+      - 8080:8080
+    volumes:
+      - ./config.yaml:/config.yaml
