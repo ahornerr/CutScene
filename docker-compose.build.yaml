@@ -1,0 +1,5 @@
+services:
+  cutscene:
+    build:
+      dockerfile: Dockerfile
+      context: .

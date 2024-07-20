@@ -1,8 +1,6 @@
 services:
   cutscene:
-    build:
-      dockerfile: Dockerfile
-      context: .
+    image: ghcr.io/ahornerr/cutscene:main
     ports:
       - 8080:8080
     volumes:
