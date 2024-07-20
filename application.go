@@ -6,12 +6,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/LukeHagar/plexgo"
-	"github.com/LukeHagar/plexgo/models/operations"
-	ffmpeg "github.com/u2takey/ffmpeg-go"
 	"os/exec"
 	"path/filepath"
 	"strconv"
+
+	"github.com/LukeHagar/plexgo"
+	"github.com/LukeHagar/plexgo/models/operations"
+	ffmpeg "github.com/u2takey/ffmpeg-go"
 )
 
 var (
