@@ -14,6 +14,17 @@ The default [docker-compose.yaml]() file points to the [GitHub Container Registr
 
 You can start this container by simply running `docker compose up`.
 
+### Hardware acceleration
+AMD GPU support on Linux is supported by setting the Ffmpeg codec config to `h264_vaapi` and mounting the `/dev/dri` device in Docker.
+
+This can be done by using the GPU Docker compose override
+
+```sh
+docker compose -f docker-compose.yaml -f docker-compose.gpu.yaml up
+```
+
+This `h264_vaapi` codec and DRI device approach should theoretically also work for Intel Quicksync but is untested.
+
 ## Usage
 
 Hit the app over HTTP passing your plex username and the start/end times of the clip in the request

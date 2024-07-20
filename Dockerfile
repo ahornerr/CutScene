@@ -10,7 +10,7 @@ RUN CGO_ENABLED=0 GOOS=linux go build -o /cutscene
 
 FROM alpine:latest
 
-RUN apk update && apk add ffmpeg
+RUN apk update && apk add ffmpeg mesa-va-gallium
 
 WORKDIR /
 COPY --from=build /cutscene /cutscene
