@@ -1,8 +1,14 @@
-Copy config.example.yaml to config.yaml and update values accordingly
+# CutScene
+
+## Setup
+
+Copy `config.example.yaml` to `config.yaml` and update values accordingly
 
 If you changed the listen address, update the port forward in docker-compose.yaml
 
 Run `docker-compose up --build` to start the app
+
+## Usage
 
 Hit the app over HTTP passing your plex username and the start/end times of the clip in the request
 
