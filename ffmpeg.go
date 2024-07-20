@@ -16,6 +16,7 @@ type Codec string
 
 const (
 	CodecH264VAAPI Codec = "h264_vaapi"
+	CodecH264NVENC Codec = "h264_nvenc"
 	CodecLibx264   Codec = "libx264"
 )
 
@@ -94,6 +95,8 @@ func DoFfmpeg(params FfmpegParams) (string, error) {
 		inputArgs["hwaccel"] = "vaapi"
 		inputArgs["hwaccel_device"] = "/dev/dri/renderD128"
 		inputArgs["hwaccel_output_format"] = "vaapi"
+	case CodecH264NVENC:
+		inputArgs["hwaccel"] = "cuda"
 	case CodecLibx264:
 		fallthrough
 	default:
@@ -118,6 +121,11 @@ func DoFfmpeg(params FfmpegParams) (string, error) {
 		case CodecH264VAAPI:
 			outputArgs["vf"] = "hwupload,scale_vaapi=format=nv12,scale_vaapi=-2:" + strconv.Itoa(params.Height)
 			outputArgs["compression_level"] = "0" // https://trac.ffmpeg.org/wiki/Hardware/VAAPI#AMDMesa
+		case CodecH264NVENC:
+			inputArgs["hwaccel_output_format"] = "cuda"
+			if params.Height > 0 {
+				outputArgs["vf"] = "scale_cuda=-2:" + strconv.Itoa(params.Height)
+			}
 		case CodecLibx264:
 			fallthrough
 		default:

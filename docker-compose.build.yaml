@@ -1,5 +1,6 @@
 services:
   cutscene:
+    image: !reset null
     build:
       dockerfile: Dockerfile
       context: .

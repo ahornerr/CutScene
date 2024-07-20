@@ -25,6 +25,8 @@ docker compose -f docker-compose.yaml -f docker-compose.gpu.yaml up
 
 This `h264_vaapi` codec and DRI device approach should theoretically also work for Intel Quicksync but is untested.
 
+`h264_nvenc` as the codec provides experimental hardware encoding for Nvidia GPUs. If running in Docker, the [Nvidia Container Toolkit](https://github.com/NVIDIA/nvidia-container-toolkit) should be installed.
+
 ## Usage
 
 Hit the app over HTTP passing your plex username and the start/end times of the clip in the request
@@ -41,7 +43,7 @@ Query parameters are used to modify the resulting file (quality, size, etc)
 Determines the height in pixels of the clip. If not specified, original quality is used.
 Width is scaled appropriately to retain original aspect ratio.
 
-#### `QP` (integer)
+#### `qp` (integer)
 Quantization parameter as an integer. https://slhck.info/video/2017/02/24/crf-guide.html
 
 Higher values = worse quality but lower file size

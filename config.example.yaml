@@ -7,4 +7,5 @@ ffmpeg:
   # libx264 is the default (software) encoder.
   # h264_vaapi is also supported for faster hardware encoding with Intel quicksync (untested)
   # and AMD GPUs (tested on Linux).
+  # Set to h264_nvenc for Nvidia GPUs.
   codec: libx264
