@@ -2,8 +2,9 @@ package main
 
 import (
 	"fmt"
-	"github.com/gofiber/fiber/v3"
 	"path/filepath"
+
+	"github.com/gofiber/fiber/v3"
 )
 
 type API struct {
