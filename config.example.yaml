@@ -1,5 +1,10 @@
 plex:
   host: https://my.plex.server
   token: xxxxxxxxxxxxxxxxx
-http:
+api:
   listen_addr: ":8080"
+ffmpeg:
+  # libx264 is the default (software) encoder.
+  # h264_vaapi is also supported for faster hardware encoding with Intel quicksync (untested)
+  # and AMD GPUs (tested on Linux).
+  codec: libx264

@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"path/filepath"
+	"strconv"
 
 	"github.com/gofiber/fiber/v3"
 )
@@ -60,13 +61,25 @@ func (a *API) clip(ctx fiber.Ctx) error {
 		return fmt.Errorf("to not specified")
 	}
 
+	heightStr := ctx.Query("height", "0")
+	height, err := strconv.Atoi(heightStr)
+	if err != nil {
+		return fmt.Errorf("height not an integer")
+	}
+
+	qpStr := ctx.Query("qp", "0")
+	qp, err := strconv.Atoi(qpStr)
+	if err != nil {
+		return fmt.Errorf("qp not an integer")
+	}
+
 	sessions, err := a.app.GetUserSessions(user)
 	if err != nil {
 		return err
 	}
 
 	// TODO: Handle multiple user sessions
-	filePath, err := a.app.Clip(sessions[0], from, to)
+	filePath, err := a.app.Clip(sessions[0], from, to, height, qp)
 	if err != nil {
 		return err
 	}

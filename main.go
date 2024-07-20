@@ -9,11 +9,14 @@ import (
 
 type Config struct {
 	Plex struct {
-		Host  string `yaml:"host"`
-		Token string `yaml:"token"`
+		Host  string `mapstructure:"host"`
+		Token string `mapstructure:"token"`
 	}
 	API struct {
-		ListenAddr string `yaml:"listen_addr"`
+		ListenAddr string `mapstructure:"listen_addr"`
+	}
+	Ffmpeg struct {
+		Codec Codec `mapstructure:"codec"`
 	}
 }
 

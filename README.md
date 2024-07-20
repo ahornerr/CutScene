@@ -22,6 +22,21 @@ Hit the app over HTTP passing your plex username and the start/end times of the 
 curl http://127.0.0.1:8080/clip/ahorner/00:05:00/00:05:05 -O -J
 ```
 
+### Query parameters
+
+Query parameters are used to modify the resulting file (quality, size, etc)
+
+#### `height` (integer)
+Determines the height in pixels of the clip. If not specified, original quality is used.
+Width is scaled appropriately to retain original aspect ratio.
+
+#### `QP` (integer)
+Quantization parameter as an integer. https://slhck.info/video/2017/02/24/crf-guide.html
+
+Higher values = worse quality but lower file size
+
+A QP between 20 and 30 is typically ideal (tested with the h264_vaapi encoder, libx264 may be different)
+
 ## Development
 
 A [docker-compose.build.yaml]() file is included which will build the Docker image from source.

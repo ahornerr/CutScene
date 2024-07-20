@@ -1,13 +1,10 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"os/exec"
-	"path/filepath"
 	"strconv"
 
 	"github.com/LukeHagar/plexgo"
@@ -64,7 +61,7 @@ func (a *Application) GetUserSessions(user string) ([]operations.GetSessionsMeta
 	return userSessions, nil
 }
 
-func (a *Application) Clip(sessionMetadata operations.GetSessionsMetadata, from, to string) (string, error) {
+func (a *Application) Clip(sessionMetadata operations.GetSessionsMetadata, from, to string, height, qp int) (string, error) {
 	ratingKey, err := strconv.ParseFloat(*sessionMetadata.RatingKey, 0)
 	if err != nil {
 		return "", fmt.Errorf("could not parse rating key: %w", err)
@@ -83,17 +80,6 @@ func (a *Application) Clip(sessionMetadata operations.GetSessionsMetadata, from,
 		a.config.Plex.Token,
 	)
 
-	probed, err := a.probe(fileURL)
-	if err != nil {
-		return "", err
-	}
-
-	outputMetadata := map[string]string{
-		"title":   *metadata.Title,
-		"comment": from,
-		"artist":  *sessionMetadata.User.Title,
-	}
-
 	var fileName string
 	if *metadata.Type == "episode" {
 		fileName = fmt.Sprintf("%s S%02dE%02d %s (%s - %s).mp4",
@@ -104,10 +90,6 @@ func (a *Application) Clip(sessionMetadata operations.GetSessionsMetadata, from,
 			from,
 			to,
 		)
-
-		outputMetadata["show"] = *metadata.GrandparentTitle
-		outputMetadata["season_number"] = strconv.Itoa(*metadata.ParentIndex)
-		outputMetadata["episode_id"] = strconv.Itoa(*metadata.Index)
 	} else {
 		fileName = fmt.Sprintf("%s (%d) (%s - %s).mp4",
 			*metadata.Title,
@@ -115,66 +97,42 @@ func (a *Application) Clip(sessionMetadata operations.GetSessionsMetadata, from,
 			from,
 			to,
 		)
-
-		outputMetadata["year"] = strconv.Itoa(*metadata.Year)
 	}
 
-	var metadataArr []string
-	for k, v := range outputMetadata {
-		metadataArr = append(metadataArr, fmt.Sprintf("%s=%s", k, v))
+	probed, err := a.probe(fileURL)
+	if err != nil {
+		return "", err
 	}
 
-	tmpFile := filepath.Join("/tmp", fileName)
-
-	inputArgs := ffmpeg.KwArgs{
-		"ss": from,
-		// TODO: Make these two configurable, we don't want them when trying to troubleshoot
-		"hide_banner": "",
-		"loglevel":    "error",
+	params := FfmpegParams{
+		URL:         fileURL,
+		From:        from,
+		To:          to,
+		Filename:    fileName,
+		Codec:       a.config.Ffmpeg.Codec,
+		Height:      height,
+		QP:          qp,
+		ProbedCodec: probed.Streams[0].CodecName, // TODO: How to handle multiple streams?
+		Metadata: FfmpegParamsMetadata{
+			Title: *metadata.Title,
+			User:  *sessionMetadata.User.Title,
+		},
 	}
 
-	// TODO: Might be a good idea to make these configurable or add support for presets
-	outputArgs := ffmpeg.KwArgs{
-		"to":           to,
-		"acodec":       "libvorbis",
-		"copyts":       "",
-		"map_chapters": -1,
-		"map_metadata": 0,
-		"movflags":     "use_metadata_tags",
-		"metadata":     metadataArr,
+	if metadata.GrandparentTitle != nil {
+		params.Metadata.Show = *metadata.GrandparentTitle
+	}
+	if metadata.ParentIndex != nil {
+		params.Metadata.SeasonNumber = *metadata.ParentIndex
+	}
+	if metadata.Index != nil {
+		params.Metadata.EpisodeID = *metadata.Index
+	}
+	if metadata.Year != nil {
+		params.Metadata.Year = *metadata.Year
 	}
 
-	//for _, m := range metadataArr {
-	//outputArgs = append(outputArgs, ffmpeg.KwArgs{"metadata": m})
-	//}
-
-	// TODO: How to handle multiple streams?
-	if probed.Streams[0].CodecName == "h264" {
-		outputArgs["vcodec"] = "copy"
-	} else {
-		outputArgs["vcodec"] = "libx264"
-		outputArgs["pix_fmt"] = "yuv420p"
-		outputArgs["crf"] = 23
-		outputArgs["video_bitrate"] = 0
-		// TODO: I'm not sure if this does anything useful
-		outputArgs["tune"] = "film"
-	}
-
-	errBuff := &bytes.Buffer{}
-	err = ffmpeg.
-		Input(fileURL, inputArgs).
-		Output(tmpFile, outputArgs).
-		OverWriteOutput().
-		WithErrorOutput(errBuff).
-		Run()
-
-	// Capture the ffmpeg process stderr if it exits unsuccessfully
-	var exitErr *exec.ExitError
-	if errors.As(err, &exitErr) {
-		err = fmt.Errorf("ffmpeg exited with error:\n%s", errBuff.String())
-	}
-
-	return tmpFile, err
+	return DoFfmpeg(params)
 }
 
 func (a *Application) probe(input string) (*ffProbeResult, error) {
