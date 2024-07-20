@@ -9,11 +9,11 @@ import (
 
 type Config struct {
 	Plex struct {
-		Host  string
-		Token string
+		Host  string `yaml:"host"`
+		Token string `yaml:"token"`
 	}
 	API struct {
-		ListenAddr string
+		ListenAddr string `yaml:"listen_addr"`
 	}
 }
 
