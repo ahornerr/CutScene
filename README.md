@@ -1,5 +1,9 @@
 # CutScene
 
+CutScene is a tool that gives you the ability to create short clips from your Plex media.
+
+Currently, CutScene exists as an HTTP API, but in the future it will be more user-friendly (UI, browser extension, etc).
+
 ## Setup
 
 Copy [config.example.yaml]() to [config.yaml]() (in the same directory) and update values accordingly
@@ -8,16 +12,17 @@ Depending on your setup, the Plex host can either be a DNS record (e.g. https://
 
 The Plex token can be found by following [these instructions](https://support.plex.tv/articles/204059436-finding-an-authentication-token-x-plex-token/).
 
-> If you changed the listen address, update the port forward in [docker-compose.yaml]()
+> [!IMPORTANT]
+> If you changed the listen address in the config, update the forwarded port in [docker-compose.yaml]()
 
 The default [docker-compose.yaml]() file points to the [GitHub Container Registry image](https://github.com/ahornerr/CutScene/pkgs/container/cutscene). 
 
 You can start this container by simply running `docker compose up`.
 
 ### Hardware acceleration
-AMD GPU support on Linux is supported by setting the Ffmpeg codec config to `h264_vaapi` and mounting the `/dev/dri` device in Docker.
+AMD GPU support on Linux is supported by setting the Ffmpeg codec config to `h264_vaapi`.
 
-This can be done by using the GPU Docker compose override
+In Docker, the `/dev/dri/renderD*` device must also be mounted. This can be done by using the GPU Docker compose override:
 
 ```sh
 docker compose -f docker-compose.yaml -f docker-compose.gpu.yaml up
@@ -25,7 +30,8 @@ docker compose -f docker-compose.yaml -f docker-compose.gpu.yaml up
 
 This `h264_vaapi` codec and DRI device approach should theoretically also work for Intel Quicksync but is untested.
 
-`h264_nvenc` as the codec provides experimental hardware encoding for Nvidia GPUs. If running in Docker, the [Nvidia Container Toolkit](https://github.com/NVIDIA/nvidia-container-toolkit) should be installed.
+> [!NOTE]
+> The `h264_nvenc` codec provides experimental hardware encoding for Nvidia GPUs. If running in Docker, the [Nvidia Container Toolkit](https://github.com/NVIDIA/nvidia-container-toolkit) should be installed.
 
 ## Usage
 
