@@ -35,10 +35,19 @@ This `h264_vaapi` codec and DRI device approach should theoretically also work f
 
 ## Usage
 
-Hit the app over HTTP passing your plex username and the start/end times of the clip in the request
+Navigate your browser to the IP/port that CutScene is running on to get a web UI.
+
+For HTTP usage, first list the sessions and find the rating key for the video you'd like to clip.
+
+```shell
+$ curl -s http://127.0.0.1:8080/sessions | jq -r '.[0].ratingKey'
+100151
+```
+
+Then call the clip endpoint with the ratingKey and start/end times you'd like to clip
 
 ```sh
-curl http://127.0.0.1:8080/clip/ahorner/00:05:00/00:05:05 -O -J
+curl http://127.0.0.1:8080/clip/100151/00:05:00/00:05:05 -O -J
 ```
 
 ### Query parameters

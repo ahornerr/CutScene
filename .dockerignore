@@ -4,3 +4,5 @@ config.yaml
 Dockerfile
 .dockerignore
 .idea/
+frontend/build
+frontend/node_modules

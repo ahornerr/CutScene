@@ -38,6 +38,15 @@ func NewApplication(config Config) (*Application, error) {
 	}, nil
 }
 
+func (a *Application) GetSessions() ([]operations.GetSessionsMetadata, error) {
+	sessions, err := a.plex.Sessions.GetSessions(context.Background())
+	if err != nil {
+		return nil, fmt.Errorf("could not get sessions: %w", err)
+	}
+
+	return sessions.Object.MediaContainer.Metadata, nil
+}
+
 func (a *Application) GetUserSessions(user string) ([]operations.GetSessionsMetadata, error) {
 	sessions, err := a.plex.Sessions.GetSessions(context.Background())
 	if err != nil {
@@ -61,8 +70,8 @@ func (a *Application) GetUserSessions(user string) ([]operations.GetSessionsMeta
 	return userSessions, nil
 }
 
-func (a *Application) Clip(sessionMetadata operations.GetSessionsMetadata, from, to string, height, qp int) (string, error) {
-	ratingKey, err := strconv.ParseFloat(*sessionMetadata.RatingKey, 0)
+func (a *Application) Clip(ratingKeyStr, from, to string, height, qp int) (string, error) {
+	ratingKey, err := strconv.ParseFloat(ratingKeyStr, 0)
 	if err != nil {
 		return "", fmt.Errorf("could not parse rating key: %w", err)
 	}
@@ -99,23 +108,16 @@ func (a *Application) Clip(sessionMetadata operations.GetSessionsMetadata, from,
 		)
 	}
 
-	probed, err := a.probe(fileURL)
-	if err != nil {
-		return "", err
-	}
-
 	params := FfmpegParams{
-		URL:         fileURL,
-		From:        from,
-		To:          to,
-		Filename:    fileName,
-		Codec:       a.config.Ffmpeg.Codec,
-		Height:      height,
-		QP:          qp,
-		ProbedCodec: probed.Streams[0].CodecName, // TODO: How to handle multiple streams?
+		URL:      fileURL,
+		From:     from,
+		To:       to,
+		Filename: fileName,
+		Codec:    a.config.Ffmpeg.Codec,
+		Height:   height,
+		QP:       qp,
 		Metadata: FfmpegParamsMetadata{
 			Title: *metadata.Title,
-			User:  *sessionMetadata.User.Title,
 		},
 	}
 

@@ -21,45 +21,28 @@ const (
 )
 
 type FfmpegParams struct {
-	URL         string
-	From        string
-	To          string
-	Filename    string
-	ProbedCodec string
-	Height      int
-	QP          int
-	Codec       Codec
-	Metadata    FfmpegParamsMetadata
+	URL      string
+	From     string
+	To       string
+	Filename string
+	Height   int
+	QP       int
+	Codec    Codec
+	Metadata FfmpegParamsMetadata
 }
 
 type FfmpegParamsMetadata struct {
 	Title        string
-	User         string
 	Show         string
 	SeasonNumber int
 	EpisodeID    int
 	Year         int
 }
 
-func (p FfmpegParams) requiresReencoding() bool {
-	if p.ProbedCodec != "h264" {
-		return true
-	}
-	if p.Height > 0 {
-		return true
-	}
-	if p.QP > 0 {
-		return true
-	}
-
-	return false
-}
-
 func DoFfmpeg(params FfmpegParams) (string, error) {
 	outputMetadata := map[string]string{
 		"title":   params.Metadata.Title,
 		"comment": params.From,
-		"artist":  params.Metadata.User,
 	}
 
 	if params.Metadata.Show != "" {
@@ -84,6 +67,7 @@ func DoFfmpeg(params FfmpegParams) (string, error) {
 
 	inputArgs := ffmpeg.KwArgs{
 		"ss":      params.From,
+		"to":      params.To,
 		"hwaccel": "auto",
 		// TODO: Make these two configurable, we don't want them when trying to troubleshoot
 		"hide_banner": "",
@@ -104,40 +88,34 @@ func DoFfmpeg(params FfmpegParams) (string, error) {
 
 	// TODO: Might be a good idea to make these configurable or add support for presets
 	outputArgs := ffmpeg.KwArgs{
-		"to":           params.To,
 		"acodec":       "libvorbis",
-		"copyts":       "",
 		"map_chapters": -1,
 		"map_metadata": 0,
-		"movflags":     "use_metadata_tags",
+		"movflags":     "+use_metadata_tags+faststart",
 		"metadata":     metadataArr,
 		"qp":           params.QP,
 	}
 
-	if params.requiresReencoding() {
-		outputArgs["vcodec"] = params.Codec
+	outputArgs["vcodec"] = params.Codec
 
-		switch params.Codec {
-		case CodecH264VAAPI:
-			outputArgs["vf"] = "hwupload,scale_vaapi=format=nv12,scale_vaapi=-2:" + strconv.Itoa(params.Height)
-			outputArgs["compression_level"] = "0" // https://trac.ffmpeg.org/wiki/Hardware/VAAPI#AMDMesa
-		case CodecH264NVENC:
-			inputArgs["hwaccel_output_format"] = "cuda"
-			if params.Height > 0 {
-				outputArgs["vf"] = "scale_cuda=-2:" + strconv.Itoa(params.Height)
-			}
-		case CodecLibx264:
-			fallthrough
-		default:
-			outputArgs["vf"] = "scale=-2:" + strconv.Itoa(params.Height)
-			outputArgs["pix_fmt"] = "yuv420p"
-			outputArgs["crf"] = 23
-			outputArgs["video_bitrate"] = 0
-			// TODO: I'm not sure if this does anything useful
-			outputArgs["tune"] = "film"
+	switch params.Codec {
+	case CodecH264VAAPI:
+		outputArgs["vf"] = "hwupload,scale_vaapi=format=nv12,scale_vaapi=-2:" + strconv.Itoa(params.Height)
+		outputArgs["compression_level"] = "0" // https://trac.ffmpeg.org/wiki/Hardware/VAAPI#AMDMesa
+	case CodecH264NVENC:
+		inputArgs["hwaccel_output_format"] = "cuda"
+		if params.Height > 0 {
+			outputArgs["vf"] = "scale_cuda=-2:" + strconv.Itoa(params.Height)
 		}
-	} else {
-		outputArgs["vcodec"] = "copy"
+	case CodecLibx264:
+		fallthrough
+	default:
+		outputArgs["vf"] = "scale=-2:" + strconv.Itoa(params.Height)
+		outputArgs["pix_fmt"] = "yuv420p"
+		outputArgs["crf"] = 23
+		outputArgs["video_bitrate"] = 0
+		// TODO: I'm not sure if this does anything useful
+		outputArgs["tune"] = "film"
 	}
 
 	errBuff := &bytes.Buffer{}
@@ -158,4 +136,74 @@ func DoFfmpeg(params FfmpegParams) (string, error) {
 	_, _ = io.Copy(os.Stderr, errBuff)
 
 	return tmpFile, err
+}
+
+func DoFfmpegPreview(fileURL, from, to string, codec Codec, writer io.Writer) error {
+	inputArgs := ffmpeg.KwArgs{
+		"ss":      from,
+		"to":      to,
+		"hwaccel": "auto",
+		// TODO: Make these two configurable, we don't want them when trying to troubleshoot
+		"hide_banner": "",
+		"loglevel":    "error",
+	}
+
+	switch codec {
+	case CodecH264VAAPI:
+		inputArgs["hwaccel"] = "vaapi"
+		inputArgs["hwaccel_device"] = "/dev/dri/renderD128"
+		inputArgs["hwaccel_output_format"] = "vaapi"
+	case CodecH264NVENC:
+		inputArgs["hwaccel"] = "cuda"
+	case CodecLibx264:
+		fallthrough
+	default:
+	}
+
+	outputArgs := ffmpeg.KwArgs{
+		"acodec":   "libvorbis",
+		"f":        "mp4",
+		"movflags": "frag_keyframe+empty_moov",
+		// TODO
+		//"qp":           params.QP,
+	}
+
+	outputArgs["vcodec"] = codec
+
+	height := 720
+
+	switch codec {
+	case CodecH264VAAPI:
+		outputArgs["vf"] = "hwupload,scale_vaapi=format=nv12,scale_vaapi=-2:" + strconv.Itoa(height)
+		outputArgs["compression_level"] = "0" // https://trac.ffmpeg.org/wiki/Hardware/VAAPI#AMDMesa
+	case CodecH264NVENC:
+		inputArgs["hwaccel_output_format"] = "cuda"
+		outputArgs["vf"] = "scale_cuda=-2:" + strconv.Itoa(height)
+	case CodecLibx264:
+		fallthrough
+	default:
+		outputArgs["vf"] = "scale=-2:" + strconv.Itoa(height)
+		outputArgs["pix_fmt"] = "yuv420p"
+		outputArgs["crf"] = 23
+		outputArgs["video_bitrate"] = 0
+		// TODO: I'm not sure if this does anything useful
+		outputArgs["tune"] = "film"
+	}
+
+	errBuff := &bytes.Buffer{}
+	err := ffmpeg.
+		Input(fileURL, inputArgs).
+		Output("pipe:", outputArgs).
+		WithOutput(writer, errBuff).
+		Run()
+
+	// Capture the ffmpeg process stderr if it exits unsuccessfully
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) {
+		err = fmt.Errorf("ffmpeg exited with error:\n%s", errBuff.String())
+	}
+
+	_, _ = io.Copy(os.Stderr, errBuff)
+
+	return err
 }
