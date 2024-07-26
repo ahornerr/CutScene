@@ -53,8 +53,14 @@ function App() {
   const [playerUrl, setPlayerUrl] = useState(null)
 
   useEffect(() => {
-    fetch('/sessions')
-      .then(response => response.json())
+    fetch('/sessions', {redirect: "manual"})
+      .then(response => {
+        // This is hack but whatever https://stackoverflow.com/questions/39735496/redirect-after-a-fetch-post-call
+        if (response.type === "opaqueredirect") {
+          window.location.replace('/authUrl')
+        }
+        return response.json()
+      })
       .then(json => setSessions(json || []))
       .catch(err => console.log(err));
   }, [])

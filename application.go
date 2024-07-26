@@ -2,18 +2,12 @@ package main
 
 import (
 	"context"
-	"encoding/json"
-	"errors"
 	"fmt"
+	"github.com/LukeHagar/plexgo/models/components"
 	"strconv"
 
 	"github.com/LukeHagar/plexgo"
 	"github.com/LukeHagar/plexgo/models/operations"
-	ffmpeg "github.com/u2takey/ffmpeg-go"
-)
-
-var (
-	ErrNoUserSession = errors.New("no user session")
 )
 
 type Application struct {
@@ -22,24 +16,44 @@ type Application struct {
 }
 
 func NewApplication(config Config) (*Application, error) {
-	plex := plexgo.New(
-		plexgo.WithServerURL(config.Plex.Host),
-		plexgo.WithSecurity(config.Plex.Token),
-	)
-
-	_, err := plex.Server.GetServerCapabilities(context.Background())
-	if err != nil {
-		return nil, fmt.Errorf("could not get server capabilities: %w", err)
+	app := &Application{
+		config: config,
 	}
 
-	return &Application{
-		config: config,
-		plex:   plex,
+	app.plex = plexgo.New(
+		plexgo.WithServerURL(config.Plex.Host),
+		plexgo.WithSecuritySource(app.security),
+	)
+
+	// TODO: Only test this if there's a configured token, as opposed to user auth
+	//_, err := app.plex.Server.GetServerCapabilities(context.Background())
+	//if err != nil {
+	//	return nil, fmt.Errorf("could not get server capabilities: %w", err)
+	//}
+
+	return app, nil
+}
+
+func (a *Application) security(ctx context.Context) (components.Security, error) {
+	authToken := AuthTokenFromContext(ctx)
+	if authToken == nil {
+		return components.Security{}, fmt.Errorf("missing auth token")
+	}
+
+	// TODO: Fallback to config.Plex.Token? Maybe only if desirable
+
+	return components.Security{
+		AccessToken: *authToken,
 	}, nil
 }
 
-func (a *Application) GetSessions() ([]operations.GetSessionsMetadata, error) {
-	sessions, err := a.plex.Sessions.GetSessions(context.Background())
+func (a *Application) TestAuth(ctx context.Context) error {
+	_, err := a.plex.Server.GetServerCapabilities(ctx)
+	return err
+}
+
+func (a *Application) GetSessions(ctx context.Context) ([]operations.GetSessionsMetadata, error) {
+	sessions, err := a.plex.Sessions.GetSessions(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("could not get sessions: %w", err)
 	}
@@ -47,36 +61,13 @@ func (a *Application) GetSessions() ([]operations.GetSessionsMetadata, error) {
 	return sessions.Object.MediaContainer.Metadata, nil
 }
 
-func (a *Application) GetUserSessions(user string) ([]operations.GetSessionsMetadata, error) {
-	sessions, err := a.plex.Sessions.GetSessions(context.Background())
-	if err != nil {
-		return nil, fmt.Errorf("could not get sessions: %w", err)
-	}
-
-	var userSessions []operations.GetSessionsMetadata
-	for _, session := range sessions.Object.MediaContainer.Metadata {
-		if *session.User.Title == user {
-			userSessions = append(userSessions, session)
-		}
-	}
-
-	// TODO: May be better to normalize each session into some human readable objects for
-	//  better handling of multiple sessions
-
-	if len(userSessions) == 0 {
-		return nil, ErrNoUserSession
-	}
-
-	return userSessions, nil
-}
-
-func (a *Application) Clip(ratingKeyStr, from, to string, height, qp int) (string, error) {
+func (a *Application) Clip(ctx context.Context, ratingKeyStr, from, to string, height, qp int) (string, error) {
 	ratingKey, err := strconv.ParseFloat(ratingKeyStr, 0)
 	if err != nil {
 		return "", fmt.Errorf("could not parse rating key: %w", err)
 	}
 
-	libraryMetadata, err := a.plex.Library.GetMetadata(context.Background(), ratingKey)
+	libraryMetadata, err := a.plex.Library.GetMetadata(ctx, ratingKey)
 	if err != nil {
 		return "", fmt.Errorf("could not get library metadata: %w", err)
 	}
@@ -135,24 +126,4 @@ func (a *Application) Clip(ratingKeyStr, from, to string, height, qp int) (strin
 	}
 
 	return DoFfmpeg(params)
-}
-
-func (a *Application) probe(input string) (*ffProbeResult, error) {
-	probeJson, err := ffmpeg.Probe(input)
-	if err != nil {
-		return nil, fmt.Errorf("could not get ffprobe: %w", err)
-	}
-
-	var probed ffProbeResult
-	if err := json.Unmarshal([]byte(probeJson), &probed); err != nil {
-		return nil, fmt.Errorf("could not unmarshal ffprobe: %w", err)
-	}
-
-	return &probed, nil
-}
-
-type ffProbeResult struct {
-	Streams []struct {
-		CodecName string `json:"codec_name"`
-	} `json:"streams"`
 }
