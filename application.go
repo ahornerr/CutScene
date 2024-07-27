@@ -102,7 +102,7 @@ func (a *Application) GetSessions(ctx context.Context) ([]operations.GetSessions
 	var filteredSessions []operations.GetSessionsMetadata
 	user := UserFromContext(ctx)
 	if user != nil && user.Email != a.ownerEmail {
-		for _, session := range filteredSessions {
+		for _, session := range sessions.Object.MediaContainer.Metadata {
 			if strconv.Itoa(user.Id) == *session.User.ID {
 				filteredSessions = append(filteredSessions, session)
 			}
