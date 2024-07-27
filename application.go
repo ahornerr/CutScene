@@ -2,81 +2,125 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/LukeHagar/plexgo/models/components"
+	"io"
 	"strconv"
 
 	"github.com/LukeHagar/plexgo"
 	"github.com/LukeHagar/plexgo/models/operations"
-	ffmpeg "github.com/u2takey/ffmpeg-go"
 )
 
 var (
-	ErrNoUserSession = errors.New("no user session")
+	ErrUserNotInvited = errors.New("user not invited to server")
 )
 
 type Application struct {
-	config Config
-	plex   *plexgo.PlexAPI
+	config            Config
+	plexAdmin         *plexgo.PlexAPI
+	plexUser          *plexgo.PlexAPI
+	plexTv            *PlexTV
+	machineIdentifier string
+	ownerEmail        string
 }
 
 func NewApplication(config Config) (*Application, error) {
-	plex := plexgo.New(
-		plexgo.WithServerURL(config.Plex.Host),
-		plexgo.WithSecurity(config.Plex.Token),
-	)
-
-	_, err := plex.Server.GetServerCapabilities(context.Background())
-	if err != nil {
-		return nil, fmt.Errorf("could not get server capabilities: %w", err)
+	app := &Application{
+		config: config,
+		plexTv: NewPlexTV(config.Plex.Token),
+		plexAdmin: plexgo.New(
+			plexgo.WithServerURL(config.Plex.Host),
+			plexgo.WithSecurity(config.Plex.Token),
+		),
 	}
 
-	return &Application{
-		config: config,
-		plex:   plex,
+	identity, err := app.plexAdmin.Server.GetServerIdentity(context.Background())
+	if err != nil {
+		return nil, fmt.Errorf("could not get server identity: %w", err)
+	}
+
+	app.machineIdentifier = *identity.Object.MediaContainer.MachineIdentifier
+
+	account, err := app.plexAdmin.Server.GetMyPlexAccount(context.Background())
+	if err != nil {
+		return nil, fmt.Errorf("could not get account info: %w", err)
+	}
+
+	app.ownerEmail = *account.Object.MyPlex.Username
+
+	// TODO: If configured, ignore auth from context and just use the configured token for all requests
+	app.plexUser = plexgo.New(
+		plexgo.WithServerURL(config.Plex.Host),
+		plexgo.WithSecuritySource(app.plexSecurityUserToken),
+	)
+
+	return app, nil
+}
+
+func (a *Application) plexSecurityUserToken(ctx context.Context) (components.Security, error) {
+	authToken := AuthTokenFromContext(ctx)
+	if authToken == nil {
+		return components.Security{}, fmt.Errorf("missing auth token")
+	}
+
+	return components.Security{
+		AccessToken: *authToken,
 	}, nil
 }
 
-func (a *Application) GetSessions() ([]operations.GetSessionsMetadata, error) {
-	sessions, err := a.plex.Sessions.GetSessions(context.Background())
+func (a *Application) GetValidatedUser(ctx context.Context) (*User, error) {
+	serverUsers, err := a.plexTv.getUsers()
 	if err != nil {
-		return nil, fmt.Errorf("could not get sessions: %w", err)
+		return nil, err
 	}
 
-	return sessions.Object.MediaContainer.Metadata, nil
+	user, err := NewPlexTV(*AuthTokenFromContext(ctx)).getUser()
+	if err != nil {
+		return nil, err
+	}
+
+	// Check for server owner
+	if user.Email == a.ownerEmail {
+		return user, nil
+	}
+
+	// Check for users invited to server
+	if serverUsers.HasUser(strconv.Itoa(user.Id), a.machineIdentifier) {
+		return user, nil
+	}
+
+	return nil, ErrUserNotInvited
 }
 
-func (a *Application) GetUserSessions(user string) ([]operations.GetSessionsMetadata, error) {
-	sessions, err := a.plex.Sessions.GetSessions(context.Background())
+func (a *Application) GetSessions(ctx context.Context) ([]operations.GetSessionsMetadata, error) {
+	sessions, err := a.plexAdmin.Sessions.GetSessions(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("could not get sessions: %w", err)
 	}
 
-	var userSessions []operations.GetSessionsMetadata
-	for _, session := range sessions.Object.MediaContainer.Metadata {
-		if *session.User.Title == user {
-			userSessions = append(userSessions, session)
+	var filteredSessions []operations.GetSessionsMetadata
+	user := UserFromContext(ctx)
+	if user != nil && user.Email != a.ownerEmail {
+		for _, session := range sessions.Object.MediaContainer.Metadata {
+			if strconv.Itoa(user.Id) == *session.User.ID {
+				filteredSessions = append(filteredSessions, session)
+			}
 		}
+	} else {
+		filteredSessions = sessions.Object.MediaContainer.Metadata
 	}
 
-	// TODO: May be better to normalize each session into some human readable objects for
-	//  better handling of multiple sessions
-
-	if len(userSessions) == 0 {
-		return nil, ErrNoUserSession
-	}
-
-	return userSessions, nil
+	return filteredSessions, nil
 }
 
-func (a *Application) Clip(ratingKeyStr, from, to string, height, qp int) (string, error) {
+func (a *Application) Clip(ctx context.Context, ratingKeyStr, from, to string, height, qp int) (string, error) {
 	ratingKey, err := strconv.ParseFloat(ratingKeyStr, 0)
 	if err != nil {
 		return "", fmt.Errorf("could not parse rating key: %w", err)
 	}
 
-	libraryMetadata, err := a.plex.Library.GetMetadata(context.Background(), ratingKey)
+	libraryMetadata, err := a.plexAdmin.Library.GetMetadata(ctx, ratingKey)
 	if err != nil {
 		return "", fmt.Errorf("could not get library metadata: %w", err)
 	}
@@ -137,22 +181,16 @@ func (a *Application) Clip(ratingKeyStr, from, to string, height, qp int) (strin
 	return DoFfmpeg(params)
 }
 
-func (a *Application) probe(input string) (*ffProbeResult, error) {
-	probeJson, err := ffmpeg.Probe(input)
+func (a *Application) Thumb(ctx context.Context, thumb string) (io.ReadCloser, error) {
+	req := operations.GetResizedPhotoRequest{
+		Width:  320,
+		Height: 320,
+		URL:    thumb,
+	}
+	resp, err := a.plexAdmin.Server.GetResizedPhoto(ctx, req)
 	if err != nil {
-		return nil, fmt.Errorf("could not get ffprobe: %w", err)
+		return nil, err
 	}
 
-	var probed ffProbeResult
-	if err := json.Unmarshal([]byte(probeJson), &probed); err != nil {
-		return nil, fmt.Errorf("could not unmarshal ffprobe: %w", err)
-	}
-
-	return &probed, nil
-}
-
-type ffProbeResult struct {
-	Streams []struct {
-		CodecName string `json:"codec_name"`
-	} `json:"streams"`
+	return resp.RawResponse.Body, nil
 }

@@ -14,6 +14,7 @@ type Config struct {
 	}
 	API struct {
 		ListenAddr string `mapstructure:"listen_addr"`
+		Domain     string `mapstructure:"domain"`
 	}
 	Ffmpeg struct {
 		Codec Codec `mapstructure:"codec"`
