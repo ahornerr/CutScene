@@ -2,11 +2,13 @@ package main
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
 	"github.com/LukeHagar/plexgo"
 	"github.com/gofiber/fiber/v3/middleware/session"
 	"github.com/gofiber/fiber/v3/middleware/static"
 	"github.com/google/uuid"
+	"io"
 	"net/url"
 	"path/filepath"
 	"strconv"
@@ -21,12 +23,17 @@ var store = session.New(session.Config{
 	Storage: storage,
 })
 
+func init() {
+	store.RegisterType(User{})
+}
+
 const (
 	productCutScene = "CutScene"
 
 	routeNameAuthUrl = "authUrl"
 
 	sessKeyAuthToken = "authToken"
+	sessKeyUser      = "user"
 	sessKeyClientID  = "clientID"
 	sessKeyPinID     = "pinID"
 	sessKeyAuthUrl   = "authURL"
@@ -46,6 +53,7 @@ func NewAPI(config Config, app *Application) (*API, error) {
 	}
 
 	api.http.Get("/sessions", api.getSessions, api.authMiddleware)
+	api.http.Get("/thumb", api.thumb, api.authMiddleware)
 	api.http.Get("/clip/:ratingKey/:from/:to", api.clip, api.authMiddleware)
 	api.http.Get("/preview/:ratingKey/:from/:to", api.preview, api.authMiddleware)
 
@@ -56,7 +64,48 @@ func NewAPI(config Config, app *Application) (*API, error) {
 	return api, nil
 }
 
+func (a *API) validateAuthToken(ctx fiber.Ctx, sess *session.Session, authToken string) error {
+	sess.Set(sessKeyAuthToken, authToken)
+
+	newCtx := ContextWithAuthToken(ctx.UserContext(), authToken)
+
+	// TODO: Probably not necessary to do auth so frequently
+	user, err := a.app.GetValidatedUser(newCtx)
+	if err != nil {
+		if errors.Is(err, ErrUserNotInvited) {
+			if err := sess.Save(); err != nil {
+				return err
+			}
+
+			return fmt.Errorf("user not invited")
+		}
+
+		// TODO: We may want to be smarter about how we handle these errors to only conditionally delete session items.
+		sess.Delete(sessKeyClientID)
+		sess.Delete(sessKeyPinID)
+		sess.Delete(sessKeyAuthUrl)
+
+		if err := sess.Save(); err != nil {
+			return err
+		}
+
+		return fmt.Errorf("verification of auth token failed: %w", err)
+	}
+
+	sess.Set(sessKeyUser, *user)
+
+	if err := sess.Save(); err != nil {
+		return err
+	}
+
+	ctx.SetUserContext(ContextWithUser(newCtx, *user))
+
+	return ctx.Next()
+}
+
 func (a *API) authMiddleware(ctx fiber.Ctx) error {
+	// TODO: If configured to not use user auth, skip all of this
+
 	if AuthTokenFromContext(ctx.UserContext()) != nil {
 		// Short circuit for when the auth token is already in the context
 		return ctx.Next()
@@ -69,21 +118,7 @@ func (a *API) authMiddleware(ctx fiber.Ctx) error {
 
 	authToken, ok := sess.Get(sessKeyAuthToken).(string)
 	if ok {
-		ctxWithAuth := ContextWithAuthToken(ctx.UserContext(), authToken)
-		err = a.app.TestAuth(ctxWithAuth)
-		if err == nil {
-			// Session found, auth successful.
-			// Set context with auth token as user context and continue onto next
-			ctx.SetUserContext(ctxWithAuth)
-			return ctx.Next()
-		}
-
-		// Auth token exists in session errored. Maybe want to check the error to see if it's a problem
-		// communicating with the server (as opposed to an invalid token).
-		// If it's a communication problem then we probably don't want to remove the auth token from the session.
-
-		sess.Delete(sessKeyAuthToken)
-		// TODO: Do we want to save the session here?
+		return a.validateAuthToken(ctx, sess, authToken)
 	}
 
 	clientID, clientIDOk := sess.Get(sessKeyClientID).(string)
@@ -111,34 +146,7 @@ func (a *API) authMiddleware(ctx fiber.Ctx) error {
 
 		// If Plex does give us an auth token, test it.
 		// If it's successful then store it in the session and context and continue on.
-		ctxWithAuth := ContextWithAuthToken(ctx.UserContext(), *authToken)
-		testAuthErr := a.app.TestAuth(ctxWithAuth)
-		if testAuthErr == nil {
-			sess.Set(sessKeyAuthToken, *authToken)
-			sess.Delete(sessKeyClientID)
-			sess.Delete(sessKeyPinID)
-			sess.Delete(sessKeyAuthUrl)
-
-			if err := sess.Save(); err != nil {
-				return err
-			}
-
-			ctx.SetUserContext(ctxWithAuth)
-			return ctx.Next()
-		}
-
-		// If it's unsuccessful, it means they don't have access to this server, or something went wrong
-		// during the auth flow. In that case, reset the session and return an error.
-		// TODO: We may want to be smarter about how we handle these errors to only conditionally delete session items.
-		sess.Delete(sessKeyClientID)
-		sess.Delete(sessKeyPinID)
-		sess.Delete(sessKeyAuthUrl)
-
-		if err := sess.Save(); err != nil {
-			return err
-		}
-
-		return fmt.Errorf("verification of auth token failed: %w", testAuthErr)
+		return a.validateAuthToken(ctx, sess, *authToken)
 	}
 
 	// User has not started the auth flow. Redirect them to the beginning of it.
@@ -234,6 +242,24 @@ func (a *API) clip(ctx fiber.Ctx) error {
 	})
 }
 
+func (a *API) thumb(ctx fiber.Ctx) error {
+	path := ctx.Query("path")
+	if path == "" {
+		return fmt.Errorf("path not specified")
+	}
+
+	respBody, err := a.app.Thumb(ctx.UserContext(), path)
+	if err != nil {
+		return err
+	}
+
+	defer respBody.Close()
+
+	_, _ = io.Copy(ctx.Response().BodyWriter(), respBody)
+
+	return nil
+}
+
 func (a *API) preview(ctx fiber.Ctx) error {
 	ratingKeyStr := ctx.Params("ratingKey")
 	if ratingKeyStr == "" {
@@ -255,7 +281,7 @@ func (a *API) preview(ctx fiber.Ctx) error {
 		return fmt.Errorf("to not specified")
 	}
 
-	libraryMetadata, err := a.app.plex.Library.GetMetadata(ctx.UserContext(), ratingKey)
+	libraryMetadata, err := a.app.plexAdmin.Library.GetMetadata(ctx.UserContext(), ratingKey)
 	if err != nil {
 		return fmt.Errorf("could not get library metadata: %w", err)
 	}

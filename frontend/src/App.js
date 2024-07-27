@@ -1,7 +1,7 @@
 import './App.css';
 import {useCallback, useEffect, useMemo, useState} from "react";
 import ReactPlayer from "react-player";
-import {Box, Button, Slider, TextField, Typography} from "@mui/material";
+import {Box, Button, Card, CardActionArea, CardContent, CardMedia, Slider, TextField, Typography} from "@mui/material";
 import {debounce} from '@mui/material/utils'
 import {TimePicker} from "@mui/x-date-pickers";
 import moment from "moment";
@@ -23,18 +23,13 @@ function getVideoName(session) {
   const title = session.title
 
   if (type === "episode") {
-    return `${session.grandparentTitle} S${String(session.parentIndex).padStart(2, '0')}E${String(session.index).padStart(2, '0')} ${title}`
+    return <>
+      <div>{session.grandparentTitle}</div>
+      S{String(session.parentIndex).padStart(2, '0')}E{String(session.index).padStart(2, '0')} {title}
+    </>
   } else {
     return `${title} (${session.year})`
   }
-}
-
-function getSessionName(session) {
-  const user = session.User.title
-
-  const position = millisToDuration(session.viewOffset)
-
-  return `${user} watching ${getVideoName(session)} @ ${position}`
 }
 
 function convertPositionToDate(position) {
@@ -51,19 +46,28 @@ function App() {
   const [startPosition, setStartPosition] = useState(null)
   const [endPosition, setEndPosition] = useState(null)
   const [playerUrl, setPlayerUrl] = useState(null)
+  const [needsAuth, setNeedsAuth] = useState(false)
 
   useEffect(() => {
     fetch('/sessions', {redirect: "manual"})
       .then(response => {
         // This is hack but whatever https://stackoverflow.com/questions/39735496/redirect-after-a-fetch-post-call
         if (response.type === "opaqueredirect") {
-          window.location.replace('/authUrl')
+          setNeedsAuth(true)
+          return null
         }
+
+        if (!response.ok) {
+          console.error(`Error: ${response.status} ${response.statusText}`);
+          console.error(`Error details: ${response.errorText || 'No error message provided'}`);
+          throw new Error('Error fetching sessions');
+        }
+
         return response.json()
       })
       .then(json => setSessions(json || []))
       .catch(err => console.log(err));
-  }, [])
+  }, [setNeedsAuth, setSessions])
 
   const setPlayerPosition = useCallback((startPosition, endPosition) => {
     setPlayerUrl(`/preview/${selectedSession.ratingKey}/${millisToDuration(startPosition)}/${millisToDuration(endPosition)}`)
@@ -107,28 +111,51 @@ function App() {
     <div className="App">
       <header className="App-header">
         <h1>CutScene</h1>
-        {sessions ? (
-            <>
-              {sessions.length > 0 ?
-                <ul>
-                  {sessions.map((session) => (
-                    <li key={session.ratingKey}>
-                      <a href="#" onClick={() => setSelectedSession(session)}>{getSessionName(session)}</a>
-                    </li>
-                  ))}
-                </ul>
-                :
-                "No active sessions found"
-              }
-            </>
-          )
-          :
-          'Loading...'
+        {needsAuth ? (
+          <Button variant="contained" onClick={() => window.location.replace('/authUrl')}>
+            Log in with Plex
+          </Button>
+        ) : (sessions ? (
+              <Box display='flex' justifyContent='center' alignItems='center'>
+                {sessions.length > 0 ?
+                  sessions.map(session => (
+                    <Card
+                      sx={{
+                        m: 2,
+                        display: 'flex',
+                        bgcolor: session.ratingKey === selectedSession?.ratingKey ? '#666666' : null
+                      }}
+                    >
+                      <Box sx={{display: 'flex', flexDirection: 'column'}}>
+                        <CardActionArea sx={{height: '100%'}} onClick={() => setSelectedSession(session)}>
+                          <CardContent sx={{flex: '1 0 auto', width: 360}}>
+                            <Typography gutterBottom variant="h6" component="div">
+                              {getVideoName(session)}
+                            </Typography>
+                            <Typography variant="body2" color="text.secondary">
+                              {millisToDuration(session.viewOffset)}
+                            </Typography>
+                            <Typography variant="body2" color="text.secondary">
+                              {session.User.title}
+                            </Typography>
+                          </CardContent>
+                        </CardActionArea>
+
+                      </Box>
+                      <CardMedia component="img" sx={{height: 160, width: 160}} image={`/thumb?path=${session.thumb}`}/>
+                    </Card>
+                  ))
+                  :
+                  "No active sessions found"
+                }
+              </Box>
+            )
+            :
+            'Loading...'
+        )
         }
         {!!selectedSession && (
           <>
-            <h3>{getVideoName(selectedSession)}</h3>
-
             <ReactPlayer
               url={playerUrl}
               controls={true}
@@ -160,7 +187,7 @@ function App() {
                   slotProps={{textField: {variant: "outlined", size: "small"}}}
                 />
                 <TextField
-                  sx={{mt:1}}
+                  sx={{mt: 1}}
                   variant="outlined"
                   type="number"
                   label="+ms"
@@ -174,7 +201,7 @@ function App() {
                     const startPositionWithoutMillis = Math.floor(startPosition / 1000) * 1000
                     setBoundedStartPosition(startPositionWithoutMillis + value)
                   }}
-                  />
+                />
               </Box>
 
               <Slider
@@ -208,7 +235,7 @@ function App() {
                   slotProps={{textField: {variant: "outlined", size: "small"}}}
                 />
                 <TextField
-                  sx={{mt:1}}
+                  sx={{mt: 1}}
                   variant="outlined"
                   type="number"
                   label="+ms"
