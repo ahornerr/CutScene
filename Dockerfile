@@ -6,7 +6,7 @@ COPY go.mod go.sum ./
 RUN go mod download
 
 COPY . .
-RUN CGO_ENABLED=0 GOOS=linux go build -o /cutscene
+RUN GOOS=linux go build -o /cutscene
 
 FROM node:alpine AS build_react
 
