@@ -81,6 +81,7 @@ func DoFfmpeg(params FfmpegParams) (string, error) {
 		inputArgs["hwaccel_output_format"] = "vaapi"
 	case CodecH264NVENC:
 		inputArgs["hwaccel"] = "cuda"
+		inputArgs["extra_hw_frames"] = 8
 	case CodecLibx264:
 		fallthrough
 	default:
@@ -106,6 +107,11 @@ func DoFfmpeg(params FfmpegParams) (string, error) {
 		inputArgs["hwaccel_output_format"] = "cuda"
 		if params.Height > 0 {
 			outputArgs["vf"] = "scale_cuda=-2:" + strconv.Itoa(params.Height)
+		}
+		if params.QP == 0 {
+			outputArgs["rc"] = "constqp"
+			outputArgs["qp"] = 24
+			outputArgs["b:v"] = "0K"
 		}
 	case CodecLibx264:
 		fallthrough
