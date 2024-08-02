@@ -70,7 +70,7 @@ function App() {
   }, [setNeedsAuth, setSessions])
 
   const setPlayerPosition = useCallback((startPosition, endPosition) => {
-    setPlayerUrl(`/preview/${selectedSession.ratingKey}/${millisToDuration(startPosition)}/${millisToDuration(endPosition)}`)
+    setPlayerUrl(`/preview/${selectedSession.ratingKey}/${millisToDuration(startPosition)}/${millisToDuration(endPosition)}?mediaId=${selectedSession.Media[0].Part[0].id}`)
   }, [selectedSession]);
 
   useEffect(() => {
@@ -272,7 +272,7 @@ function App() {
             <Box my={6}>
               <Button
                 variant="contained"
-                href={`/clip/${selectedSession.ratingKey}/${millisToDuration(startPosition)}/${millisToDuration(endPosition)}`}
+                href={`/clip/${selectedSession.ratingKey}/${millisToDuration(startPosition)}/${millisToDuration(endPosition)}?mediaId=${selectedSession.Media[0].Part[0].id}`}
                 target="_blank"
                 download
               >

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"github.com/LukeHagar/plexgo"
+	"github.com/LukeHagar/plexgo/models/operations"
 	"github.com/gofiber/fiber/v3/middleware/session"
 	"github.com/gofiber/fiber/v3/middleware/static"
 	"github.com/google/uuid"
@@ -206,6 +207,8 @@ func (a *API) clip(ctx fiber.Ctx) error {
 		return fmt.Errorf("ratingKey not specified")
 	}
 
+	mediaIdStr := ctx.Query("mediaId")
+
 	from := ctx.Params("from")
 	if from == "" {
 		return fmt.Errorf("from not specified")
@@ -228,7 +231,7 @@ func (a *API) clip(ctx fiber.Ctx) error {
 		return fmt.Errorf("qp not an integer")
 	}
 
-	filePath, err := a.app.Clip(ctx.UserContext(), ratingKeyStr, from, to, height, qp)
+	filePath, err := a.app.Clip(ctx.UserContext(), ratingKeyStr, mediaIdStr, from, to, height, qp)
 	if err != nil {
 		return err
 	}
@@ -271,6 +274,8 @@ func (a *API) preview(ctx fiber.Ctx) error {
 		return fmt.Errorf("could not parse rating key: %w", err)
 	}
 
+	mediaIdStr := ctx.Query("mediaId")
+
 	from := ctx.Params("from")
 	if from == "" {
 		return fmt.Errorf("from not specified")
@@ -288,9 +293,38 @@ func (a *API) preview(ctx fiber.Ctx) error {
 
 	metadata := libraryMetadata.Object.MediaContainer.Metadata[0]
 
+	var media *operations.GetMetadataMedia
+	if mediaIdStr != "" {
+		mediaId, err := strconv.Atoi(mediaIdStr)
+		if err != nil {
+			return fmt.Errorf("could not parse media id: %w", err)
+		}
+
+		for _, m := range metadata.Media {
+			if m.ID != nil && *m.ID == mediaId {
+				media = &m
+			}
+		}
+	}
+
+	if media == nil {
+		for _, m := range metadata.Media {
+			// 10 bit encoding doesn't work correctly on NVIDIA hardware (and maybe others)
+			if m.VideoProfile != nil && *m.VideoProfile == "main 10" {
+				continue
+			}
+			media = &m
+			break
+		}
+	}
+
+	if media == nil {
+		return fmt.Errorf("could not find suitable media for rating key")
+	}
+
 	fileURL := fmt.Sprintf("%s%s?X-Plex-Token=%s",
 		a.config.Plex.Host,
-		*metadata.Media[0].Part[0].Key,
+		*media.Part[0].Key,
 		a.config.Plex.Token,
 	)
 
