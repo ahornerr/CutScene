@@ -114,7 +114,7 @@ func (a *Application) GetSessions(ctx context.Context) ([]operations.GetSessions
 	return filteredSessions, nil
 }
 
-func (a *Application) Clip(ctx context.Context, ratingKeyStr, from, to string, height, qp int) (string, error) {
+func (a *Application) Clip(ctx context.Context, ratingKeyStr, mediaIdStr, from, to string, height, qp int) (string, error) {
 	ratingKey, err := strconv.ParseFloat(ratingKeyStr, 0)
 	if err != nil {
 		return "", fmt.Errorf("could not parse rating key: %w", err)
@@ -127,9 +127,38 @@ func (a *Application) Clip(ctx context.Context, ratingKeyStr, from, to string, h
 
 	metadata := libraryMetadata.Object.MediaContainer.Metadata[0]
 
+	var media *operations.GetMetadataMedia
+	if mediaIdStr != "" {
+		mediaId, err := strconv.Atoi(mediaIdStr)
+		if err != nil {
+			return "", fmt.Errorf("could not parse media id: %w", err)
+		}
+
+		for _, m := range metadata.Media {
+			if m.ID != nil && *m.ID == mediaId {
+				media = &m
+			}
+		}
+	}
+
+	if media == nil {
+		for _, m := range metadata.Media {
+			// 10 bit encoding doesn't work correctly on NVIDIA hardware (and maybe others)
+			if m.VideoProfile != nil && *m.VideoProfile == "main 10" {
+				continue
+			}
+			media = &m
+			break
+		}
+	}
+
+	if media == nil {
+		return "", fmt.Errorf("could not find suitable media for rating key")
+	}
+
 	fileURL := fmt.Sprintf("%s%s?X-Plex-Token=%s",
 		a.config.Plex.Host,
-		*metadata.Media[0].Part[0].Key,
+		*media.Part[0].Key,
 		a.config.Plex.Token,
 	)
 

@@ -89,7 +89,7 @@ func DoFfmpeg(params FfmpegParams) (string, error) {
 
 	// TODO: Might be a good idea to make these configurable or add support for presets
 	outputArgs := ffmpeg.KwArgs{
-		"acodec":       "libvorbis",
+		"acodec":       "aac",
 		"map_chapters": -1,
 		"map_metadata": 0,
 		"movflags":     "+use_metadata_tags+faststart",
