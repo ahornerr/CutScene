@@ -72,3 +72,4 @@ A [docker-compose.build.yaml]() file is included which will build the Docker ima
 It can be used via `docker compose -f docker-compose.yaml -f docker-compose.build.yaml up --build`.
 
 Alternatively the source can be compiled directly with `go build ./...` or ran with `go run ./...` assuming the Go SDK is installed (recommend Go >= 1.22).
+
