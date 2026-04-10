@@ -27,9 +27,7 @@ FROM debian:stable
 ENV NVIDIA_VISIBLE_DEVICES=all
 ENV NVIDIA_DRIVER_CAPABILITIES=all
 
-# https://github.com/blakeblackshear/frigate/issues/3858#issuecomment-1256832591
-RUN echo 'deb http://deb.debian.org/debian testing main non-free' >> /etc/apt/sources.list
-RUN apt update && apt install -y -t testing mesa-va-drivers libva-drm2 wget xz-utils
+RUN apt update && apt install -y mesa-va-drivers libva-drm2 wget xz-utils
 
 RUN mkdir -p /usr/lib/btbn-ffmpeg && \
     wget -qO btbn-ffmpeg.tar.xz "https://github.com/NickM-27/FFmpeg-Builds/releases/download/autobuild-2022-07-31-12-37/ffmpeg-n5.1-2-g915ef932a3-linux64-gpl-5.1.tar.xz" && \
