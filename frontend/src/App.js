@@ -1,7 +1,7 @@
 import './App.css';
-import {useCallback, useEffect, useMemo, useState} from "react";
+import {useCallback, useEffect, useMemo, useRef, useState} from "react";
 import ReactPlayer from "react-player";
-import {Box, Button, Card, CardActionArea, CardContent, CardMedia, FormControl, InputLabel, MenuItem, Select, Slider, TextField, Typography} from "@mui/material";
+import {Box, Button, Card, CardActionArea, CardContent, CardMedia, CircularProgress, FormControl, InputLabel, MenuItem, Select, Slider, TextField, Typography} from "@mui/material";
 import {debounce} from '@mui/material/utils'
 import {TimePicker} from "@mui/x-date-pickers";
 import moment from "moment";
@@ -49,6 +49,12 @@ function App() {
   const [needsAuth, setNeedsAuth] = useState(false)
   const [subtitleStreams, setSubtitleStreams] = useState([])
   const [selectedSubtitle, setSelectedSubtitle] = useState(-1)
+  const [subtitleEntries, setSubtitleEntries] = useState([])
+  const [subtitleSearch, setSubtitleSearch] = useState('')
+  const [subtitlesLoading, setSubtitlesLoading] = useState(false)
+  const [subtitleAnchor, setSubtitleAnchor] = useState(-1)
+  const [subtitleSelectionEnd, setSubtitleSelectionEnd] = useState(-1)
+  const subtitleListRef = useRef(null)
 
   useEffect(() => {
     fetch('/sessions', {redirect: "manual"})
@@ -95,10 +101,56 @@ function App() {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedSession])
 
+  useEffect(() => {
+    if (!selectedSession || selectedSubtitle < 0) {
+      setSubtitleEntries([])
+      setSubtitleSearch('')
+      return
+    }
+
+    setSubtitlesLoading(true)
+    setSubtitleEntries([])
+
+    const mediaId = selectedSession.Media[0].Part[0].id
+    fetch(`/subtitles/${selectedSession.ratingKey}?subtitle=${selectedSubtitle}&mediaId=${mediaId}`)
+      .then(r => r.json())
+      .then(entries => setSubtitleEntries(entries || []))
+      .catch(err => console.error('Could not fetch subtitle entries:', err))
+      .finally(() => setSubtitlesLoading(false))
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedSession, selectedSubtitle])
+
   const debounceSetPosition = useMemo(
     () => debounce(setPlayerPosition, 500),
     [setPlayerPosition],
   );
+
+  const filteredSubtitleEntries = useMemo(() => {
+    if (!subtitleSearch.trim()) return subtitleEntries
+    const lower = subtitleSearch.toLowerCase()
+    return subtitleEntries.filter(e => e.text.toLowerCase().includes(lower))
+  }, [subtitleEntries, subtitleSearch])
+
+  const subtitleSelectionRange = useMemo(() => {
+    if (subtitleAnchor < 0) return { from: -1, to: -1 }
+    const end = subtitleSelectionEnd >= 0 ? subtitleSelectionEnd : subtitleAnchor
+    return { from: Math.min(subtitleAnchor, end), to: Math.max(subtitleAnchor, end) }
+  }, [subtitleAnchor, subtitleSelectionEnd])
+
+  const applySubtitleSelection = useCallback((from, to) => {
+    const firstEntry = subtitleEntries[from]
+    const lastEntry = subtitleEntries[to]
+    if (!firstEntry || !lastEntry) return
+    setEndPosition(lastEntry.end + 500)
+    setStartPosition(Math.max(0, firstEntry.start - 500))
+  }, [subtitleEntries])
+
+  // Scroll full list to anchor when it changes
+  useEffect(() => {
+    if (subtitleAnchor < 0 || !subtitleListRef.current) return
+    const el = subtitleListRef.current.querySelector(`[data-idx="${subtitleAnchor}"]`)
+    if (el) el.scrollIntoView({ block: 'center' })
+  }, [subtitleAnchor])
 
   useEffect(() => {
     if (startPosition) {
@@ -189,7 +241,7 @@ function App() {
             />
 
             {subtitleStreams.length > 0 && (
-              <Box sx={{width: '100%', mb: 3}} display='flex' justifyContent='center' alignItems='center'>
+              <Box sx={{width: '50%', mb: 3}} display='flex' justifyContent='center' alignItems='center'>
                 <Box sx={{width: 200, mr: 3}}>
                   <FormControl fullWidth>
                     <InputLabel id="subtitle-select">Subtitles</InputLabel>
@@ -214,6 +266,115 @@ function App() {
                     {subtitleStreams.find(s => s.index === selectedSubtitle)?.codec}
                   </Typography>
                 </Box>
+              </Box>
+            )}
+
+            {selectedSubtitle >= 0 && (
+              <Box sx={{width: '50%', mb: 3}}>
+                {subtitlesLoading ? (
+                  <Box sx={{height: 340, display: 'flex', justifyContent: 'center', alignItems: 'center'}}>
+                    <CircularProgress />
+                    <Typography variant="body2" color="text.secondary" sx={{ml: 2}}>Loading subtitles...</Typography>
+                  </Box>
+                ) : subtitleEntries.length > 0 && (
+                  <>
+                    {/* Search box */}
+                    <TextField
+                      fullWidth
+                      variant="outlined"
+                      size="small"
+                      label="Search subtitles"
+                      value={subtitleSearch}
+                      onChange={e => setSubtitleSearch(e.target.value)}
+                    />
+
+                    {/* Conditional: search results OR full list */}
+                    {subtitleSearch.trim() ? (
+                      /* Search results - clicking jumps to entry in full list and clears search */
+                      <Box sx={{height: 300, overflowY: 'auto', border: '1px solid #444', borderRadius: 1, mt: 1}}>
+                        {filteredSubtitleEntries.map((entry, idx) => (
+                          <Box
+                            key={idx}
+                            onClick={() => {
+                              const fullIdx = subtitleEntries.indexOf(entry)
+                              setSubtitleAnchor(fullIdx)
+                              setSubtitleSelectionEnd(fullIdx)
+                              applySubtitleSelection(fullIdx, fullIdx)
+                              setSubtitleSearch('')
+                            }}
+                            sx={{
+                              display: 'flex',
+                              alignItems: 'center',
+                              px: 1.5,
+                              py: 0.75,
+                              cursor: 'pointer',
+                              borderBottom: '1px solid #333',
+                              '&:hover': { backgroundColor: '#383c44' },
+                              userSelect: 'none',
+                            }}
+                          >
+                            <Typography variant="caption" color="text.secondary" sx={{minWidth: 70, fontFamily: 'monospace', flexShrink: 0}}>
+                              {millisToDuration(entry.start)}
+                            </Typography>
+                            <Typography variant="body2" sx={{ml: 1.5}}>
+                              {entry.text}
+                            </Typography>
+                          </Box>
+                        ))}
+                        {filteredSubtitleEntries.length === 0 && (
+                          <Box sx={{p: 2, textAlign: 'center', color: 'text.secondary'}}>
+                            No matching subtitles found
+                          </Box>
+                        )}
+                      </Box>
+                    ) : (
+                      /* Full subtitle list - supports range selection with shift-click */
+                      <Box sx={{height: 300, overflowY: 'auto', border: '1px solid #444', borderRadius: 1, mt: 1}} ref={subtitleListRef}>
+                        {subtitleEntries.map((entry, idx) => {
+                          const isSelected = idx >= subtitleSelectionRange.from && idx <= subtitleSelectionRange.to
+                          return (
+                            <Box
+                              key={idx}
+                              data-idx={idx}
+                              onClick={e => {
+                                if (e.shiftKey && subtitleAnchor >= 0) {
+                                  const newEnd = idx
+                                  setSubtitleSelectionEnd(newEnd)
+                                  applySubtitleSelection(
+                                    Math.min(subtitleAnchor, newEnd),
+                                    Math.max(subtitleAnchor, newEnd)
+                                  )
+                                } else {
+                                  setSubtitleAnchor(idx)
+                                  setSubtitleSelectionEnd(idx)
+                                  applySubtitleSelection(idx, idx)
+                                }
+                              }}
+                              sx={{
+                                display: 'flex',
+                                alignItems: 'center',
+                                px: 1.5,
+                                py: 0.75,
+                                cursor: 'pointer',
+                                borderBottom: '1px solid #333',
+                                backgroundColor: isSelected ? '#1a3a5c' : 'transparent',
+                                '&:hover': { backgroundColor: isSelected ? '#1e4676' : '#383c44' },
+                                userSelect: 'none',
+                              }}
+                            >
+                              <Typography variant="caption" color="text.secondary" sx={{minWidth: 70, fontFamily: 'monospace', flexShrink: 0}}>
+                                {millisToDuration(entry.start)}
+                              </Typography>
+                              <Typography variant="body2" sx={{ml: 1.5}}>
+                                {entry.text}
+                              </Typography>
+                            </Box>
+                          )
+                        })}
+                      </Box>
+                    )}
+                  </>
+                )}
               </Box>
             )}
 

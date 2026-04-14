@@ -57,6 +57,7 @@ func NewAPI(config Config, app *Application) (*API, error) {
 	api.http.Get("/sessions", api.getSessions, api.authMiddleware)
 	api.http.Get("/thumb", api.thumb, api.authMiddleware)
 	api.http.Get("/streams/:ratingKey", api.getStreams, api.authMiddleware)
+	api.http.Get("/subtitles/:ratingKey", api.getSubtitleEntries, api.authMiddleware)
 	api.http.Get("/clip/:ratingKey/:from/:to", api.clip, api.authMiddleware)
 	api.http.Get("/preview/:ratingKey/:from/:to", api.preview, api.authMiddleware)
 
@@ -215,6 +216,32 @@ func (a *API) getStreams(ctx fiber.Ctx) error {
 	}
 
 	return ctx.JSON(streams)
+}
+
+func (a *API) getSubtitleEntries(ctx fiber.Ctx) error {
+	ratingKeyStr := ctx.Params("ratingKey")
+	if ratingKeyStr == "" {
+		return fmt.Errorf("ratingKey not specified")
+	}
+
+	mediaIdStr := ctx.Query("mediaId")
+
+	subtitleIndexStr := ctx.Query("subtitle", "-1")
+	subtitleIndex, err := strconv.Atoi(subtitleIndexStr)
+	if err != nil {
+		return fmt.Errorf("subtitle not an integer")
+	}
+
+	if subtitleIndex < 0 {
+		return ctx.JSON([]SubtitleEntry{})
+	}
+
+	entries, err := a.app.GetSubtitleEntries(ctx.UserContext(), ratingKeyStr, mediaIdStr, subtitleIndex)
+	if err != nil {
+		return err
+	}
+
+	return ctx.JSON(entries)
 }
 
 func (a *API) clip(ctx fiber.Ctx) error {

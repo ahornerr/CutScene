@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"errors"
 	"fmt"
@@ -10,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -254,6 +256,126 @@ func DoFfmpegPreview(fileURL, from, to, subtitleFile string, codec Codec, writer
 	_, _ = io.Copy(os.Stderr, errBuff)
 
 	return err
+}
+
+// ExtractSubtitleFull extracts the entire subtitle track at subtitleIndex into a
+// temp SRT file with absolute timestamps (relative to the start of the video).
+// Use this when you need all subtitle entries for browsing/searching.
+func ExtractSubtitleFull(url string, subtitleIndex int) (string, error) {
+	tmpFile := fmt.Sprintf("/tmp/cutscene_subfull_%d.srt", time.Now().UnixNano())
+
+	inputArgs := ffmpeg.KwArgs{
+		"hide_banner": "",
+		"loglevel":    "error",
+	}
+
+	outputArgs := ffmpeg.KwArgs{
+		"map": fmt.Sprintf("0:s:%d", subtitleIndex),
+		"c:s": "srt",
+	}
+
+	errBuff := &bytes.Buffer{}
+	err := ffmpeg.
+		Input(url, inputArgs).
+		Output(tmpFile, outputArgs).
+		OverWriteOutput().
+		WithErrorOutput(errBuff).
+		Run()
+
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) {
+		return "", fmt.Errorf("subtitle extraction failed:\n%s", errBuff.String())
+	}
+	_, _ = io.Copy(os.Stderr, errBuff)
+
+	return tmpFile, err
+}
+
+// ParseSRT parses a SubRip (.srt) file and returns the subtitle entries with
+// millisecond timestamps. Multi-line text blocks are joined with newlines.
+func ParseSRT(filename string) ([]SubtitleEntry, error) {
+	f, err := os.Open(filename)
+	if err != nil {
+		return nil, fmt.Errorf("could not open SRT file: %w", err)
+	}
+	defer f.Close()
+
+	var entries []SubtitleEntry
+	var start, end int64
+	var textLines []string
+
+	// state: 0 = awaiting sequence number, 1 = awaiting timestamp, 2 = collecting text
+	state := 0
+
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		line := strings.TrimRight(scanner.Text(), "\r")
+
+		switch state {
+		case 0: // awaiting sequence number
+			if strings.TrimSpace(line) != "" {
+				state = 1
+			}
+		case 1: // awaiting timestamp line
+			parts := strings.SplitN(line, " --> ", 2)
+			if len(parts) == 2 {
+				start, _ = parseSRTTimestamp(strings.TrimSpace(parts[0]))
+				end, _ = parseSRTTimestamp(strings.TrimSpace(parts[1]))
+				textLines = textLines[:0]
+				state = 2
+			}
+		case 2: // collecting text lines
+			if strings.TrimSpace(line) == "" {
+				if len(textLines) > 0 {
+					entries = append(entries, SubtitleEntry{
+						Start: start,
+						End:   end,
+						Text:  strings.Join(textLines, "\n"),
+					})
+				}
+				state = 0
+			} else {
+				textLines = append(textLines, line)
+			}
+		}
+	}
+
+	// flush any pending entry at EOF (files without trailing blank line)
+	if state == 2 && len(textLines) > 0 {
+		entries = append(entries, SubtitleEntry{
+			Start: start,
+			End:   end,
+			Text:  strings.Join(textLines, "\n"),
+		})
+	}
+
+	return entries, scanner.Err()
+}
+
+// parseSRTTimestamp converts an SRT timestamp string "HH:MM:SS,mmm" to milliseconds.
+func parseSRTTimestamp(s string) (int64, error) {
+	// Strip anything after space (e.g. position tags: "00:01:23,456 X1:0 Y1:0")
+	if i := strings.Index(s, " "); i >= 0 {
+		s = s[:i]
+	}
+	comma := strings.SplitN(s, ",", 2)
+	if len(comma) != 2 {
+		return 0, fmt.Errorf("invalid SRT timestamp: %s", s)
+	}
+	hms := strings.SplitN(comma[0], ":", 3)
+	if len(hms) != 3 {
+		return 0, fmt.Errorf("invalid SRT timestamp: %s", s)
+	}
+	h, err1 := strconv.ParseInt(hms[0], 10, 64)
+	m, err2 := strconv.ParseInt(hms[1], 10, 64)
+	sec, err3 := strconv.ParseInt(hms[2], 10, 64)
+	ms, err4 := strconv.ParseInt(comma[1], 10, 64)
+	for _, e := range []error{err1, err2, err3, err4} {
+		if e != nil {
+			return 0, fmt.Errorf("invalid SRT timestamp %q: %w", s, e)
+		}
+	}
+	return h*3600000 + m*60000 + sec*1000 + ms, nil
 }
 
 // ExtractSubtitle extracts the subtitle stream at subtitleIndex (0-based among
