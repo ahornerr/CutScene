@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strconv"
+	"time"
 )
 
 type Codec string
@@ -21,14 +22,15 @@ const (
 )
 
 type FfmpegParams struct {
-	URL      string
-	From     string
-	To       string
-	Filename string
-	Height   int
-	QP       int
-	Codec    Codec
-	Metadata FfmpegParamsMetadata
+	URL           string
+	From          string
+	To            string
+	Filename      string
+	Height        int
+	QP            int
+	Codec         Codec
+	SubtitleFile  string
+	Metadata      FfmpegParamsMetadata
 }
 
 type FfmpegParamsMetadata struct {
@@ -103,12 +105,30 @@ func DoFfmpeg(params FfmpegParams) (string, error) {
 
 	switch params.Codec {
 	case CodecH264VAAPI:
-		outputArgs["vf"] = "hwupload,scale_vaapi=format=nv12,scale_vaapi=-2:" + strconv.Itoa(params.Height)
+		if params.SubtitleFile != "" {
+			// Software subtitle filter can't run on VAAPI frames; decode to system
+			// memory first, apply subtitles, then upload for hardware encoding.
+			delete(inputArgs, "hwaccel_output_format")
+			outputArgs["vf"] = fmt.Sprintf("subtitles=%s,format=nv12,hwupload,scale_vaapi=format=nv12,scale_vaapi=-2:%d",
+				params.SubtitleFile, params.Height)
+		} else {
+			outputArgs["vf"] = "hwupload,scale_vaapi=format=nv12,scale_vaapi=-2:" + strconv.Itoa(params.Height)
+		}
 		outputArgs["compression_level"] = "0" // https://trac.ffmpeg.org/wiki/Hardware/VAAPI#AMDMesa
 	case CodecH264NVENC:
-		inputArgs["hwaccel_output_format"] = "cuda"
-		if params.Height > 0 {
-			outputArgs["vf"] = "scale_cuda=-2:" + strconv.Itoa(params.Height)
+		if params.SubtitleFile != "" {
+			// Apply subtitles in software; h264_nvenc accepts software frames.
+			if params.Height > 0 {
+				outputArgs["vf"] = fmt.Sprintf("subtitles=%s,hwupload_cuda,scale_cuda=-2:%d",
+					params.SubtitleFile, params.Height)
+			} else {
+				outputArgs["vf"] = fmt.Sprintf("subtitles=%s", params.SubtitleFile)
+			}
+		} else {
+			inputArgs["hwaccel_output_format"] = "cuda"
+			if params.Height > 0 {
+				outputArgs["vf"] = "scale_cuda=-2:" + strconv.Itoa(params.Height)
+			}
 		}
 		if params.QP == 0 {
 			outputArgs["rc"] = "constqp"
@@ -118,7 +138,11 @@ func DoFfmpeg(params FfmpegParams) (string, error) {
 	case CodecLibx264:
 		fallthrough
 	default:
-		outputArgs["vf"] = "scale=-2:" + strconv.Itoa(params.Height)
+		vf := "scale=-2:" + strconv.Itoa(params.Height)
+		if params.SubtitleFile != "" {
+			vf += ",subtitles=" + params.SubtitleFile
+		}
+		outputArgs["vf"] = vf
 		outputArgs["pix_fmt"] = "yuv420p"
 		outputArgs["crf"] = 23
 		outputArgs["video_bitrate"] = 0
@@ -146,7 +170,7 @@ func DoFfmpeg(params FfmpegParams) (string, error) {
 	return tmpFile, err
 }
 
-func DoFfmpegPreview(fileURL, from, to string, codec Codec, writer io.Writer) error {
+func DoFfmpegPreview(fileURL, from, to, subtitleFile string, codec Codec, writer io.Writer) error {
 	inputArgs := ffmpeg.KwArgs{
 		"ss":      from,
 		"to":      to,
@@ -169,7 +193,9 @@ func DoFfmpegPreview(fileURL, from, to string, codec Codec, writer io.Writer) er
 	}
 
 	outputArgs := ffmpeg.KwArgs{
-		"acodec":   "libvorbis",
+		"acodec":   "aac",
+		"ac":       2,
+		"b:a":      "192k",
 		"f":        "mp4",
 		"movflags": "frag_keyframe+empty_moov",
 		// TODO
@@ -182,15 +208,29 @@ func DoFfmpegPreview(fileURL, from, to string, codec Codec, writer io.Writer) er
 
 	switch codec {
 	case CodecH264VAAPI:
-		outputArgs["vf"] = "hwupload,scale_vaapi=format=nv12,scale_vaapi=-2:" + strconv.Itoa(height)
+		if subtitleFile != "" {
+			delete(inputArgs, "hwaccel_output_format")
+			outputArgs["vf"] = fmt.Sprintf("subtitles=%s,format=nv12,hwupload,scale_vaapi=format=nv12,scale_vaapi=-2:%d",
+				subtitleFile, height)
+		} else {
+			outputArgs["vf"] = "hwupload,scale_vaapi=format=nv12,scale_vaapi=-2:" + strconv.Itoa(height)
+		}
 		outputArgs["compression_level"] = "0" // https://trac.ffmpeg.org/wiki/Hardware/VAAPI#AMDMesa
 	case CodecH264NVENC:
-		inputArgs["hwaccel_output_format"] = "cuda"
-		outputArgs["vf"] = "scale_cuda=-2:" + strconv.Itoa(height)
+		if subtitleFile != "" {
+			outputArgs["vf"] = fmt.Sprintf("subtitles=%s,hwupload_cuda,scale_cuda=-2:%d", subtitleFile, height)
+		} else {
+			inputArgs["hwaccel_output_format"] = "cuda"
+			outputArgs["vf"] = "scale_cuda=-2:" + strconv.Itoa(height)
+		}
 	case CodecLibx264:
 		fallthrough
 	default:
-		outputArgs["vf"] = "scale=-2:" + strconv.Itoa(height)
+		vf := "scale=-2:" + strconv.Itoa(height)
+		if subtitleFile != "" {
+			vf += ",subtitles=" + subtitleFile
+		}
+		outputArgs["vf"] = vf
 		outputArgs["pix_fmt"] = "yuv420p"
 		outputArgs["crf"] = 23
 		outputArgs["video_bitrate"] = 0
@@ -214,4 +254,43 @@ func DoFfmpegPreview(fileURL, from, to string, codec Codec, writer io.Writer) er
 	_, _ = io.Copy(os.Stderr, errBuff)
 
 	return err
+}
+
+// ExtractSubtitle extracts the subtitle stream at subtitleIndex (0-based among
+// subtitle streams) for the given time range and writes it to a temp SRT file.
+// The timestamps in the output file are relative to from, so they align with
+// the clip produced by DoFfmpeg for the same range.
+func ExtractSubtitle(url, from, to string, subtitleIndex int) (string, error) {
+	tmpFile := fmt.Sprintf("/tmp/cutscene_sub_%d.srt", time.Now().UnixNano())
+
+	inputArgs := ffmpeg.KwArgs{
+		"hide_banner": "",
+		"loglevel":    "error",
+	}
+
+	// Output-side seeking ensures SRT timestamps are 0-relative from FROM,
+	// matching the video's PTS=0 at FROM after input-side seeking discards
+	// frames before the keyframe.
+	outputArgs := ffmpeg.KwArgs{
+		"ss":  from,
+		"to":  to,
+		"map": fmt.Sprintf("0:s:%d", subtitleIndex),
+		"c:s": "srt",
+	}
+
+	errBuff := &bytes.Buffer{}
+	err := ffmpeg.
+		Input(url, inputArgs).
+		Output(tmpFile, outputArgs).
+		OverWriteOutput().
+		WithErrorOutput(errBuff).
+		Run()
+
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) {
+		return "", fmt.Errorf("subtitle extraction failed:\n%s", errBuff.String())
+	}
+	_, _ = io.Copy(os.Stderr, errBuff)
+
+	return tmpFile, err
 }

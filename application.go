@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"github.com/LukeHagar/plexgo/models/components"
 	"io"
+	"os"
 	"strconv"
 
 	"github.com/LukeHagar/plexgo"
@@ -114,7 +115,78 @@ func (a *Application) GetSessions(ctx context.Context) ([]operations.GetSessions
 	return filteredSessions, nil
 }
 
-func (a *Application) Clip(ctx context.Context, ratingKeyStr, mediaIdStr, from, to string, height, qp int) (string, error) {
+// SubtitleStream describes a text-based subtitle track available in a media item.
+type SubtitleStream struct {
+	Index        int    `json:"index"`        // 0-based subtitle stream index (for FFmpeg -map 0:s:N)
+	Language     string `json:"language"`
+	DisplayTitle string `json:"displayTitle"`
+	Codec        string `json:"codec"`
+	Default      bool   `json:"default"`
+}
+
+// textSubtitleCodecs are codecs that can be extracted to SRT and rendered by libass.
+var textSubtitleCodecs = map[string]bool{
+	"srt":      true,
+	"subrip":   true,
+	"ass":      true,
+	"ssa":      true,
+	"webvtt":   true,
+	"mov_text": true,
+	"text":     true,
+}
+
+func (a *Application) GetSubtitleStreams(ctx context.Context, ratingKeyStr string) ([]SubtitleStream, error) {
+	ratingKey, err := strconv.ParseFloat(ratingKeyStr, 0)
+	if err != nil {
+		return nil, fmt.Errorf("could not parse rating key: %w", err)
+	}
+
+	libraryMetadata, err := a.plexAdmin.Library.GetMetadata(ctx, ratingKey)
+	if err != nil {
+		return nil, err
+	}
+
+	metadata := libraryMetadata.Object.MediaContainer.Metadata[0]
+	if len(metadata.Media) == 0 || len(metadata.Media[0].Part) == 0 {
+		return nil, nil
+	}
+
+	var result []SubtitleStream
+	subtitleIdx := 0
+	for _, stream := range metadata.Media[0].Part[0].Stream {
+		if stream.StreamType == nil || *stream.StreamType != 3 {
+			continue
+		}
+
+		codec := ""
+		if stream.Codec != nil {
+			codec = *stream.Codec
+		}
+
+		if textSubtitleCodecs[codec] {
+			s := SubtitleStream{
+				Index: subtitleIdx,
+				Codec: codec,
+			}
+			if stream.Language != nil {
+				s.Language = *stream.Language
+			}
+			if stream.DisplayTitle != nil {
+				s.DisplayTitle = *stream.DisplayTitle
+			}
+			if stream.Default != nil {
+				s.Default = *stream.Default
+			}
+			result = append(result, s)
+		}
+
+		subtitleIdx++ // always increment to reflect true FFmpeg stream index
+	}
+
+	return result, nil
+}
+
+func (a *Application) Clip(ctx context.Context, ratingKeyStr, mediaIdStr, from, to string, height, qp, subtitleIndex int) (string, error) {
 	ratingKey, err := strconv.ParseFloat(ratingKeyStr, 0)
 	if err != nil {
 		return "", fmt.Errorf("could not parse rating key: %w", err)
@@ -162,6 +234,19 @@ func (a *Application) Clip(ctx context.Context, ratingKeyStr, mediaIdStr, from, 
 		a.config.Plex.Token,
 	)
 
+	// Extract subtitle for burning in if requested. ExtractSubtitle runs a short
+	// FFmpeg pass to demux the subtitle stream into a temp SRT file with timestamps
+	// relative to `from`, so they align with the clip's video timeline.
+	var subtitleFile string
+	if subtitleIndex >= 0 {
+		var err error
+		subtitleFile, err = ExtractSubtitle(fileURL, from, to, subtitleIndex)
+		if err != nil {
+			return "", fmt.Errorf("could not extract subtitle: %w", err)
+		}
+		defer os.Remove(subtitleFile)
+	}
+
 	var fileName string
 	if *metadata.Type == "episode" {
 		fileName = fmt.Sprintf("%s S%02dE%02d %s (%s - %s).mp4",
@@ -182,13 +267,14 @@ func (a *Application) Clip(ctx context.Context, ratingKeyStr, mediaIdStr, from, 
 	}
 
 	params := FfmpegParams{
-		URL:      fileURL,
-		From:     from,
-		To:       to,
-		Filename: fileName,
-		Codec:    a.config.Ffmpeg.Codec,
-		Height:   height,
-		QP:       qp,
+		URL:          fileURL,
+		From:         from,
+		To:           to,
+		Filename:     fileName,
+		Codec:        a.config.Ffmpeg.Codec,
+		Height:       height,
+		QP:           qp,
+		SubtitleFile: subtitleFile,
 		Metadata: FfmpegParamsMetadata{
 			Title: *metadata.Title,
 		},
