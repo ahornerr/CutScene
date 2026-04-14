@@ -11,6 +11,7 @@ import (
 	"github.com/google/uuid"
 	"io"
 	"net/url"
+	"os"
 	"path/filepath"
 	"strconv"
 
@@ -55,6 +56,7 @@ func NewAPI(config Config, app *Application) (*API, error) {
 
 	api.http.Get("/sessions", api.getSessions, api.authMiddleware)
 	api.http.Get("/thumb", api.thumb, api.authMiddleware)
+	api.http.Get("/streams/:ratingKey", api.getStreams, api.authMiddleware)
 	api.http.Get("/clip/:ratingKey/:from/:to", api.clip, api.authMiddleware)
 	api.http.Get("/preview/:ratingKey/:from/:to", api.preview, api.authMiddleware)
 
@@ -201,6 +203,20 @@ func (a *API) getSessions(ctx fiber.Ctx) error {
 	return ctx.JSON(sessions)
 }
 
+func (a *API) getStreams(ctx fiber.Ctx) error {
+	ratingKeyStr := ctx.Params("ratingKey")
+	if ratingKeyStr == "" {
+		return fmt.Errorf("ratingKey not specified")
+	}
+
+	streams, err := a.app.GetSubtitleStreams(ctx.UserContext(), ratingKeyStr)
+	if err != nil {
+		return err
+	}
+
+	return ctx.JSON(streams)
+}
+
 func (a *API) clip(ctx fiber.Ctx) error {
 	ratingKeyStr := ctx.Params("ratingKey")
 	if ratingKeyStr == "" {
@@ -231,7 +247,13 @@ func (a *API) clip(ctx fiber.Ctx) error {
 		return fmt.Errorf("qp not an integer")
 	}
 
-	filePath, err := a.app.Clip(ctx.UserContext(), ratingKeyStr, mediaIdStr, from, to, height, qp)
+	subtitleIndexStr := ctx.Query("subtitle", "-1")
+	subtitleIndex, err := strconv.Atoi(subtitleIndexStr)
+	if err != nil {
+		return fmt.Errorf("subtitle not an integer")
+	}
+
+	filePath, err := a.app.Clip(ctx.UserContext(), ratingKeyStr, mediaIdStr, from, to, height, qp, subtitleIndex)
 	if err != nil {
 		return err
 	}
@@ -269,13 +291,6 @@ func (a *API) preview(ctx fiber.Ctx) error {
 		return fmt.Errorf("ratingKey not specified")
 	}
 
-	ratingKey, err := strconv.ParseFloat(ratingKeyStr, 0)
-	if err != nil {
-		return fmt.Errorf("could not parse rating key: %w", err)
-	}
-
-	mediaIdStr := ctx.Query("mediaId")
-
 	from := ctx.Params("from")
 	if from == "" {
 		return fmt.Errorf("from not specified")
@@ -286,6 +301,26 @@ func (a *API) preview(ctx fiber.Ctx) error {
 		return fmt.Errorf("to not specified")
 	}
 
+	subtitleIndexStr := ctx.Query("subtitle", "-1")
+	subtitleIndex, err := strconv.Atoi(subtitleIndexStr)
+	if err != nil {
+		return fmt.Errorf("subtitle not an integer")
+	}
+
+	previewMediaIdStr := ctx.Query("mediaId")
+	var previewMediaId int
+	if previewMediaIdStr != "" {
+		previewMediaId, err = strconv.Atoi(previewMediaIdStr)
+		if err != nil {
+			return fmt.Errorf("could not parse media id: %w", err)
+		}
+	}
+
+	ratingKey, err := strconv.ParseFloat(ratingKeyStr, 0)
+	if err != nil {
+		return fmt.Errorf("could not parse rating key: %w", err)
+	}
+
 	libraryMetadata, err := a.app.plexAdmin.Library.GetMetadata(ctx.UserContext(), ratingKey)
 	if err != nil {
 		return fmt.Errorf("could not get library metadata: %w", err)
@@ -293,43 +328,51 @@ func (a *API) preview(ctx fiber.Ctx) error {
 
 	metadata := libraryMetadata.Object.MediaContainer.Metadata[0]
 
-	var media *operations.GetMetadataMedia
-	if mediaIdStr != "" {
-		mediaId, err := strconv.Atoi(mediaIdStr)
-		if err != nil {
-			return fmt.Errorf("could not parse media id: %w", err)
-		}
-
+	var previewMedia *operations.GetMetadataMedia
+	if previewMediaIdStr != "" {
 		for _, m := range metadata.Media {
-			if m.ID != nil && *m.ID == mediaId {
-				media = &m
+			if m.ID != nil && *m.ID == previewMediaId {
+				previewMedia = &m
+				break
 			}
 		}
 	}
 
-	if media == nil {
+	if previewMedia == nil {
 		for _, m := range metadata.Media {
 			// 10 bit encoding doesn't work correctly on NVIDIA hardware (and maybe others)
 			if m.VideoProfile != nil && *m.VideoProfile == "main 10" {
 				continue
 			}
-			media = &m
+			previewMedia = &m
 			break
 		}
 	}
 
-	if media == nil {
+	if previewMedia == nil {
 		return fmt.Errorf("could not find suitable media for rating key")
 	}
 
 	fileURL := fmt.Sprintf("%s%s?X-Plex-Token=%s",
 		a.config.Plex.Host,
-		*media.Part[0].Key,
+		*previewMedia.Part[0].Key,
 		a.config.Plex.Token,
 	)
 
+	// Extract subtitle to temp file if requested
+	var subtitleFile string
+	if subtitleIndex >= 0 {
+		subtitleFile, err = ExtractSubtitle(fileURL, from, to, subtitleIndex)
+		if err != nil {
+			return fmt.Errorf("could not extract subtitle: %w", err)
+		}
+	}
+
 	ctx.Response().SetBodyStreamWriter(func(w *bufio.Writer) {
-		_ = DoFfmpegPreview(fileURL, from, to, a.config.Ffmpeg.Codec, w)
+		if subtitleFile != "" {
+			defer os.Remove(subtitleFile)
+		}
+		_ = DoFfmpegPreview(fileURL, from, to, subtitleFile, a.config.Ffmpeg.Codec, w)
 	})
 
 	ctx.Set("Content-Type", "video/mp4")

@@ -1,7 +1,7 @@
 import './App.css';
 import {useCallback, useEffect, useMemo, useState} from "react";
 import ReactPlayer from "react-player";
-import {Box, Button, Card, CardActionArea, CardContent, CardMedia, Slider, TextField, Typography} from "@mui/material";
+import {Box, Button, Card, CardActionArea, CardContent, CardMedia, FormControl, InputLabel, MenuItem, Select, Slider, TextField, Typography} from "@mui/material";
 import {debounce} from '@mui/material/utils'
 import {TimePicker} from "@mui/x-date-pickers";
 import moment from "moment";
@@ -47,6 +47,8 @@ function App() {
   const [endPosition, setEndPosition] = useState(null)
   const [playerUrl, setPlayerUrl] = useState(null)
   const [needsAuth, setNeedsAuth] = useState(false)
+  const [subtitleStreams, setSubtitleStreams] = useState([])
+  const [selectedSubtitle, setSelectedSubtitle] = useState(-1)
 
   useEffect(() => {
     fetch('/sessions', {redirect: "manual"})
@@ -70,15 +72,28 @@ function App() {
   }, [setNeedsAuth, setSessions])
 
   const setPlayerPosition = useCallback((startPosition, endPosition) => {
-    setPlayerUrl(`/preview/${selectedSession.ratingKey}/${millisToDuration(startPosition)}/${millisToDuration(endPosition)}?mediaId=${selectedSession.Media[0].Part[0].id}`)
-  }, [selectedSession]);
+    const subtitleParam = selectedSubtitle >= 0 ? `&subtitle=${selectedSubtitle}` : ''
+    setPlayerUrl(`/preview/${selectedSession.ratingKey}/${millisToDuration(startPosition)}/${millisToDuration(endPosition)}?mediaId=${selectedSession.Media[0].Part[0].id}${subtitleParam}`)
+  }, [selectedSession, selectedSubtitle]);
 
   useEffect(() => {
     if (selectedSession) {
       setStartPosition(selectedSession.viewOffset)
       setEndPosition(selectedSession.viewOffset + 60000)
+      setSubtitleStreams([])
+      setSelectedSubtitle(-1)
+      fetch(`/streams/${selectedSession.ratingKey}`)
+        .then(r => r.json())
+        .then(streams => {
+          setSubtitleStreams(streams || [])
+          if (streams && streams.length > 0) {
+            setSelectedSubtitle(streams[0].index)
+          }
+        })
+        .catch(err => console.log('Could not fetch subtitle streams:', err))
     }
-  }, [selectedSession, setStartPosition, setEndPosition])
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedSession])
 
   const debounceSetPosition = useMemo(
     () => debounce(setPlayerPosition, 500),
@@ -172,6 +187,35 @@ function App() {
                 }
               }}
             />
+
+            {subtitleStreams.length > 0 && (
+              <Box sx={{width: '100%', mb: 3}} display='flex' justifyContent='center' alignItems='center'>
+                <Box sx={{width: 200, mr: 3}}>
+                  <FormControl fullWidth>
+                    <InputLabel id="subtitle-select">Subtitles</InputLabel>
+                    <Select
+                      labelId="subtitle-select"
+                      value={selectedSubtitle}
+                      onChange={e => setSelectedSubtitle(e.target.value)}
+                    >
+                      <MenuItem value={-1}>None</MenuItem>
+                      {subtitleStreams.map((stream, idx) => (
+                        <MenuItem key={idx} value={stream.index}>
+                          {stream.language
+                            ? `${stream.language} (${stream.displayTitle || 'Track ' + (stream.index + 1)})`
+                            : stream.displayTitle || 'Track ' + (stream.index + 1)}
+                        </MenuItem>
+                      ))}
+                    </Select>
+                  </FormControl>
+                </Box>
+                <Box sx={{flex: 1}}>
+                  <Typography variant="body2" color="text.secondary">
+                    {subtitleStreams.find(s => s.index === selectedSubtitle)?.codec}
+                  </Typography>
+                </Box>
+              </Box>
+            )}
 
             <Box sx={{width: '75%'}} mt={6} display='flex' justifyContent='center' alignItems='center'>
               <Box sx={{width: 80}}>
@@ -272,7 +316,7 @@ function App() {
             <Box my={6}>
               <Button
                 variant="contained"
-                href={`/clip/${selectedSession.ratingKey}/${millisToDuration(startPosition)}/${millisToDuration(endPosition)}?mediaId=${selectedSession.Media[0].Part[0].id}`}
+                href={`/clip/${selectedSession.ratingKey}/${millisToDuration(startPosition)}/${millisToDuration(endPosition)}?mediaId=${selectedSession.Media[0].Part[0].id}${selectedSubtitle >= 0 ? `&subtitle=${selectedSubtitle}` : ''}`}
                 target="_blank"
                 download
               >
