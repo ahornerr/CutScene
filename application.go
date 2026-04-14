@@ -124,6 +124,13 @@ type SubtitleStream struct {
 	Default      bool   `json:"default"`
 }
 
+// SubtitleEntry represents a single subtitle line block with its time range and text.
+type SubtitleEntry struct {
+	Start int64  `json:"start"` // milliseconds from start of video
+	End   int64  `json:"end"`   // milliseconds from start of video
+	Text  string `json:"text"`
+}
+
 // textSubtitleCodecs are codecs that can be extracted to SRT and rendered by libass.
 var textSubtitleCodecs = map[string]bool{
 	"srt":      true,
@@ -184,6 +191,62 @@ func (a *Application) GetSubtitleStreams(ctx context.Context, ratingKeyStr strin
 	}
 
 	return result, nil
+}
+
+func (a *Application) GetSubtitleEntries(ctx context.Context, ratingKeyStr, mediaIdStr string, subtitleIndex int) ([]SubtitleEntry, error) {
+	ratingKey, err := strconv.ParseFloat(ratingKeyStr, 0)
+	if err != nil {
+		return nil, fmt.Errorf("could not parse rating key: %w", err)
+	}
+
+	libraryMetadata, err := a.plexAdmin.Library.GetMetadata(ctx, ratingKey)
+	if err != nil {
+		return nil, fmt.Errorf("could not get library metadata: %w", err)
+	}
+
+	metadata := libraryMetadata.Object.MediaContainer.Metadata[0]
+
+	var media *operations.GetMetadataMedia
+	if mediaIdStr != "" {
+		mediaId, err := strconv.Atoi(mediaIdStr)
+		if err != nil {
+			return nil, fmt.Errorf("could not parse media id: %w", err)
+		}
+		for _, m := range metadata.Media {
+			if m.ID != nil && *m.ID == mediaId {
+				media = &m
+				break
+			}
+		}
+	}
+
+	if media == nil {
+		for _, m := range metadata.Media {
+			if m.VideoProfile != nil && *m.VideoProfile == "main 10" {
+				continue
+			}
+			media = &m
+			break
+		}
+	}
+
+	if media == nil {
+		return nil, fmt.Errorf("could not find suitable media for rating key")
+	}
+
+	fileURL := fmt.Sprintf("%s%s?X-Plex-Token=%s",
+		a.config.Plex.Host,
+		*media.Part[0].Key,
+		a.config.Plex.Token,
+	)
+
+	tmpFile, err := ExtractSubtitleFull(fileURL, subtitleIndex)
+	if err != nil {
+		return nil, fmt.Errorf("could not extract subtitle: %w", err)
+	}
+	defer os.Remove(tmpFile)
+
+	return ParseSRT(tmpFile)
 }
 
 func (a *Application) Clip(ctx context.Context, ratingKeyStr, mediaIdStr, from, to string, height, qp, subtitleIndex int) (string, error) {
