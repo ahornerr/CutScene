@@ -5,3 +5,4 @@ services:
       - 8080:8080
     volumes:
       - ./config.yaml:/config.yaml
+      - ./fiber.sqlite3:/fiber.sqlite3

@@ -1,11 +1,15 @@
 plex:
   host: https://my.plex.server
-  token: xxxxxxxxxxxxxxxxx
+  token: replace-with-a-plex-server-token
 api:
   listen_addr: ":8080"
+  # Browser-reachable URL used as the Plex OAuth/PIN authentication forward URL.
+  domain: http://localhost:8080
 ffmpeg:
-  # libx264 is the default (software) encoder.
-  # h264_vaapi is also supported for faster hardware encoding with Intel quicksync (untested)
-  # and AMD GPUs (tested on Linux).
-  # Set to h264_nvenc for Nvidia GPUs.
+  # Maximum concurrent FFmpeg processes, shared by previews and render jobs.
+  # Defaults to 2 when omitted, zero, or negative.
+  concurrency: 2
+  # libx264 is software encoding. h264_vaapi requires Linux VAAPI and /dev/dri.
+  # h264_nvenc requires Nvidia drivers, Docker GPU access, and the Nvidia
+  # Container Toolkit. See README.md for the Docker GPU setup.
   codec: libx264

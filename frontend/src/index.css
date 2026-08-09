@@ -1,14 +1,68 @@
+/* CutScene global resets and base typography. Local/system font stacks only. */
+
+:root {
+  --cs-bg: #13151a;
+  --cs-paper: #1b1e26;
+  --cs-accent: #ff7300;
+  --cs-accent-warm: #ffab1e;
+  --cs-text: #f4f5f8;
+  --cs-text-dim: #a7adb9;
+}
+
+html, body, #root {
+  height: 100%;
+}
+
 body {
   margin: 0;
-  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', 'Oxygen',
-    'Ubuntu', 'Cantarell', 'Fira Sans', 'Droid Sans', 'Helvetica Neue',
-    sans-serif;
+  font-family: system-ui, "Segoe UI", "Helvetica Neue", Arial, sans-serif;
+  font-feature-settings: "kern", "liga", "calt", "ss01";
+  font-variant-numeric: tabular-nums;
+  background-color: var(--cs-bg);
+  color: var(--cs-text);
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
-  color: #ffffff;
 }
 
 code {
-  font-family: source-code-pro, Menlo, Monaco, Consolas, 'Courier New',
-    monospace;
+  font-family: ui-monospace, "SFMono-Regular", Menlo, Consolas, "Liberation Mono", monospace;
+}
+
+h1, h2, h3, h4, h5, h6 {
+  text-wrap: balance;
+}
+
+/* Visible focus for keyboard users across custom interactive elements. */
+.cs-focusable:focus-visible {
+  outline: 2px solid #ffd9b0;
+  outline-offset: 2px;
+  border-radius: 8px;
+}
+
+/* Thin custom scrollbar for subtitle panes (WebKit). */
+.cs-scroll {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(255,255,255,0.18) transparent;
+}
+.cs-scroll::-webkit-scrollbar { width: 10px; }
+.cs-scroll::-webkit-scrollbar-track { background: transparent; }
+.cs-scroll::-webkit-scrollbar-thumb {
+  background: rgba(255,255,255,0.16);
+  border-radius: 999px;
+  border: 2px solid transparent;
+  background-clip: content-box;
+}
+.cs-scroll::-webkit-scrollbar-thumb:hover { background: rgba(255,255,255,0.28); background-clip: content-box; }
+
+/* Orchestrated reveal used on workspace mount. */
+@keyframes cs-rise {
+  from { opacity: 0; transform: translateY(10px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+.cs-rise { animation: cs-rise 420ms cubic-bezier(0.2, 0.7, 0.2, 1) both; }
+.cs-rise-2 { animation: cs-rise 420ms cubic-bezier(0.2, 0.7, 0.2, 1) 70ms both; }
+.cs-rise-3 { animation: cs-rise 420ms cubic-bezier(0.2, 0.7, 0.2, 1) 140ms both; }
+
+@media (prefers-reduced-motion: reduce) {
+  .cs-rise, .cs-rise-2, .cs-rise-3 { animation: none; }
 }
