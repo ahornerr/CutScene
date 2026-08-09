@@ -2,6 +2,8 @@
 
 CutScene lets you create short clips from media that is currently playing in Plex. It includes a browser UI and an HTTP API.
 
+![](.github/cutscene.png)
+
 ## Setup
 
 Copy [config.example.yaml](config.example.yaml) to [config.yaml](config.yaml) in the same directory and set the values for your Plex server. The Plex token is used by CutScene to read server metadata; see [Plex's instructions for finding an authentication token](https://support.plex.tv/articles/204059436-finding-an-authentication-token-x-plex-token/).
