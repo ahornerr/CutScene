@@ -14,6 +14,7 @@ import {
 } from "./utils";
 
 const POLL_INTERVAL_MS = 2000
+const SESSION_REFRESH_INTERVAL_MS = 10000
 const MAX_NETWORK_RETRIES = 5
 const EXPIRY_TICK_MS = 1000
 
@@ -31,6 +32,13 @@ function App() {
   const [playerError, setPlayerError] = useState(false)
   const [previewStale, setPreviewStale] = useState(false)
   const [audioMode, setAudioMode] = useState(AUDIO_MODES.STANDARD)
+
+  // --- Theater mode ---
+  // Desktop-only view toggle: widens the preview rail (Container lg → xl) and
+  // collapses the workspace grid to a single column so subtitles drop beneath
+  // the player. Reset on session change alongside the other ephemeral
+  // workspace state for a predictable per-session default.
+  const [theaterMode, setTheaterMode] = useState(false)
 
   // --- Subtitle offset ---
   // Positive = subtitles appear later, negative = earlier. Retained across
@@ -72,6 +80,14 @@ function App() {
   const pollTimeoutRef = useRef(null)
   const networkRetryCountRef = useRef(0)
   const jobIdRef = useRef(null)
+  const sessionRefreshControllerRef = useRef(null)
+  const sessionRefreshTimeoutRef = useRef(null)
+  const sessionRefreshInFlightRef = useRef(false)
+  const sessionRefreshGenerationRef = useRef(0)
+  const sessionRefreshRequestRef = useRef(0)
+  const sessionRefreshActiveRef = useRef(false)
+  const sessionRefreshRunnerRef = useRef(null)
+  const sessionsHaveDataRef = useRef(false)
 
   // ---------------------------------------------------------------- render-job cleanup
   const stopPolling = useCallback(() => {
@@ -109,27 +125,108 @@ function App() {
   }, [])
 
   // ---------------------------------------------------------------- sessions
-  useEffect(() => {
-    let active = true
-    fetch('/sessions', {redirect: "manual"})
+  const [sessionsRetry, setSessionsRetry] = useState(0)
+  const [documentVisible, setDocumentVisible] = useState(() => document.visibilityState !== 'hidden')
+
+  const stopSessionRefresh = useCallback(() => {
+    sessionRefreshActiveRef.current = false
+    sessionRefreshGenerationRef.current += 1
+    if (sessionRefreshTimeoutRef.current) {
+      clearTimeout(sessionRefreshTimeoutRef.current)
+      sessionRefreshTimeoutRef.current = null
+    }
+    if (sessionRefreshControllerRef.current) {
+      sessionRefreshControllerRef.current.abort()
+      sessionRefreshControllerRef.current = null
+    }
+    sessionRefreshInFlightRef.current = false
+  }, [])
+
+  const scheduleSessionRefresh = useCallback(() => {
+    if (!sessionRefreshActiveRef.current || sessionRefreshInFlightRef.current || sessionRefreshTimeoutRef.current) return
+    sessionRefreshTimeoutRef.current = setTimeout(() => {
+      sessionRefreshTimeoutRef.current = null
+      sessionRefreshRunnerRef.current?.()
+    }, SESSION_REFRESH_INTERVAL_MS)
+  }, [])
+
+  const refreshSessions = useCallback(() => {
+    if (!sessionRefreshActiveRef.current || sessionRefreshInFlightRef.current) return
+
+    const generation = sessionRefreshGenerationRef.current
+    const requestId = sessionRefreshRequestRef.current + 1
+    sessionRefreshRequestRef.current = requestId
+    const controller = new AbortController()
+    sessionRefreshControllerRef.current = controller
+    sessionRefreshInFlightRef.current = true
+
+    const isCurrent = () => (
+      sessionRefreshActiveRef.current &&
+      sessionRefreshGenerationRef.current === generation &&
+      sessionRefreshRequestRef.current === requestId
+    )
+
+    fetch('/sessions', {redirect: "manual", signal: controller.signal})
       .then(response => {
-        if (response.type === "opaqueredirect") {
+        if (!isCurrent()) return undefined
+        if (response.type === "opaqueredirect" || response.status === 401 || response.status === 403) {
           setNeedsAuth(true)
-          return null
+          stopSessionRefresh()
+          return undefined
         }
         if (!response.ok) {
           throw new Error(`Error fetching sessions: ${response.status} ${response.statusText}`)
         }
         return response.json()
       })
-      .then(json => { if (active) setSessions(json || []) })
-      .catch(err => {
-        if (!active) return
-        console.error('Error fetching sessions:', err)
-        setSessionsError(err)
+      .then(json => {
+        if (!isCurrent() || json === undefined) return
+        sessionsHaveDataRef.current = true
+        setSessions(json || [])
+        setSessionsError(null)
       })
-    return () => { active = false }
+      .catch(err => {
+        if (!isCurrent() || isAbortError(err)) return
+        console.error('Error refreshing sessions:', err)
+        // Refresh failures retain the last good picker data. Only the initial
+        // load uses the error state so the existing retry UX remains intact.
+        if (!sessionsHaveDataRef.current) setSessionsError(err)
+      })
+      .finally(() => {
+        if (sessionRefreshGenerationRef.current !== generation || sessionRefreshRequestRef.current !== requestId) return
+        sessionRefreshInFlightRef.current = false
+        if (sessionRefreshControllerRef.current === controller) sessionRefreshControllerRef.current = null
+        scheduleSessionRefresh()
+      })
+  }, [scheduleSessionRefresh, stopSessionRefresh])
+
+  sessionRefreshRunnerRef.current = refreshSessions
+
+  useEffect(() => {
+    const handleVisibilityChange = () => setDocumentVisible(document.visibilityState !== 'hidden')
+    document.addEventListener('visibilitychange', handleVisibilityChange)
+    return () => document.removeEventListener('visibilitychange', handleVisibilityChange)
   }, [])
+
+  useEffect(() => {
+    const pickerVisible = !selectedSession && !needsAuth && documentVisible
+    if (!pickerVisible) {
+      stopSessionRefresh()
+      return undefined
+    }
+
+    sessionRefreshActiveRef.current = true
+    refreshSessions()
+    return stopSessionRefresh
+  }, [documentVisible, needsAuth, refreshSessions, selectedSession, sessionsRetry, stopSessionRefresh])
+
+  const retrySessions = useCallback(() => {
+    stopSessionRefresh()
+    sessionsHaveDataRef.current = false
+    setSessionsError(null)
+    setSessions(null)
+    setSessionsRetry(n => n + 1)
+  }, [stopSessionRefresh])
 
   // ---------------------------------------------------------------- player URL builder
   const setPlayerPosition = useCallback((start, end, subtitleOverride = selectedSubtitle, audioModeOverride = audioMode, offsetOverride = subtitleOffsetMs) => {
@@ -689,6 +786,7 @@ function App() {
     sessionAbortControllerRef.current?.abort()
     sessionGenerationRef.current += 1
     stopPolling()
+    stopSessionRefresh()
     setSelectedSession(null)
     setPlayerUrl(null)
     playerReadyRef.current = false
@@ -712,13 +810,22 @@ function App() {
     setEndPosition(null)
     setAudioMode(AUDIO_MODES.STANDARD)
     setSubtitleOffsetMs(0)
+    setTheaterMode(false)
     setTrimFlashKey(0)
-  }, [jobIsActive, stopPolling])
+  }, [jobIsActive, stopPolling, stopSessionRefresh])
+
+  const handleSelectSession = useCallback((session) => {
+    stopSessionRefresh()
+    setSelectedSession(session)
+  }, [stopSessionRefresh])
 
   // ---------------------------------------------------------------- cleanup on unmount
   useEffect(() => {
-    return () => stopPolling()
-  }, [stopPolling])
+    return () => {
+      stopPolling()
+      stopSessionRefresh()
+    }
+  }, [stopPolling, stopSessionRefresh])
 
   // ---------------------------------------------------------------- render
   const sessionsLoading = sessions === null && !sessionsError && !needsAuth
@@ -741,24 +848,12 @@ function App() {
               </Typography>
             </Box>
             <Box sx={{flex: 1}}/>
-            {selectedSession && (
-              <Button
-                variant="outlined"
-                size="small"
-                onClick={handleChangeSession}
-                disabled={jobIsActive}
-                title={jobIsActive ? changeSessionDisabledReason : ''}
-                sx={{borderColor: 'rgba(255,255,255,0.2)'}}
-              >
-                Change session
-              </Button>
-            )}
           </Toolbar>
         </Container>
       </Box>
 
       <Box component="main" sx={{flex: 1, py: {xs: 2, md: 3}, position: 'relative', zIndex: 2}}>
-        <Container maxWidth="lg">
+        <Container className="cs-main-container" maxWidth={selectedSession && theaterMode ? 'xl' : 'lg'}>
           {needsAuth ? (
             <Stack spacing={2} alignItems="center" className="cs-rise" sx={{py: 5, textAlign: 'center'}}>
               <Typography variant="h4">Connect CutScene to Plex</Typography>
@@ -785,7 +880,8 @@ function App() {
                 loading={sessionsLoading}
                 error={sessionsError}
                 selectedKey={selectedSession?.ratingKey}
-                onSelect={setSelectedSession}
+                onSelect={handleSelectSession}
+                onRetry={retrySessions}
               />
             </Stack>
           ) : (
@@ -815,6 +911,8 @@ function App() {
               onCreateNewJob={() => createRenderJob()}
               audioMode={audioMode}
               onAudioModeChange={setAudioMode}
+              theaterMode={theaterMode}
+              onToggleTheater={() => setTheaterMode(mode => !mode)}
               subtitleOffsetMs={subtitleOffsetMs}
               onSubtitleOffsetChange={setSubtitleOffsetMs}
               subtitle={selectedSubtitle}

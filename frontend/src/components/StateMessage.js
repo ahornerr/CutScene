@@ -1,7 +1,8 @@
 import {Box, CircularProgress, Typography} from "@mui/material";
 
-// Shared loading / empty / error affordance with a live-region option.
-export default function StateMessage({variant = 'empty', title, hint, live = false}) {
+// Shared loading / empty / error affordance with a live-region option. An
+// optional `action` node (e.g. a retry button) renders under the hint.
+export default function StateMessage({variant = 'empty', title, hint, live = false, action}) {
   const tone =
     variant === 'error' ? '#ffb4a8' :
     variant === 'loading' ? 'text.secondary' : 'text.secondary';
@@ -31,6 +32,7 @@ export default function StateMessage({variant = 'empty', title, hint, live = fal
           {hint}
         </Typography>
       )}
+      {action}
     </Box>
   );
 }

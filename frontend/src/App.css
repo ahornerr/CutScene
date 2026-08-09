@@ -41,7 +41,10 @@
   background-clip: text;
 }
 
-/* Workspace grid */
+/* Workspace grid. grid-template-columns is animatable in Chromium 111+; in
+   browsers without it, the grid snaps while the container width and gap ease
+   the rest of the geometry — a graceful progressive enhancement. The shared
+   cubic-bezier matches the orchestrated cs-rise reveal for a cohesive feel. */
 .cs-workspace {
   display: grid;
   gap: 20px;
@@ -49,6 +52,15 @@
   width: 100%;
   position: relative;
   z-index: 2;
+  transition: grid-template-columns 320ms cubic-bezier(0.2, 0.7, 0.2, 1),
+              gap 320ms cubic-bezier(0.2, 0.7, 0.2, 1);
+}
+
+/* Main container widens (lg → xl) when theater mode is on. Transitioning
+   max-width lets the whole workspace "breathe" outward in sync with the grid
+   collapse instead of snapping to the wider breakpoint. */
+.cs-main-container {
+  transition: max-width 320ms cubic-bezier(0.2, 0.7, 0.2, 1);
 }
 
 @media (min-width: 960px) {
@@ -56,9 +68,44 @@
     grid-template-columns: minmax(0, 1.45fr) minmax(360px, 1fr);
     align-items: start;
   }
+  /* Theater mode: collapse to a single full-width column so the preview rail
+     (player + trim + render) sits on top and the subtitle panel drops beneath
+     it — a wider, more immersive preview like YouTube theater mode. */
+  .cs-workspace--theater {
+    grid-template-columns: minmax(0, 1fr);
+  }
 }
 
-/* Player frame with cinematic letterbox bars */
+/* Subtitle reflow softening. When theater mode engages, the subtitle rail
+   drops from the right column to beneath the preview. A short, translate-only
+   settle gives the repositioning a sense of weight without ever hiding content
+   (no opacity change) — keeping it readable for low-vision users. The class is
+   applied once on toggle, so the animation runs a single time. */
+@keyframes cs-theater-subtitle-settle {
+  from { transform: translateY(10px); }
+  to   { transform: translateY(0); }
+}
+@media (min-width: 960px) {
+  .cs-workspace--theater .cs-workspace-subtitles {
+    animation: cs-theater-subtitle-settle 260ms cubic-bezier(0.2, 0.7, 0.2, 1) both;
+  }
+}
+
+/* Player toolbar hosts the theater-mode toggle above the preview frame. */
+.cs-player-toolbar {
+  min-height: 32px;
+}
+
+/* Theater toggle pill — accent fill reads as "on" at a glance. */
+.cs-theater-toggle {
+  font-weight: 600;
+  letter-spacing: 0.01em;
+  text-transform: none;
+}
+
+/* Player frame with cinematic letterbox bars. border-radius and box-shadow
+   transition so entering theater mode deepens the frame's presence alongside
+   the geometry change. */
 .cs-player-frame {
   position: relative;
   width: 100%;
@@ -68,7 +115,19 @@
   overflow: hidden;
   border: 1px solid rgba(255,255,255,0.07);
   box-shadow: 0 24px 60px -28px rgba(0,0,0,0.8);
-  transition: border-color 300ms ease;
+  transition: border-color 300ms ease,
+              border-radius 320ms cubic-bezier(0.2, 0.7, 0.2, 1),
+              box-shadow 320ms cubic-bezier(0.2, 0.7, 0.2, 1);
+}
+
+/* Theater mode deepens the frame: a touch more rounding and a wider, darker
+   shadow so the widened preview reads as more cinematic, not just larger. */
+@media (min-width: 960px) {
+  .cs-workspace--theater .cs-player-frame {
+    border-radius: 16px;
+    box-shadow: 0 34px 84px -32px rgba(0,0,0,0.86),
+                0 0 0 1px rgba(255,115,0,0.06);
+  }
 }
 
 .cs-player-frame::before,
@@ -103,6 +162,12 @@
 
 @media (prefers-reduced-motion: reduce) {
   .cs-player-frame[data-stale="true"] { animation: none; }
+  /* Theater mode geometry changes resolve instantly — no width/grid/gap easing
+     and no subtitle settle animation. Content stays fully readable throughout. */
+  .cs-workspace,
+  .cs-main-container,
+  .cs-player-frame { transition: none; }
+  .cs-workspace--theater .cs-workspace-subtitles { animation: none; }
 }
 
 /* Preview button overlay on the player frame */
