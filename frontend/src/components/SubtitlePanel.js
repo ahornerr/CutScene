@@ -1,19 +1,25 @@
 import {Box, FormControl, InputLabel, MenuItem, Select, Typography} from "@mui/material";
 import SubtitleList from "./SubtitleList";
+import SubtitleOffsetControl from "./SubtitleOffsetControl";
 
 // Right-rail subtitle control room: track selector on top, searchable list below.
+// The subtitle offset stepper lives beside the track selector so all subtitle
+// timing controls sit together; the offset is retained across subtitle
+// selections and applied to both preview and render requests.
 export default function SubtitlePanel({
   streams, selectedSubtitle, onSubtitleChange, streamsLoading, streamsError,
+  subtitleOffsetMs, onSubtitleOffsetChange,
   listMode, listEntries, totalCount, anchor, selectionRange,
   onPick, search, onSearchChange, onClearSearch,
   loading, error, listRef,
 }) {
   const hasStreams = streams.length > 0
   const currentCodec = streams.find(s => s.index === selectedSubtitle)?.codec
+  const offsetDisabled = selectedSubtitle < 0
 
   return (
     <Box className="cs-rise-3" sx={{display: 'flex', flexDirection: 'column', minHeight: 0, height: '100%'}}>
-      <Box sx={{display: 'flex', alignItems: 'center', gap: 2, flexWrap: 'wrap'}}>
+      <Box sx={{display: 'flex', alignItems: 'center', gap: 1.5, flexWrap: 'wrap'}}>
         <FormControl fullWidth size="small" sx={{maxWidth: 280}}>
           <InputLabel id="subtitle-select">Subtitle track</InputLabel>
           <Select
@@ -37,6 +43,11 @@ export default function SubtitlePanel({
             {currentCodec}
           </Typography>
         )}
+        <SubtitleOffsetControl
+          value={subtitleOffsetMs}
+          onChange={onSubtitleOffsetChange}
+          disabled={offsetDisabled}
+        />
       </Box>
 
       {streamsError ? (

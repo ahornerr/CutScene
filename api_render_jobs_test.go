@@ -508,7 +508,7 @@ func TestPreviewColdCacheUsesExternalSubtitleStream(t *testing.T) {
 		},
 	}
 	httpApp := testAuthenticatedParamRoute(http.MethodGet, "/preview/:ratingKey/:from/:to", api.preview)
-	response, err := httpApp.Test(httptest.NewRequest(http.MethodGet, "/preview/movie-1/00:00:00/00:00:02?mediaId=200&subtitle=0", nil))
+	response, err := httpApp.Test(httptest.NewRequest(http.MethodGet, "/preview/movie-1/00:00:00/00:00:02?mediaId=200&subtitle=0&subtitleOffsetMs=-500", nil))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -517,7 +517,7 @@ func TestPreviewColdCacheUsesExternalSubtitleStream(t *testing.T) {
 		body, _ := io.ReadAll(response.Body)
 		t.Fatalf("status = %d body=%s", response.StatusCode, body)
 	}
-	if subtitleContent == "" || !strings.Contains(subtitleContent, "00:00:01,000 --> 00:00:02,000") {
+	if subtitleContent == "" || !strings.Contains(subtitleContent, "00:00:00,500 --> 00:00:02,000") {
 		t.Fatalf("cold-cache preview did not receive clip-relative external subtitle: %q", subtitleContent)
 	}
 }
@@ -617,6 +617,19 @@ func TestPreviewRejectsOutOfBoundsRangeBeforeUpstreamCalls(t *testing.T) {
 	defer response.Body.Close()
 	if response.StatusCode != http.StatusUnprocessableEntity {
 		t.Fatalf("preview range status = %d, want 422", response.StatusCode)
+	}
+}
+
+func TestPreviewRejectsInvalidSubtitleOffsetBeforeUpstreamCalls(t *testing.T) {
+	api := &API{app: &Application{}}
+	app := testAuthenticatedParamRoute(http.MethodGet, "/preview/:ratingKey/:from/:to", api.preview)
+	response, err := app.Test(httptest.NewRequest(http.MethodGet, "/preview/movie/00:00:00/00:00:01?subtitleOffsetMs=not-a-number", nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusUnprocessableEntity {
+		t.Fatalf("preview offset status = %d, want 422", response.StatusCode)
 	}
 }
 

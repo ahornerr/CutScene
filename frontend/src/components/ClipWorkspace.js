@@ -16,9 +16,10 @@ export default function ClipWorkspace({
   onChangeSession, changeSessionDisabled, changeSessionDisabledReason,
   renderState, jobSpec, controlsChangedSinceJob,
   onCreateJob, onDownloadJob, onRetryJob, onRetryPoll, onCreateNewJob,
-  audioMode, onAudioModeChange,
-  subtitle, ...subProps
-}) {
+audioMode, onAudioModeChange,
+              subtitleOffsetMs, onSubtitleOffsetChange,
+              subtitle, ...subProps
+            }) {
   return (
     <>
       <SessionContext
@@ -65,7 +66,11 @@ export default function ClipWorkspace({
               Subtitles
             </Typography>
             <Box sx={{flex: 1, display: 'flex', flexDirection: 'column', minHeight: 0, mt: 0.5}}>
-              <SubtitlePanel {...subProps} />
+              <SubtitlePanel
+                subtitleOffsetMs={subtitleOffsetMs}
+                onSubtitleOffsetChange={onSubtitleOffsetChange}
+                {...subProps}
+              />
             </Box>
           </Paper>
           <RenderJobBar

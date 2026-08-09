@@ -32,6 +32,14 @@ function App() {
   const [previewStale, setPreviewStale] = useState(false)
   const [audioMode, setAudioMode] = useState(AUDIO_MODES.STANDARD)
 
+  // --- Subtitle offset ---
+  // Positive = subtitles appear later, negative = earlier. Retained across
+  // subtitle track switches and entry picks (not reset by selection); reset
+  // only on session change, mirroring audioMode. Applied to the preview URL,
+  // the render-job payload (as `subtitleOffsetMs`), and subtitle-derived clip
+  // range math.
+  const [subtitleOffsetMs, setSubtitleOffsetMs] = useState(0)
+
   // --- Subtitle streams ---
   const [subtitleStreams, setSubtitleStreams] = useState([])
   const [selectedSubtitle, setSelectedSubtitle] = useState(-1)
@@ -124,18 +132,21 @@ function App() {
   }, [])
 
   // ---------------------------------------------------------------- player URL builder
-  const setPlayerPosition = useCallback((start, end, subtitleOverride = selectedSubtitle, audioModeOverride = audioMode) => {
+  const setPlayerPosition = useCallback((start, end, subtitleOverride = selectedSubtitle, audioModeOverride = audioMode, offsetOverride = subtitleOffsetMs) => {
     const subtitleIndex = subtitleOverride
     const subtitleParam = subtitleIndex >= 0 ? `&subtitle=${subtitleIndex}` : ''
     const audioModeParam = audioModeOverride && audioModeOverride !== AUDIO_MODES.STANDARD
       ? `&audioMode=${audioModeOverride}`
       : ''
+    // Only emit the offset param when a subtitle track is selected and the
+    // offset is non-zero — keeps the default preview URL stable.
+    const offsetParam = (subtitleIndex >= 0 && offsetOverride) ? `&subtitleOffsetMs=${offsetOverride}` : ''
     setPlayerError(false)
     setPlayerUrl(
       `/preview/${selectedSession.ratingKey}/${millisToDuration(start)}/${millisToDuration(end)}` +
-      `?mediaId=${selectedSession.Media[0].Part[0].id}${subtitleParam}${audioModeParam}`
+      `?mediaId=${selectedSession.Media[0].Part[0].id}${subtitleParam}${audioModeParam}${offsetParam}`
     )
-  }, [selectedSession, selectedSubtitle, audioMode])
+  }, [selectedSession, selectedSubtitle, audioMode, subtitleOffsetMs])
 
   // ---------------------------------------------------------------- session change → streams + prewarm
   useEffect(() => {
@@ -156,6 +167,7 @@ function App() {
       setStartPosition(initStart)
       setEndPosition(initEnd)
       setAudioMode(AUDIO_MODES.STANDARD)
+      setSubtitleOffsetMs(0)
       setSubtitleStreams([])
       setSelectedSubtitle(-1)
       setStreamsError(null)
@@ -273,6 +285,20 @@ function App() {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [audioMode])
 
+  // ---------------------------------------------------------------- subtitle offset auto-preview
+  // Changing the subtitle offset is a discrete, intentional action — the
+  // preview refreshes so the user sees the shifted subtitles immediately,
+  // just like changing the audio mode or subtitle track.
+  useEffect(() => {
+    if (!selectedSession) return
+    if (startPosition == null || endPosition == null) return
+    if (!playerReadyRef.current) return
+    setPlayerPosition(startPosition, endPosition)
+    setPreviewStale(false)
+    setControlsChangedSinceJob(true)
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [subtitleOffsetMs])
+
   // ---------------------------------------------------------------- derived subtitle state
   const filteredSubtitleEntries = useMemo(() => {
     if (!subtitleSearch.trim()) return []
@@ -351,13 +377,19 @@ function App() {
   }, [selectedSession])
 
   // ---------------------------------------------------------------- subtitle pick (clamp to duration)
+  // Subtitle timings are shifted by `subtitleOffsetMs` before deriving the clip
+  // range: a positive offset makes the subtitle appear later in the output, so
+  // the clip should cover the shifted window (with the usual 500ms padding).
   const handleSubtitlePick = useCallback((fullIdx, shiftKey) => {
     const duration = selectedSession?.duration ?? Infinity
+    const offset = subtitleOffsetMs
     if (subtitleSearch.trim()) {
       const entry = subtitleEntries[fullIdx]
       if (!entry) return
-      const newStart = Math.max(0, Math.min(entry.start - 500, duration))
-      const newEnd = Math.max(0, Math.min(entry.end + 500, duration))
+      const shiftedStart = entry.start + offset
+      const shiftedEnd = entry.end + offset
+      const newStart = Math.max(0, Math.min(shiftedStart - 500, duration))
+      const newEnd = Math.max(0, Math.min(shiftedEnd + 500, duration))
       setSubtitleAnchor(fullIdx)
       setSubtitleSelectionEnd(fullIdx)
       setStartPosition(newStart)
@@ -383,15 +415,17 @@ function App() {
     const firstEntry = subtitleEntries[from]
     const lastEntry = subtitleEntries[to]
     if (!firstEntry || !lastEntry) return
-    const newStart = Math.max(0, Math.min(firstEntry.start - 500, duration))
-    const newEnd = Math.max(0, Math.min(lastEntry.end + 500, duration))
+    const shiftedStart = firstEntry.start + offset
+    const shiftedEnd = lastEntry.end + offset
+    const newStart = Math.max(0, Math.min(shiftedStart - 500, duration))
+    const newEnd = Math.max(0, Math.min(shiftedEnd + 500, duration))
     setStartPosition(newStart)
     setEndPosition(newEnd)
     setPreviewStale(false)
     setPlayerPosition(newStart, newEnd)
     flashTrim()
     setControlsChangedSinceJob(true)
-  }, [subtitleSearch, subtitleAnchor, subtitleEntries, setPlayerPosition, flashTrim, selectedSession])
+  }, [subtitleSearch, subtitleAnchor, subtitleEntries, setPlayerPosition, flashTrim, selectedSession, subtitleOffsetMs])
 
   // ---------------------------------------------------------------- render-job create
   const createRenderJob = useCallback((retrySpec = null) => {
@@ -400,12 +434,12 @@ function App() {
     setDownloadCompleted(false)
     networkRetryCountRef.current = 0
 
-    const spec = retrySpec || snapshotJobSpec(selectedSession, startPosition, endPosition, selectedSubtitle, subtitleStreams, audioMode)
+    const spec = retrySpec || snapshotJobSpec(selectedSession, startPosition, endPosition, selectedSubtitle, subtitleStreams, audioMode, subtitleOffsetMs)
     let body
     try {
       body = JSON.stringify(retrySpec
         ? buildRenderJobRequestFromSpec(retrySpec)
-        : buildRenderJobRequest(selectedSession, startPosition, endPosition, selectedSubtitle, audioMode))
+        : buildRenderJobRequest(selectedSession, startPosition, endPosition, selectedSubtitle, audioMode, subtitleOffsetMs))
     } catch (error) {
       setRenderState({
         status: JOB_STATES.FAILED,
@@ -462,7 +496,7 @@ function App() {
           downloadUrl: null, expiresAt: null, retryAfter: err?.retryAfter || null,
         })
       })
-  }, [selectedSession, startPosition, endPosition, selectedSubtitle, subtitleStreams, audioMode, stopPolling])
+  }, [selectedSession, startPosition, endPosition, selectedSubtitle, subtitleStreams, audioMode, subtitleOffsetMs, stopPolling])
 
   // ---------------------------------------------------------------- render-job polling (ref-bound)
   const pollForJobRef = useRef(null)
@@ -642,6 +676,7 @@ function App() {
     setStartPosition(null)
     setEndPosition(null)
     setAudioMode(AUDIO_MODES.STANDARD)
+    setSubtitleOffsetMs(0)
     setTrimFlashKey(0)
   }, [jobIsActive, stopPolling])
 
@@ -745,6 +780,8 @@ function App() {
               onCreateNewJob={() => createRenderJob()}
               audioMode={audioMode}
               onAudioModeChange={setAudioMode}
+              subtitleOffsetMs={subtitleOffsetMs}
+              onSubtitleOffsetChange={setSubtitleOffsetMs}
               subtitle={selectedSubtitle}
               streams={subtitleStreams}
               selectedSubtitle={selectedSubtitle}

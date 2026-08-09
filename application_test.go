@@ -386,6 +386,70 @@ func TestWriteClipSRT(t *testing.T) {
 	}
 }
 
+func TestWriteClipSRTSubtitleOffsetShiftsWithoutMutatingEntries(t *testing.T) {
+	entries := []SubtitleEntry{{Start: 1000, End: 3000, Text: "shift me"}}
+
+	positive, err := WriteClipSRT(entries, 0, 2500, 500)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(positive)
+	positiveEntries, err := ParseSRT(positive)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(positiveEntries) != 1 || positiveEntries[0].Start != 1500 || positiveEntries[0].End != 2500 {
+		t.Fatalf("positive offset entries = %+v", positiveEntries)
+	}
+
+	negative, err := WriteClipSRT(entries, 0, 2500, -500)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(negative)
+	negativeEntries, err := ParseSRT(negative)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(negativeEntries) != 1 || negativeEntries[0].Start != 500 || negativeEntries[0].End != 2500 {
+		t.Fatalf("negative offset entries = %+v", negativeEntries)
+	}
+	if entries[0].Start != 1000 || entries[0].End != 3000 {
+		t.Fatalf("source entries were mutated: %+v", entries)
+	}
+}
+
+func TestSubtitleOffsetParsingAndRange(t *testing.T) {
+	for _, test := range []struct {
+		value string
+		want  int64
+		valid bool
+	}{
+		{value: "250", want: 250, valid: true},
+		{value: "-250", want: -250, valid: true},
+		{value: "", want: 0, valid: true},
+		{value: "not-a-number", valid: false},
+		{value: "900001", valid: false},
+	} {
+		got, err := parseSubtitleOffsetMs(test.value)
+		if test.valid && (err != nil || got != test.want) {
+			t.Errorf("parseSubtitleOffsetMs(%q) = %d, %v; want %d", test.value, got, err, test.want)
+		}
+		if !test.valid && err == nil {
+			t.Errorf("parseSubtitleOffsetMs(%q) unexpectedly succeeded", test.value)
+		}
+	}
+}
+
+func TestSubtitleOverlayFilterAppliesSignedOffset(t *testing.T) {
+	if got := subtitleOverlayFilter(2, 500, ",scale[out]"); !strings.Contains(got, "setpts=PTS+500/1000/TB") {
+		t.Fatalf("positive overlay offset filter = %q", got)
+	}
+	if got := subtitleOverlayFilter(2, -500, ",scale[out]"); !strings.Contains(got, "setpts=PTS-500/1000/TB") {
+		t.Fatalf("negative overlay offset filter = %q", got)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Subtitle cache tests
 // ---------------------------------------------------------------------------

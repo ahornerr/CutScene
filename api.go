@@ -50,11 +50,12 @@ const (
 )
 
 type API struct {
-	config        Config
-	app           *Application
-	http          *fiber.App
-	validateUser  func(context.Context) (*User, error)
-	previewRunner func(context.Context, string, string, string, string, int, Codec, io.Writer, AudioMode) error
+	config                          Config
+	app                             *Application
+	http                            *fiber.App
+	validateUser                    func(context.Context) (*User, error)
+	previewRunner                   func(context.Context, string, string, string, string, int, Codec, io.Writer, AudioMode) error
+	previewRunnerWithSubtitleOffset func(context.Context, string, string, string, string, int, Codec, io.Writer, AudioMode, int64) error
 }
 
 func NewAPI(config Config, app *Application) (*API, error) {
@@ -673,6 +674,10 @@ func (a *API) previewStream(ctx fiber.Ctx) error {
 	if subtitleIndex < -1 {
 		return errors.New("subtitle not available")
 	}
+	subtitleOffsetMs, err := parseSubtitleOffsetMs(ctx.Query("subtitleOffsetMs", "0"))
+	if err != nil {
+		return errors.New("subtitleOffsetMs is invalid")
+	}
 
 	// Validate the caller-visible source before asking the configured Plex
 	// administrator token for metadata. This prevents a valid session from
@@ -747,7 +752,7 @@ func (a *API) previewStream(ctx fiber.Ctx) error {
 		} else {
 			cacheMediaID := strconv.FormatInt(visibleMediaID, 10)
 			if entries, ok := a.app.GetCachedSubtitleEntries(ratingKeyStr, cacheMediaID, subtitleIndex); ok {
-				subtitleFile, err = WriteClipSRT(entries, fromMs, toMs)
+				subtitleFile, err = WriteClipSRT(entries, fromMs, toMs, subtitleOffsetMs)
 				if err != nil {
 					return fmt.Errorf("could not write clip subtitle: %w", err)
 				}
@@ -755,7 +760,7 @@ func (a *API) previewStream(ctx fiber.Ctx) error {
 				if !isSupportedTextSubtitle(source) {
 					return errors.New("subtitle codec is not supported")
 				}
-				subtitleFile, err = a.app.prepareExternalSubtitle(operationCtx, source, fromMs, toMs)
+				subtitleFile, err = a.app.prepareExternalSubtitle(operationCtx, source, fromMs, toMs, subtitleOffsetMs)
 				if err != nil {
 					return newPreviewUpstreamFailure("preview subtitle source unavailable", err)
 				}
@@ -769,7 +774,7 @@ func (a *API) previewStream(ctx fiber.Ctx) error {
 				subtitleCtx, cancelSubtitle := context.WithTimeout(operationCtx, renderPreviewTimeout)
 				subtitleFile, err = func() (string, error) {
 					defer release()
-					return ExtractSubtitleContext(subtitleCtx, fileURL, from, to, source.EmbeddedIndex)
+					return ExtractSubtitleContext(subtitleCtx, fileURL, from, to, source.EmbeddedIndex, subtitleOffsetMs)
 				}()
 				cancelSubtitle()
 				if err != nil {
@@ -805,9 +810,15 @@ func (a *API) previewStream(ctx fiber.Ctx) error {
 		}
 	}()
 	previewRunner := a.previewRunner
+	previewRunnerWithOffset := a.previewRunnerWithSubtitleOffset
+	if previewRunner == nil && previewRunnerWithOffset == nil {
+		previewRunnerWithOffset = func(ctx context.Context, fileURL, from, to, subtitleFile string, subtitleIndex int, codec Codec, writer io.Writer, audioMode AudioMode, offsetMs int64) error {
+			return DoFfmpegPreviewContextWithSubtitleOffset(ctx, fileURL, from, to, subtitleFile, subtitleIndex, codec, writer, audioMode, offsetMs)
+		}
+	}
 	if previewRunner == nil {
 		previewRunner = func(ctx context.Context, fileURL, from, to, subtitleFile string, subtitleIndex int, codec Codec, writer io.Writer, audioMode AudioMode) error {
-			return DoFfmpegPreviewContext(ctx, fileURL, from, to, subtitleFile, subtitleIndex, codec, writer, audioMode)
+			return previewRunnerWithOffset(ctx, fileURL, from, to, subtitleFile, subtitleIndex, codec, writer, audioMode, subtitleOffsetMs)
 		}
 	}
 	ctx.Response().SetBodyStreamWriter(func(w *bufio.Writer) {

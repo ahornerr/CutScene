@@ -36,6 +36,41 @@ const (
 
 const dialogueAudioFilter = "pan=stereo|FL<FL+0.85*FC+0.50*BL+0.50*SL|FR<FR+0.85*FC+0.50*BR+0.50*SR,alimiter=limit=0.95:attack=5:release=50:latency=1:level=0"
 
+// Subtitle offsets are deliberately bounded to keep timestamp arithmetic
+// predictable and to match the maximum supported clip duration.
+const maxSubtitleOffsetMs int64 = 15 * 60 * 1000
+
+func validateSubtitleOffsetMs(offset int64) error {
+	if offset < -maxSubtitleOffsetMs || offset > maxSubtitleOffsetMs {
+		return fmt.Errorf("subtitleOffsetMs must be between -%d and %d", maxSubtitleOffsetMs, maxSubtitleOffsetMs)
+	}
+	return nil
+}
+
+func parseSubtitleOffsetMs(value string) (int64, error) {
+	if value == "" {
+		return 0, nil
+	}
+	offset, err := strconv.ParseInt(value, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("invalid subtitleOffsetMs: %w", err)
+	}
+	if err := validateSubtitleOffsetMs(offset); err != nil {
+		return 0, err
+	}
+	return offset, nil
+}
+
+func saturatingAddInt64(a, b int64) int64 {
+	if b > 0 && a > math.MaxInt64-b {
+		return math.MaxInt64
+	}
+	if b < 0 && a < math.MinInt64-b {
+		return math.MinInt64
+	}
+	return a + b
+}
+
 func parseAudioMode(value string) (AudioMode, error) {
 	if value == "" {
 		return AudioModeStandard, nil
@@ -101,19 +136,27 @@ func init() {
 }
 
 type FfmpegParams struct {
-	URL           string
-	From          string
-	To            string
-	Filename      string
-	Height        int
-	QP            int
-	Codec         Codec
-	AudioMode     AudioMode
-	SubtitleFile  string
-	SubtitleIndex int // >= 0 for PGS overlay via overlay filter
-	OutputPath    string
-	Context       context.Context
-	Metadata      FfmpegParamsMetadata
+	URL              string
+	From             string
+	To               string
+	Filename         string
+	Height           int
+	QP               int
+	Codec            Codec
+	AudioMode        AudioMode
+	SubtitleFile     string
+	SubtitleIndex    int // >= 0 for PGS overlay via overlay filter
+	SubtitleOffsetMs int64
+	OutputPath       string
+	Context          context.Context
+	Metadata         FfmpegParamsMetadata
+}
+
+func subtitleOverlayFilter(index int, offsetMs int64, suffix string) string {
+	if offsetMs == 0 {
+		return fmt.Sprintf("[0:v][0:s:%d]overlay%s", index, suffix)
+	}
+	return fmt.Sprintf("[0:s:%d]setpts=PTS%+d/1000/TB[sub];[0:v][sub]overlay%s", index, offsetMs, suffix)
 }
 
 type FfmpegParamsMetadata struct {
@@ -144,6 +187,9 @@ func configureMP4Output(outputArgs ffmpeg.KwArgs) {
 }
 
 func DoFfmpeg(params FfmpegParams) (string, error) {
+	if err := validateSubtitleOffsetMs(params.SubtitleOffsetMs); err != nil {
+		return params.OutputPath, err
+	}
 	outputMetadata := map[string]string{
 		"title":   params.Metadata.Title,
 		"comment": params.From,
@@ -215,7 +261,7 @@ func DoFfmpeg(params FfmpegParams) (string, error) {
 	switch params.Codec {
 	case CodecH264VAAPI:
 		if params.SubtitleIndex >= 0 {
-			outputArgs["filter_complex"] = fmt.Sprintf("[0:v][0:s:%d]overlay,format=nv12,hwupload,scale_vaapi=format=nv12,scale_vaapi=-2:%d[out]", params.SubtitleIndex, params.Height)
+			outputArgs["filter_complex"] = subtitleOverlayFilter(params.SubtitleIndex, params.SubtitleOffsetMs, fmt.Sprintf(",format=nv12,hwupload,scale_vaapi=format=nv12,scale_vaapi=-2:%d[out]", params.Height))
 			outputArgs["map"] = []string{"[out]", "0:a:0?"}
 			delete(inputArgs, "hwaccel_output_format")
 		} else if params.SubtitleFile != "" {
@@ -229,9 +275,9 @@ func DoFfmpeg(params FfmpegParams) (string, error) {
 	case CodecH264NVENC:
 		if params.SubtitleIndex >= 0 {
 			if params.Height > 0 {
-				outputArgs["filter_complex"] = fmt.Sprintf("[0:v][0:s:%d]overlay,hwupload_cuda,scale_cuda=-2:%d[out]", params.SubtitleIndex, params.Height)
+				outputArgs["filter_complex"] = subtitleOverlayFilter(params.SubtitleIndex, params.SubtitleOffsetMs, fmt.Sprintf(",hwupload_cuda,scale_cuda=-2:%d[out]", params.Height))
 			} else {
-				outputArgs["filter_complex"] = fmt.Sprintf("[0:v][0:s:%d]overlay,hwupload_cuda[out]", params.SubtitleIndex)
+				outputArgs["filter_complex"] = subtitleOverlayFilter(params.SubtitleIndex, params.SubtitleOffsetMs, ",hwupload_cuda[out]")
 			}
 			outputArgs["map"] = []string{"[out]", "0:a:0?"}
 		} else if params.SubtitleFile != "" {
@@ -251,7 +297,7 @@ func DoFfmpeg(params FfmpegParams) (string, error) {
 		fallthrough
 	default:
 		if params.SubtitleIndex >= 0 {
-			outputArgs["filter_complex"] = fmt.Sprintf("[0:v][0:s:%d]overlay,scale=-2:%d[out]", params.SubtitleIndex, params.Height)
+			outputArgs["filter_complex"] = subtitleOverlayFilter(params.SubtitleIndex, params.SubtitleOffsetMs, fmt.Sprintf(",scale=-2:%d[out]", params.Height))
 			outputArgs["map"] = []string{"[out]", "0:a:0?"}
 		} else {
 			vf := "scale=-2:" + strconv.Itoa(params.Height)
@@ -356,6 +402,17 @@ func isExpectedPreviewTermination(err error, writer io.Writer) bool {
 }
 
 func DoFfmpegPreviewContext(ctx context.Context, fileURL, from, to string, subtitleFile string, subtitleIndex int, codec Codec, writer io.Writer, audioModes ...AudioMode) error {
+	return doFfmpegPreviewContext(ctx, fileURL, from, to, subtitleFile, subtitleIndex, codec, writer, 0, audioModes...)
+}
+
+func DoFfmpegPreviewContextWithSubtitleOffset(ctx context.Context, fileURL, from, to string, subtitleFile string, subtitleIndex int, codec Codec, writer io.Writer, audioMode AudioMode, subtitleOffsetMs int64) error {
+	return doFfmpegPreviewContext(ctx, fileURL, from, to, subtitleFile, subtitleIndex, codec, writer, subtitleOffsetMs, audioMode)
+}
+
+func doFfmpegPreviewContext(ctx context.Context, fileURL, from, to string, subtitleFile string, subtitleIndex int, codec Codec, writer io.Writer, subtitleOffsetMs int64, audioModes ...AudioMode) error {
+	if err := validateSubtitleOffsetMs(subtitleOffsetMs); err != nil {
+		return err
+	}
 	inputArgs := ffmpeg.KwArgs{
 		"ss":          from,
 		"to":          to,
@@ -400,7 +457,7 @@ func DoFfmpegPreviewContext(ctx context.Context, fileURL, from, to string, subti
 	switch codec {
 	case CodecH264VAAPI:
 		if subtitleIndex >= 0 {
-			outputArgs["filter_complex"] = fmt.Sprintf("[0:v][0:s:%d]overlay,format=nv12,hwupload,scale_vaapi=format=nv12,scale_vaapi=-2:%d[out]", subtitleIndex, height)
+			outputArgs["filter_complex"] = subtitleOverlayFilter(subtitleIndex, subtitleOffsetMs, fmt.Sprintf(",format=nv12,hwupload,scale_vaapi=format=nv12,scale_vaapi=-2:%d[out]", height))
 			outputArgs["map"] = []string{"[out]", "0:a:0?"}
 			delete(inputArgs, "hwaccel_output_format")
 		} else if subtitleFile != "" {
@@ -413,7 +470,7 @@ func DoFfmpegPreviewContext(ctx context.Context, fileURL, from, to string, subti
 		outputArgs["compression_level"] = "0"
 	case CodecH264NVENC:
 		if subtitleIndex >= 0 {
-			outputArgs["filter_complex"] = fmt.Sprintf("[0:v][0:s:%d]overlay,hwupload_cuda,scale_cuda=-2:%d[out]", subtitleIndex, height)
+			outputArgs["filter_complex"] = subtitleOverlayFilter(subtitleIndex, subtitleOffsetMs, fmt.Sprintf(",hwupload_cuda,scale_cuda=-2:%d[out]", height))
 			outputArgs["map"] = []string{"[out]", "0:a:0?"}
 		} else if subtitleFile != "" {
 			configureNVENCTextSubtitle(inputArgs, outputArgs, subtitleFile, height)
@@ -425,7 +482,7 @@ func DoFfmpegPreviewContext(ctx context.Context, fileURL, from, to string, subti
 		fallthrough
 	default:
 		if subtitleIndex >= 0 {
-			outputArgs["filter_complex"] = fmt.Sprintf("[0:v][0:s:%d]overlay,scale=-2:%d[out]", subtitleIndex, height)
+			outputArgs["filter_complex"] = subtitleOverlayFilter(subtitleIndex, subtitleOffsetMs, fmt.Sprintf(",scale=-2:%d[out]", height))
 			outputArgs["map"] = []string{"[out]", "0:a:0?"}
 		} else {
 			vf := "scale=-2:" + strconv.Itoa(height)
@@ -601,11 +658,72 @@ func parseSRTTimestamp(s string) (int64, error) {
 // subtitle streams) for the given time range and writes it to a temp SRT file.
 // The timestamps in the output file are relative to from, so they align with
 // the clip produced by DoFfmpeg for the same range.
-func ExtractSubtitle(url, from, to string, subtitleIndex int) (string, error) {
-	return ExtractSubtitleContext(context.Background(), url, from, to, subtitleIndex)
+func ExtractSubtitle(url, from, to string, subtitleIndex int, subtitleOffsets ...int64) (string, error) {
+	return ExtractSubtitleContext(context.Background(), url, from, to, subtitleIndex, subtitleOffsets...)
 }
 
-func ExtractSubtitleContext(ctx context.Context, url, from, to string, subtitleIndex int) (string, error) {
+func ExtractSubtitleContext(ctx context.Context, url, from, to string, subtitleIndex int, subtitleOffsets ...int64) (string, error) {
+	offset, err := subtitleOffsetArgument(subtitleOffsets)
+	if err != nil {
+		return "", err
+	}
+	if offset == 0 {
+		return extractSubtitleContextRaw(ctx, url, from, to, subtitleIndex)
+	}
+
+	fromMs, err := ParseTimestampToMs(from)
+	if err != nil {
+		return "", fmt.Errorf("invalid subtitle extraction start: %w", err)
+	}
+	toMs, err := ParseTimestampToMs(to)
+	if err != nil || toMs <= fromMs {
+		return "", fmt.Errorf("invalid subtitle extraction range")
+	}
+	// A shifted subtitle in the requested clip comes from this source range.
+	// Avoid passing negative seek times to FFmpeg; entries before source zero
+	// cannot exist and are consequently absent from the result.
+	extractFrom := saturatingAddInt64(fromMs, -offset)
+	extractTo := saturatingAddInt64(toMs, -offset)
+	if extractFrom < 0 {
+		extractFrom = 0
+	}
+	if extractTo <= extractFrom {
+		return WriteClipSRT(nil, fromMs, toMs, offset)
+	}
+
+	rawFile, err := extractSubtitleContextRaw(ctx, url, formatRenderTimestamp(extractFrom), formatRenderTimestamp(extractTo), subtitleIndex)
+	if err != nil {
+		return "", err
+	}
+	defer os.Remove(rawFile)
+	entries, err := ParseSRT(rawFile)
+	if err != nil {
+		return "", fmt.Errorf("could not parse extracted subtitle: %w", err)
+	}
+	// Raw extraction timestamps are relative to extractFrom. Convert them back
+	// to source time, then apply the same clipping path used by external and
+	// cached subtitles. This keeps all subtitle types semantically identical.
+	for i := range entries {
+		entries[i].Start = saturatingAddInt64(entries[i].Start, extractFrom)
+		entries[i].End = saturatingAddInt64(entries[i].End, extractFrom)
+	}
+	return WriteClipSRT(entries, fromMs, toMs, offset)
+}
+
+func subtitleOffsetArgument(offsets []int64) (int64, error) {
+	if len(offsets) > 1 {
+		return 0, errors.New("multiple subtitle offsets specified")
+	}
+	if len(offsets) == 0 {
+		return 0, nil
+	}
+	if err := validateSubtitleOffsetMs(offsets[0]); err != nil {
+		return 0, err
+	}
+	return offsets[0], nil
+}
+
+func extractSubtitleContextRaw(ctx context.Context, url, from, to string, subtitleIndex int) (string, error) {
 	tmpFile := fmt.Sprintf("/tmp/cutscene_sub_%d.srt", time.Now().UnixNano())
 
 	inputArgs := ffmpeg.KwArgs{
@@ -711,7 +829,14 @@ func formatSRTTimestamp(ms int64) string {
 	return fmt.Sprintf("%02d:%02d:%02d,%03d", h, m, s, ms)
 }
 
-func WriteClipSRT(entries []SubtitleEntry, fromMs, toMs int64) (string, error) {
+func WriteClipSRT(entries []SubtitleEntry, fromMs, toMs int64, subtitleOffsets ...int64) (string, error) {
+	offset, err := subtitleOffsetArgument(subtitleOffsets)
+	if err != nil {
+		return "", err
+	}
+	if fromMs < 0 || toMs <= fromMs {
+		return "", errors.New("invalid subtitle clip range")
+	}
 	tmpFile, err := os.CreateTemp("", "cutscene_clip_*.srt")
 	if err != nil {
 		return "", err
@@ -721,15 +846,19 @@ func WriteClipSRT(entries []SubtitleEntry, fromMs, toMs int64) (string, error) {
 
 	seq := 1
 	for _, entry := range entries {
-		if entry.End <= fromMs || entry.Start >= toMs {
+		// Work on local values only. Cached entries are source data and must not
+		// be changed when one preview/render requests an offset.
+		startMs := saturatingAddInt64(entry.Start, offset)
+		endMs := saturatingAddInt64(entry.End, offset)
+		if endMs <= fromMs || startMs >= toMs {
 			continue
 		}
 
-		start := entry.Start - fromMs
+		start := startMs - fromMs
 		if start < 0 {
 			start = 0
 		}
-		end := entry.End - fromMs
+		end := endMs - fromMs
 		if end > toMs-fromMs {
 			end = toMs - fromMs
 		}
