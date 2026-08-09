@@ -6,7 +6,9 @@ import SubtitlePanel from "./SubtitlePanel";
 import RenderJobBar from "./RenderJobBar";
 
 // Two-pane workspace shell. CSS grid (.cs-workspace) reflows to one column
-// below 960px — no duplicate DOM trees per breakpoint.
+// below 960px — no duplicate DOM trees per breakpoint. Theater mode collapses
+// the desktop grid to a single full-width column (preview rail on top,
+// subtitles beneath) for an immersive preview, mirroring YouTube theater mode.
 export default function ClipWorkspace({
   session, playerUrl, onPlayerError, onPlayerReady,
   previewStale, onApplyPreview,
@@ -16,7 +18,8 @@ export default function ClipWorkspace({
   onChangeSession, changeSessionDisabled, changeSessionDisabledReason,
   renderState, jobSpec, controlsChangedSinceJob,
   onCreateJob, onDownloadJob, onRetryJob, onRetryPoll, onCreateNewJob,
-audioMode, onAudioModeChange,
+  audioMode, onAudioModeChange,
+  theaterMode, onToggleTheater,
               subtitleOffsetMs, onSubtitleOffsetChange,
               subtitle, ...subProps
             }) {
@@ -28,8 +31,8 @@ audioMode, onAudioModeChange,
         changeDisabled={changeSessionDisabled}
         changeDisabledReason={changeSessionDisabledReason}
       />
-      <Box className="cs-workspace">
-        {/* Left: player + trim */}
+      <Box className={`cs-workspace${theaterMode ? ' cs-workspace--theater' : ''}`}>
+        {/* Left: player + trim + render controls */}
         <Box sx={{display: 'flex', flexDirection: 'column', minWidth: 0}}>
           <PlayerPane
             playerUrl={playerUrl}
@@ -37,6 +40,8 @@ audioMode, onAudioModeChange,
             onReady={onPlayerReady}
             previewStale={previewStale}
             onApplyPreview={onApplyPreview}
+            theaterMode={theaterMode}
+            onToggleTheater={onToggleTheater}
           />
           <TrimScrubber
             duration={session.duration}
@@ -47,10 +52,27 @@ audioMode, onAudioModeChange,
             onEndChange={onEndChange}
             trimFlashKey={trimFlashKey}
           />
+          {/* Render job / status / controls live directly under the video and
+              trim times so the whole left rail reads as the "clip" workflow. */}
+          <RenderJobBar
+            startPosition={startPosition}
+            endPosition={endPosition}
+            selectedSubtitle={subtitle}
+            audioMode={audioMode}
+            onAudioModeChange={onAudioModeChange}
+            renderState={renderState}
+            jobSpec={jobSpec}
+            controlsChangedSinceJob={controlsChangedSinceJob}
+            onCreateJob={onCreateJob}
+            onDownload={onDownloadJob}
+            onRetry={onRetryJob}
+            onRetryPoll={onRetryPoll}
+            onCreateNew={onCreateNewJob}
+          />
         </Box>
 
-        {/* Right: subtitle panel + render job */}
-        <Box sx={{display: 'flex', flexDirection: 'column', minWidth: 0, gap: 2}}>
+        {/* Right: subtitle panel */}
+        <Box className="cs-workspace-subtitles" sx={{display: 'flex', flexDirection: 'column', minWidth: 0}}>
           <Paper
             variant="outlined"
             sx={{
@@ -73,21 +95,6 @@ audioMode, onAudioModeChange,
               />
             </Box>
           </Paper>
-          <RenderJobBar
-            startPosition={startPosition}
-            endPosition={endPosition}
-            selectedSubtitle={subtitle}
-            audioMode={audioMode}
-            onAudioModeChange={onAudioModeChange}
-            renderState={renderState}
-            jobSpec={jobSpec}
-            controlsChangedSinceJob={controlsChangedSinceJob}
-            onCreateJob={onCreateJob}
-            onDownload={onDownloadJob}
-            onRetry={onRetryJob}
-            onRetryPoll={onRetryPoll}
-            onCreateNew={onCreateNewJob}
-          />
         </Box>
       </Box>
     </>

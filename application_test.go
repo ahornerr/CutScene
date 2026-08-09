@@ -800,6 +800,120 @@ func TestUsersHasUser(t *testing.T) {
 	}
 }
 
+func TestPlexUserIDAcceptsNumericWireForms(t *testing.T) {
+	for _, id := range []string{`42`, `"42"`} {
+		t.Run(id, func(t *testing.T) {
+			var response GetUserResp
+			if err := json.Unmarshal([]byte(`{"user":{"id":`+id+`,"uuid":"user-uuid","title":"Viewer Title"}}`), &response); err != nil {
+				t.Fatal(err)
+			}
+			if response.User.Id != 42 {
+				t.Fatalf("user id = %d, want 42", response.User.Id)
+			}
+			if response.User.Title != "Viewer Title" {
+				t.Fatalf("user title = %q, want Viewer Title", response.User.Title)
+			}
+		})
+	}
+}
+
+func TestGetSessionsFiltersNonOwnerByNumericUserID(t *testing.T) {
+	plex := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, `{"MediaContainer":{"Metadata":[
+			{"key":"owned","User":{"id":42}},
+			{"key":"other","User":{"id":"7"}}
+		]}}`)
+	}))
+	defer plex.Close()
+
+	config := Config{}
+	config.Plex.Host = plex.URL
+	app := &Application{config: config, ownerEmail: "owner@example.com"}
+	sessions, err := app.GetSessions(ContextWithUser(context.Background(), User{
+		Id:    42,
+		Email: "viewer@example.com",
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(sessions) != 1 || sessions[0].Key != "owned" || !sessions[0].OwnedByCurrentUser {
+		t.Fatalf("filtered sessions = %+v, want only the numerically matching owned session", sessions)
+	}
+}
+
+func TestSessionOwnershipMappingUsesPlexLocalProfileAndIdentity(t *testing.T) {
+	identity := &User{
+		Id:       42,
+		Username: "ViewerName",
+		Title:    "Viewer Title",
+		Email:    "viewer@example.com",
+	}
+	session := func(id, title string) sessionMetadata {
+		return sessionMetadata{User: sessionUser{ID: id, Title: title}}
+	}
+
+	tests := []struct {
+		name        string
+		session     sessionMetadata
+		user        *User
+		serverOwner bool
+		want        bool
+	}{
+		{
+			name:        "configured owner local profile one",
+			session:     session("1", "PMS Owner"),
+			user:        &User{Id: 9001, Email: "owner@example.com"},
+			serverOwner: true,
+			want:        true,
+		},
+		{
+			name:    "non-owner title case insensitive",
+			session: session("77", "vIeWeRnAmE"),
+			user:    identity,
+			want:    true,
+		},
+		{
+			name:    "non-owner identity title",
+			session: session("77", "viewer title"),
+			user:    identity,
+			want:    true,
+		},
+		{
+			name:    "non-owner identity email",
+			session: session("77", "VIEWER@EXAMPLE.COM"),
+			user:    identity,
+			want:    true,
+		},
+		{
+			name:    "non-owner direct ID remains positive",
+			session: session("42", "another display name"),
+			user:    identity,
+			want:    true,
+		},
+		{
+			name:    "non-owner mismatch",
+			session: session("77", "someone else"),
+			user:    identity,
+			want:    false,
+		},
+		{
+			name:    "non-owner cannot claim owner local profile",
+			session: session("1", "ViewerName"),
+			user:    identity,
+			want:    false,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := sessionOwnedByCurrentUser(test.session, test.user, test.serverOwner); got != test.want {
+				t.Fatalf("ownership = %v, want %v", got, test.want)
+			}
+		})
+	}
+}
+
 // ---------------------------------------------------------------------------
 // FFmpeg KwArgs mapping behavior tests
 // ---------------------------------------------------------------------------

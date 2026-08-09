@@ -96,6 +96,87 @@ func TestAuthMiddlewareRestoresUserWhenTokenAlreadyExists(t *testing.T) {
 	}
 }
 
+func TestGetSessionsAnnotatesOwnershipByNumericUserID(t *testing.T) {
+	plex := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/status/sessions" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"MediaContainer":{"Metadata":[
+			{"title":"Different title","key":"matching","User":{"id":1,"title":"Owner"}},
+			{"title":"Owner","key":"nonmatching","User":{"id":"7","title":"Owner"}}
+		]}}`)
+	}))
+	defer plex.Close()
+
+	config := Config{}
+	config.Plex.Host = plex.URL
+	app := &Application{config: config, ownerEmail: "owner@example.com"}
+	api := &API{
+		app: app,
+		validateUser: func(ctx context.Context) (*User, error) {
+			if AuthTokenFromContext(ctx) == nil {
+				t.Fatal("authentication token was not propagated")
+			}
+			return &User{Id: 42, Username: "Owner", Email: "owner@example.com"}, nil
+		},
+	}
+	httpApp := fiber.New()
+	httpApp.Use(func(ctx fiber.Ctx) error {
+		ctx.SetUserContext(ContextWithAuthToken(context.Background(), "user-token"))
+		return ctx.Next()
+	})
+	httpApp.Get("/sessions", api.getSessions, api.authMiddleware)
+
+	response, err := httpApp.Test(httptest.NewRequest(http.MethodGet, "/sessions", nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", response.StatusCode)
+	}
+
+	body, err := io.ReadAll(response.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var sessions []sessionMetadata
+	if err := json.Unmarshal(body, &sessions); err != nil {
+		t.Fatal(err)
+	}
+	var wireSessions []map[string]json.RawMessage
+	if err := json.Unmarshal(body, &wireSessions); err != nil {
+		t.Fatal(err)
+	}
+	if len(sessions) != 2 {
+		t.Fatalf("got %d sessions, want 2", len(sessions))
+	}
+	for i, want := range []bool{true, false} {
+		rawOwned, ok := wireSessions[i]["ownedByCurrentUser"]
+		if !ok {
+			t.Fatalf("session %d omitted ownedByCurrentUser", i)
+		}
+		var owned bool
+		if err := json.Unmarshal(rawOwned, &owned); err != nil {
+			t.Fatalf("session %d ownedByCurrentUser was not a JSON boolean: %v", i, err)
+		}
+		if owned != want {
+			t.Errorf("session %d ownedByCurrentUser = %v, want %v", i, owned, want)
+		}
+	}
+	if !sessions[0].OwnedByCurrentUser {
+		t.Errorf("session with matching numeric user ID was not marked owned: %+v", sessions[0])
+	}
+	if sessions[1].OwnedByCurrentUser {
+		t.Error("session with nonmatching numeric user ID was marked owned")
+	}
+	if sessions[0].Title != "Different title" || sessions[0].Key != "matching" {
+		t.Errorf("existing session fields were not preserved: %+v", sessions[0])
+	}
+}
+
 func testAuthenticatedRoute(handler fiber.Handler) *fiber.App {
 	app := fiber.New()
 	app.Use(func(ctx fiber.Ctx) error {

@@ -60,6 +60,19 @@ function installFetch(sessionsResponse = response(sessions)) {
   return pending;
 }
 
+function installTrackedSessionsFetch() {
+  const sessionRequests = [];
+  const pending = [];
+  global.fetch = jest.fn((url, options = {}) => {
+    const request = deferred();
+    const tracked = {url, options, ...request};
+    if (url === '/sessions') sessionRequests.push(tracked);
+    else pending.push(tracked);
+    return request.promise;
+  });
+  return {sessionRequests, pending};
+}
+
 async function flush() {
   await act(async () => {
     await Promise.resolve();
@@ -99,6 +112,15 @@ async function advancePolling(ms = 2000) {
   await act(async () => {
     jest.advanceTimersByTime(ms);
     await Promise.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+  });
+}
+
+async function setDocumentVisibility(state) {
+  Object.defineProperty(document, 'visibilityState', {configurable: true, value: state});
+  await act(async () => {
+    document.dispatchEvent(new Event('visibilitychange'));
     await Promise.resolve();
     await Promise.resolve();
   });
@@ -169,6 +191,7 @@ function textStreams() {
 afterEach(() => {
   jest.useRealTimers();
   jest.restoreAllMocks();
+  Object.defineProperty(document, 'visibilityState', {configurable: true, value: 'visible'});
   mockPlayerUrls.length = 0;
 });
 
@@ -707,6 +730,296 @@ test('session loading exposes a live status message', async () => {
   expect(screen.getByText('Alpha')).toBeInTheDocument();
 });
 
+test('sessions owned by the current user are highlighted with a Your session badge', async () => {
+  const ownedSessions = [
+    {
+      ratingKey: 'A', type: 'movie', title: 'Alpha', year: 2024, viewOffset: 0, duration: 120000,
+      User: {title: 'viewer'}, Media: [{Part: [{id: '101'}]}],
+      ownedByCurrentUser: true,
+    },
+    {
+      ratingKey: 'B', type: 'movie', title: 'Beta', year: 2024, viewOffset: 5000, duration: 120000,
+      User: {title: 'someone else'}, Media: [{Part: [{id: '202'}]}],
+      ownedByCurrentUser: false,
+    },
+    {
+      ratingKey: 'C', type: 'movie', title: 'Gamma', year: 2024, viewOffset: 0, duration: 120000,
+      User: {title: 'viewer'}, Media: [{Part: [{id: '303'}]}],
+      // ownedByCurrentUser omitted → treated as not owned (graceful default).
+    },
+  ];
+  installFetch(response(ownedSessions));
+  render(<App/>);
+  await flush();
+
+  // The owned card carries the visible "Your session" badge and a data hook.
+  const alphaCard = screen.getByRole('button', {name: /Your session.*Alpha/});
+  expect(alphaCard).toHaveTextContent('Your session');
+  expect(alphaCard).toHaveAttribute('data-owned', 'true');
+
+  // Explicitly-not-owned card: no badge, no data hook.
+  const betaCard = screen.getByRole('button', {name: /Beta/});
+  expect(betaCard).not.toHaveTextContent('Your session');
+  expect(betaCard).not.toHaveAttribute('data-owned');
+
+  // Field omitted entirely: treated as not owned — no badge.
+  const gammaCard = screen.getByRole('button', {name: /Gamma/});
+  expect(gammaCard).not.toHaveTextContent('Your session');
+  expect(gammaCard).not.toHaveAttribute('data-owned');
+
+  // Exactly one badge across the picker.
+  expect(screen.getAllByText('Your session')).toHaveLength(1);
+});
+
+test('session cards surface existing metadata: progress, player state, resolution, audio, location', async () => {
+  const richSessions = [
+    {
+      ratingKey: 'A', type: 'episode',
+      grandparentTitle: 'The Show', parentIndex: 2, index: 7, title: 'A Long Descriptive Episode Title',
+      year: 2024, viewOffset: 1500000, duration: 3000000,
+      thumb: '/thumb/A', User: {title: 'viewer'}, Media: [{Part: [{id: '101'}], videoResolution: '1080', audioChannels: 6}],
+      Player: {title: 'Plex Web (Chrome)', state: 'playing'},
+      Session: {location: 'lan'},
+      ownedByCurrentUser: true,
+    },
+    {
+      ratingKey: 'B', type: 'movie', title: 'Beta', year: 2023, viewOffset: 0, duration: 5400000,
+      thumb: '/thumb/B', User: {title: 'someone else'}, Media: [{Part: [{id: '202'}], videoResolution: '4k', audioChannels: 8}],
+      Player: {title: 'Apple TV', state: 'paused'},
+      Session: {location: 'wan'},
+      ownedByCurrentUser: false,
+    },
+    {
+      ratingKey: 'C', type: 'movie', title: 'Gamma', year: 2022, viewOffset: 0, duration: 3600000,
+      thumb: '/thumb/C', User: {title: 'viewer'}, Media: [{Part: [{id: '303'}]}],
+      // No Player / Session.location, minimal Media — quality + footer gracefully absent.
+    },
+  ];
+  installFetch(response(richSessions));
+  render(<App/>);
+  await flush();
+
+  // Alpha — episode primary is the show title; secondary is S02E07 + episode title.
+  const alphaCard = screen.getByRole('button', {name: /Your session.*The Show/});
+  expect(alphaCard).toHaveTextContent('The Show');
+  expect(alphaCard).toHaveTextContent('S02E07 A Long Descriptive Episode Title');
+  // Progress (viewOffset 1,500,000ms / duration 3,000,000ms → 50%).
+  expect(alphaCard).toHaveTextContent('00:25:00');
+  expect(alphaCard).toHaveTextContent('00:50:00');
+  // Player state dot label.
+  expect(alphaCard).toHaveTextContent('Playing');
+  // Quality accent pill — resolution + audio combined.
+  expect(alphaCard).toHaveTextContent('1080 · 5.1');
+  // Footer — device + location. The user ('viewer') is omitted on owned cards
+  // because the "Your session" badge already conveys ownership.
+  expect(alphaCard).toHaveTextContent('Plex Web (Chrome)');
+  expect(alphaCard).toHaveTextContent('Local');
+  expect(alphaCard).not.toHaveTextContent('viewer');
+
+  // Beta — paused, 4k/7.1, remote, not owned.
+  const betaCard = screen.getByRole('button', {name: /Beta/});
+  expect(betaCard).toHaveTextContent('Paused');
+  expect(betaCard).toHaveTextContent('4K · 7.1');
+  // Footer includes the user (not owned), device, and location.
+  expect(betaCard).toHaveTextContent('someone else');
+  expect(betaCard).toHaveTextContent('Apple TV');
+  expect(betaCard).toHaveTextContent('Remote');
+  // Not owned → no badge.
+  expect(betaCard).not.toHaveTextContent('Your session');
+
+  // Gamma — minimal metadata: no player-state label, no quality pill, no footer.
+  const gammaCard = screen.getByRole('button', {name: /Gamma/});
+  expect(gammaCard).not.toHaveTextContent('Playing');
+  expect(gammaCard).not.toHaveTextContent('Paused');
+  expect(gammaCard).not.toHaveTextContent('Local');
+  expect(gammaCard).not.toHaveTextContent('Remote');
+  expect(gammaCard).not.toHaveTextContent('Your session');
+  expect(gammaCard).not.toHaveTextContent('·');
+  // Duration still surfaces as the upper bound.
+  expect(gammaCard).toHaveTextContent('01:00:00');
+});
+
+test('episode cards fall back to the show poster when the episode has no thumbnail', async () => {
+  const noThumbSessions = [
+    {
+      ratingKey: 'A', type: 'episode',
+      grandparentTitle: 'The Show', parentIndex: 1, index: 1, title: 'Pilot',
+      viewOffset: 0, duration: 1200000,
+      // No thumb; grandparentThumb should be used instead.
+      grandparentThumb: '/show/poster',
+      User: {title: 'viewer'}, Media: [{Part: [{id: '101'}]}],
+      ownedByCurrentUser: true,
+    },
+    {
+      ratingKey: 'B', type: 'movie', title: 'NoArt Movie', year: 2024, viewOffset: 0, duration: 1200000,
+      // Neither thumb nor grandparentThumb → placeholder, no broken image request.
+      User: {title: 'viewer'}, Media: [{Part: [{id: '202'}]}],
+    },
+  ];
+  installFetch(response(noThumbSessions));
+  render(<App/>);
+  await flush();
+
+  // Episode card uses the show poster URL.
+  const episodeCard = screen.getByRole('button', {name: /Your session.*The Show/});
+  const episodeImg = episodeCard.querySelector('img');
+  expect(episodeImg).not.toBeNull();
+  expect(episodeImg.getAttribute('src')).toBe('/thumb?path=/show/poster');
+
+  // Movie with no artwork renders a placeholder and no <img> at all.
+  const movieCard = screen.getByRole('button', {name: /NoArt Movie/});
+  expect(movieCard.querySelector('img')).toBeNull();
+  // The placeholder SVG is present.
+  expect(movieCard.querySelector('svg')).not.toBeNull();
+});
+
+test('owned sessions sort first while preserving original relative order within each group', async () => {
+  // Mix owned and non-owned in a scrambled order; each group keeps its
+  // original relative order after the stable partition.
+  const mixedSessions = [
+    {ratingKey: 'N1', type: 'movie', title: 'Non-A', year: 2024, viewOffset: 0, duration: 60000,
+      User: {title: 'x'}, Media: [{Part: [{id: '1'}]}], ownedByCurrentUser: false},
+    {ratingKey: 'O1', type: 'movie', title: 'Own-A', year: 2024, viewOffset: 0, duration: 60000,
+      User: {title: 'me'}, Media: [{Part: [{id: '2'}]}], ownedByCurrentUser: true},
+    {ratingKey: 'N2', type: 'movie', title: 'Non-B', year: 2024, viewOffset: 0, duration: 60000,
+      User: {title: 'y'}, Media: [{Part: [{id: '3'}]}], ownedByCurrentUser: false},
+    {ratingKey: 'O2', type: 'movie', title: 'Own-B', year: 2024, viewOffset: 0, duration: 60000,
+      User: {title: 'me'}, Media: [{Part: [{id: '4'}]}], ownedByCurrentUser: true},
+    {ratingKey: 'N3', type: 'movie', title: 'Non-C', year: 2024, viewOffset: 0, duration: 60000,
+      User: {title: 'z'}, Media: [{Part: [{id: '5'}]}], ownedByCurrentUser: false},
+  ];
+  installFetch(response(mixedSessions));
+  render(<App/>);
+  await flush();
+
+  // The cards render in DOM order. Owned cards (O1, O2) come first, preserving
+  // their original relative order; non-owned (N1, N2, N3) follow, also in
+  // their original relative order.
+  const cards = screen.getAllByRole('button');
+  const cardTitles = cards.map(card => card.textContent);
+  const indexOf = title => cardTitles.findIndex(t => t.includes(title));
+  const o1 = indexOf('Own-A');
+  const o2 = indexOf('Own-B');
+  const n1 = indexOf('Non-A');
+  const n2 = indexOf('Non-B');
+  const n3 = indexOf('Non-C');
+
+  // All found.
+  [o1, o2, n1, n2, n3].forEach(i => expect(i).toBeGreaterThanOrEqual(0));
+
+  // Owned group leads, in original relative order.
+  expect(o1).toBeLessThan(o2);
+  expect(o2).toBeLessThan(n1);
+
+  // Non-owned group preserves original relative order.
+  expect(n1).toBeLessThan(n2);
+  expect(n2).toBeLessThan(n3);
+});
+
+test('sessions error state offers a retry that re-fetches the sessions list', async () => {
+  const failing = jest.fn(() => Promise.reject(new Error('boom')));
+  global.fetch = jest.fn((url) => {
+    if (url === '/sessions') return failing();
+    return Promise.resolve(response([]));
+  });
+  render(<App/>);
+  await flush();
+
+  expect(screen.getByText(/Couldn’t load your Plex sessions/)).toBeInTheDocument();
+  const retryButton = screen.getByRole('button', {name: 'Try again'});
+  expect(retryButton).toBeInTheDocument();
+
+  // First fetch failed; retry re-fetches.
+  expect(failing).toHaveBeenCalledTimes(1);
+  fireEvent.click(retryButton);
+  await flush();
+  expect(failing).toHaveBeenCalledTimes(2);
+});
+
+test('refreshes sessions on a ten-second picker cadence and restarts immediately on return', async () => {
+  jest.useFakeTimers();
+  const {sessionRequests} = installTrackedSessionsFetch();
+  render(<App/>);
+
+  expect(sessionRequests).toHaveLength(1);
+  await resolveRequest(sessionRequests[0], sessions);
+  await advancePolling(9999);
+  expect(sessionRequests).toHaveLength(1);
+  await advancePolling(1);
+  expect(sessionRequests).toHaveLength(2);
+
+  await resolveRequest(sessionRequests[1], sessions);
+  await advancePolling(10000);
+  expect(sessionRequests).toHaveLength(3);
+  // A refresh already in flight is aborted before opening the workspace.
+  await selectSession('Alpha');
+  expect(sessionRequests[2].options.signal.aborted).toBe(true);
+
+  await changeSession();
+  expect(sessionRequests).toHaveLength(4);
+});
+
+test('visibility pauses and aborts refreshes, then performs an immediate refresh when visible', async () => {
+  jest.useFakeTimers();
+  const {sessionRequests} = installTrackedSessionsFetch();
+  render(<App/>);
+  await resolveRequest(sessionRequests[0], sessions);
+
+  await advancePolling(10000);
+  expect(sessionRequests).toHaveLength(2);
+  await setDocumentVisibility('hidden');
+  expect(sessionRequests[1].options.signal.aborted).toBe(true);
+  await advancePolling(20000);
+  expect(sessionRequests).toHaveLength(2);
+
+  await setDocumentVisibility('visible');
+  expect(sessionRequests).toHaveLength(3);
+});
+
+test('transient refresh failures retain the last good sessions and retry on the next tick', async () => {
+  jest.useFakeTimers();
+  const {sessionRequests} = installTrackedSessionsFetch();
+  render(<App/>);
+  await resolveRequest(sessionRequests[0], sessions);
+
+  await advancePolling(10000);
+  await rejectRequest(sessionRequests[1]);
+  expect(screen.getByText('Alpha')).toBeInTheDocument();
+  expect(screen.queryByText(/Couldn’t load your Plex sessions/)).not.toBeInTheDocument();
+
+  await advancePolling(10000);
+  expect(sessionRequests).toHaveLength(3);
+});
+
+test('auth responses stop session refresh and show the login state', async () => {
+  jest.useFakeTimers();
+  const {sessionRequests} = installTrackedSessionsFetch();
+  render(<App/>);
+  await resolveRequest(sessionRequests[0], sessions);
+  await advancePolling(10000);
+  await resolveRequestWith(sessionRequests[1], null, {ok: false, status: 401, statusText: 'Unauthorized'});
+
+  expect(screen.getByRole('link', {name: 'Log in with Plex'})).toBeInTheDocument();
+  await advancePolling(30000);
+  expect(sessionRequests).toHaveLength(2);
+});
+
+test('stale refresh results cannot replace sessions after selection', async () => {
+  jest.useFakeTimers();
+  const {sessionRequests} = installTrackedSessionsFetch();
+  render(<App/>);
+  await resolveRequest(sessionRequests[0], sessions);
+  await advancePolling(10000);
+  const stale = [{...sessions[0], title: 'Stale session'}];
+
+  await selectSession('Alpha');
+  await resolveRequest(sessionRequests[1], stale);
+  await changeSession();
+
+  expect(screen.getByText('Alpha')).toBeInTheDocument();
+  expect(screen.queryByText('Stale session')).not.toBeInTheDocument();
+});
+
 test('streams loading is shown before the empty-stream state', async () => {
   const pending = installFetch();
   render(<App/>);
@@ -1101,7 +1414,7 @@ test('active render jobs constrain session changes and keep polling alive', asyn
   await resolveRequest(poll, {id: 'job-session', status: 'running'});
 
   const changeButtons = screen.getAllByRole('button', {name: 'Change session'});
-  expect(changeButtons).toHaveLength(2);
+  expect(changeButtons).toHaveLength(1);
   changeButtons.forEach(button => {
     expect(button).toBeDisabled();
     expect(button).toHaveAttribute(
@@ -1198,4 +1511,107 @@ test('session context shows the active session title in the workspace', async ()
 
   expect(screen.getByText('Now clipping')).toBeInTheDocument();
   expect(screen.getByText('Alpha')).toBeInTheDocument();
+});
+
+// ---------------------------------------------------------------------------
+// Theater mode — desktop-only preview toggle (mobile stays single-column).
+// ---------------------------------------------------------------------------
+
+async function openWorkspaceWithStreams() {
+  const pending = installFetch();
+  render(<App/>);
+  await flush();
+  await selectSession('Alpha');
+  await resolveRequest(requestFor(pending, url => url === '/streams/A?mediaId=101'), textStreams());
+  return pending;
+}
+
+test('theater toggle is rendered near the preview with an accessible pressed state', async () => {
+  await openWorkspaceWithStreams();
+
+  const toggle = screen.getByRole('button', {name: 'Theater mode'});
+  expect(toggle).toBeInTheDocument();
+  // Off by default — aria-pressed communicates state to assistive tech.
+  expect(toggle).toHaveAttribute('aria-pressed', 'false');
+  expect(toggle).toHaveTextContent('Theater mode');
+});
+
+test('clicking the theater toggle flips state, label, and the workspace modifier class', async () => {
+  await openWorkspaceWithStreams();
+
+  const toggle = screen.getByRole('button', {name: 'Theater mode'});
+  // Workspace starts in the normal two-pane layout.
+  expect(document.querySelector('.cs-workspace')).not.toHaveClass('cs-workspace--theater');
+
+  fireEvent.click(toggle);
+  await flush();
+
+  // On: pressed, relabeled, and the workspace grid collapses to one column.
+  expect(toggle).toHaveAttribute('aria-pressed', 'true');
+  expect(toggle).toHaveTextContent('Default view');
+  expect(document.querySelector('.cs-workspace')).toHaveClass('cs-workspace--theater');
+
+  // Toggling back restores the normal layout and the original label.
+  fireEvent.click(toggle);
+  await flush();
+  expect(toggle).toHaveAttribute('aria-pressed', 'false');
+  expect(toggle).toHaveTextContent('Theater mode');
+  expect(document.querySelector('.cs-workspace')).not.toHaveClass('cs-workspace--theater');
+});
+
+test('theater mode preserves trim, render, and subtitle controls in the DOM', async () => {
+  await openWorkspaceWithStreams();
+
+  fireEvent.click(screen.getByRole('button', {name: 'Theater mode'}));
+  await flush();
+
+  // Trim controls remain available.
+  expect(screen.getByRole('textbox', {name: 'Start time as hours minutes seconds milliseconds'})).toBeInTheDocument();
+  expect(screen.getByRole('textbox', {name: 'End time as hours minutes seconds milliseconds'})).toBeInTheDocument();
+  // Render controls remain available.
+  expect(screen.getByRole('button', {name: 'Render clip'})).toBeInTheDocument();
+  // Subtitle panel remains available beneath the preview.
+  expect(screen.getByRole('combobox', {name: 'Subtitle track'})).toBeInTheDocument();
+  expect(screen.getByText('Subtitles')).toBeInTheDocument();
+});
+
+test('theater mode does not alter the preview URL or trigger a render request', async () => {
+  const pending = await openWorkspaceWithStreams();
+  const playerUrlBefore = screen.getByTestId('react-player').getAttribute('data-url');
+  const renderRequestsBefore = pending.filter(r => r.url === '/render-jobs').length;
+
+  fireEvent.click(screen.getByRole('button', {name: 'Theater mode'}));
+  await flush();
+
+  expect(screen.getByTestId('react-player').getAttribute('data-url')).toBe(playerUrlBefore);
+  expect(pending.filter(r => r.url === '/render-jobs').length).toBe(renderRequestsBefore);
+});
+
+test('changing sessions resets theater mode to its default off state', async () => {
+  const pending = await openWorkspaceWithStreams();
+
+  fireEvent.click(screen.getByRole('button', {name: 'Theater mode'}));
+  await flush();
+  expect(document.querySelector('.cs-workspace')).toHaveClass('cs-workspace--theater');
+
+  await changeSession();
+  // Theater toggle is gone while the picker is showing.
+  expect(screen.queryByRole('button', {name: 'Theater mode'})).not.toBeInTheDocument();
+
+  await selectSession('Beta');
+  await resolveRequest(requestFor(pending, url => url === '/streams/B?mediaId=202'), textStreams());
+
+  // New session opens in the normal two-pane layout with the toggle off.
+  expect(document.querySelector('.cs-workspace')).not.toHaveClass('cs-workspace--theater');
+  const toggle = screen.getByRole('button', {name: 'Theater mode'});
+  expect(toggle).toHaveAttribute('aria-pressed', 'false');
+  expect(toggle).toHaveTextContent('Theater mode');
+});
+
+test('theater toggle is not rendered before a session is selected', async () => {
+  installFetch();
+  render(<App/>);
+  await flush();
+
+  expect(screen.queryByRole('button', {name: 'Theater mode'})).not.toBeInTheDocument();
 });

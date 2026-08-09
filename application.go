@@ -83,24 +83,21 @@ type sessionContainer struct {
 }
 
 type sessionMetadata struct {
-	Title            string  `json:"title"`
-	Type             string  `json:"type"`
-	GrandparentTitle *string `json:"grandparentTitle,omitempty"`
-	ParentIndex      *int    `json:"parentIndex,omitempty"`
-	Index            *int    `json:"index,omitempty"`
-	Year             *int    `json:"year,omitempty"`
-	Thumb            *string `json:"thumb,omitempty"`
-	GrandparentThumb *string `json:"grandparentThumb,omitempty"`
-	Key              string  `json:"key"`
-	RatingKey        *string `json:"ratingKey,omitempty"`
-	Duration         *int    `json:"duration,omitempty"`
-	ViewOffset       *int64  `json:"viewOffset,omitempty"`
-	User             struct {
-		ID    string `json:"id"`
-		Title string `json:"title"`
-		Thumb string `json:"thumb"`
-	} `json:"User"`
-	Player struct {
+	Title              string      `json:"title"`
+	Type               string      `json:"type"`
+	GrandparentTitle   *string     `json:"grandparentTitle,omitempty"`
+	ParentIndex        *int        `json:"parentIndex,omitempty"`
+	Index              *int        `json:"index,omitempty"`
+	Year               *int        `json:"year,omitempty"`
+	Thumb              *string     `json:"thumb,omitempty"`
+	GrandparentThumb   *string     `json:"grandparentThumb,omitempty"`
+	Key                string      `json:"key"`
+	RatingKey          *string     `json:"ratingKey,omitempty"`
+	Duration           *int        `json:"duration,omitempty"`
+	ViewOffset         *int64      `json:"viewOffset,omitempty"`
+	User               sessionUser `json:"User"`
+	OwnedByCurrentUser bool        `json:"ownedByCurrentUser"`
+	Player             struct {
 		Title             string `json:"title"`
 		UUID              string `json:"uuid"`
 		MachineIdentifier string `json:"machineIdentifier"`
@@ -113,6 +110,34 @@ type sessionMetadata struct {
 		Location  string `json:"location,omitempty"`
 	} `json:"Session"`
 	Media []sessionMedia `json:"Media,omitempty"`
+}
+
+// sessionUser accepts both forms emitted by Plex: User.id is normally a
+// quoted value, but some Plex versions serialize it as a JSON number.
+type sessionUser struct {
+	ID    string `json:"id"`
+	Title string `json:"title"`
+	Thumb string `json:"thumb"`
+}
+
+func (u *sessionUser) UnmarshalJSON(data []byte) error {
+	var raw struct {
+		ID    json.RawMessage `json:"id"`
+		Title string          `json:"title"`
+		Thumb string          `json:"thumb"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+
+	id, err := plexNumericIDText(raw.ID)
+	if err != nil {
+		return fmt.Errorf("invalid session user id: %w", err)
+	}
+	u.ID = id
+	u.Title = raw.Title
+	u.Thumb = raw.Thumb
+	return nil
 }
 
 type sessionMedia struct {
@@ -304,13 +329,17 @@ func (a *Application) GetSessions(ctx context.Context) ([]sessionMetadata, error
 		return nil, fmt.Errorf("could not decode sessions: %w\nRaw response:\n%s", err, string(body))
 	}
 
-	// Non-owner users see only their own sessions
 	user := UserFromContext(ctx)
-	if user != nil && user.Email != a.ownerEmail {
-		userIdStr := strconv.Itoa(user.Id)
+	serverOwner := user != nil && user.Email == a.ownerEmail
+	for i := range sessions.MediaContainer.Metadata {
+		sessions.MediaContainer.Metadata[i].OwnedByCurrentUser = sessionOwnedByCurrentUser(sessions.MediaContainer.Metadata[i], user, serverOwner)
+	}
+
+	// Non-owner users see only their own sessions
+	if user != nil && !serverOwner {
 		var filtered []sessionMetadata
 		for _, s := range sessions.MediaContainer.Metadata {
-			if s.User.ID == userIdStr {
+			if sessionVisibleToCurrentUser(s, user) {
 				filtered = append(filtered, s)
 			}
 		}
@@ -318,6 +347,51 @@ func (a *Application) GetSessions(ctx context.Context) ([]sessionMetadata, error
 	}
 
 	return sessions.MediaContainer.Metadata, nil
+}
+
+func sessionOwnedByCurrentUser(session sessionMetadata, user *User, serverOwner bool) bool {
+	if user == nil {
+		return false
+	}
+
+	sessionUserID, err := strconv.ParseInt(session.User.ID, 10, 64)
+	if err != nil {
+		return false
+	}
+
+	// PMS uses local playback-profile IDs. The configured server owner's
+	// profile is the stable local ID 1, not necessarily the Plex account ID.
+	if serverOwner {
+		return sessionUserID == 1
+	}
+
+	// A non-owner must never claim the owner's local profile. For other local
+	// IDs, retain the direct numeric match as an additional positive signal.
+	if sessionUserID == 1 {
+		return false
+	}
+	if sessionUserID == int64(user.Id) {
+		return true
+	}
+
+	for _, identity := range []string{user.Username, user.Title, user.Email} {
+		if identity != "" && strings.EqualFold(strings.TrimSpace(session.User.Title), strings.TrimSpace(identity)) {
+			return true
+		}
+	}
+
+	return false
+}
+
+// sessionVisibleToCurrentUser intentionally remains ID-based. Ownership
+// annotations must not change the existing non-owner access boundary.
+func sessionVisibleToCurrentUser(session sessionMetadata, user *User) bool {
+	if user == nil {
+		return false
+	}
+
+	sessionUserID, err := strconv.ParseInt(session.User.ID, 10, 64)
+	return err == nil && sessionUserID == int64(user.Id)
 }
 
 // SubtitleStream describes a subtitle track available in a media item.

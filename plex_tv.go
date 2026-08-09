@@ -1,11 +1,14 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"encoding/xml"
 	"fmt"
-	"github.com/google/uuid"
 	"net/http"
+	"strconv"
+
+	"github.com/google/uuid"
 )
 
 type PlexTV struct {
@@ -75,7 +78,63 @@ type User struct {
 	Id       int    `json:"id"`
 	Uuid     string `json:"uuid"`
 	Username string `json:"username"`
+	Title    string `json:"title"`
 	Email    string `json:"email"`
+}
+
+// Plex has returned account IDs as both JSON numbers and quoted numbers over
+// time. Keep the application identity numeric while accepting either wire
+// representation.
+func (u *User) UnmarshalJSON(data []byte) error {
+	var raw struct {
+		ID       json.RawMessage `json:"id"`
+		UUID     string          `json:"uuid"`
+		Username string          `json:"username"`
+		Title    string          `json:"title"`
+		Email    string          `json:"email"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+
+	id, err := plexNumericID(raw.ID)
+	if err != nil {
+		return fmt.Errorf("invalid Plex user id: %w", err)
+	}
+	if int64(int(id)) != id {
+		return fmt.Errorf("Plex user id %d does not fit in int", id)
+	}
+	u.Id = int(id)
+	u.Uuid = raw.UUID
+	u.Username = raw.Username
+	u.Title = raw.Title
+	u.Email = raw.Email
+	return nil
+}
+
+func plexNumericID(raw json.RawMessage) (int64, error) {
+	text, err := plexNumericIDText(raw)
+	if err != nil || text == "" {
+		return 0, err
+	}
+	return strconv.ParseInt(text, 10, 64)
+}
+
+func plexNumericIDText(raw json.RawMessage) (string, error) {
+	raw = bytes.TrimSpace(raw)
+	if len(raw) == 0 || bytes.Equal(raw, []byte("null")) {
+		return "", nil
+	}
+
+	if raw[0] == '"' {
+		var text string
+		if err := json.Unmarshal(raw, &text); err != nil {
+			return "", err
+		}
+		return text, nil
+	}
+
+	return string(raw), nil
 }
 
 type GetUserResp struct {
