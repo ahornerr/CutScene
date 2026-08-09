@@ -740,7 +740,7 @@ func (a *Application) downloadSubtitle(ctx context.Context, streamKey, codec str
 	}
 }
 
-func (a *Application) prepareExternalSubtitle(ctx context.Context, source subtitleSource, fromMs, toMs int64) (string, error) {
+func (a *Application) prepareExternalSubtitle(ctx context.Context, source subtitleSource, fromMs, toMs int64, subtitleOffsets ...int64) (string, error) {
 	if !source.External || source.StreamKey == "" {
 		return "", fmt.Errorf("external subtitle stream key is missing")
 	}
@@ -751,7 +751,7 @@ func (a *Application) prepareExternalSubtitle(ctx context.Context, source subtit
 	if err != nil {
 		return "", fmt.Errorf("could not download external subtitle: %w", err)
 	}
-	subtitleFile, err := WriteClipSRT(entries, fromMs, toMs)
+	subtitleFile, err := WriteClipSRT(entries, fromMs, toMs, subtitleOffsets...)
 	if err != nil {
 		return "", fmt.Errorf("could not write external subtitle: %w", err)
 	}

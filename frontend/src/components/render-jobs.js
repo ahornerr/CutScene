@@ -1,4 +1,5 @@
 import {millisToDuration} from "../utils";
+import {clampSubtitleOffsetMs, formatSubtitleOffsetMs} from "./SubtitleOffsetControl";
 
 // Render job states matching the backend renderJobState constants.
 export const JOB_STATES = {
@@ -42,7 +43,10 @@ export function audioModeLabel(value) {
 }
 
 // Build the POST /render-jobs request body from the current clip spec.
-export function buildRenderJobRequest(session, startPosition, endPosition, selectedSubtitle, audioMode) {
+// `subtitleOffsetMs` shifts subtitle timing in the rendered output — positive
+// delays subtitles (later), negative advances them (earlier). It is always
+// present in the payload so the backend can rely on the field.
+export function buildRenderJobRequest(session, startPosition, endPosition, selectedSubtitle, audioMode, subtitleOffsetMs) {
   const mediaId = normalizeMediaId(session?.Media?.[0]?.Part?.[0]?.id)
   if (mediaId == null) throw new Error('The selected media part has an invalid media ID.')
   return {
@@ -52,6 +56,7 @@ export function buildRenderJobRequest(session, startPosition, endPosition, selec
     toMs: endPosition,
     subtitleIndex: selectedSubtitle,
     audioMode: audioMode || AUDIO_MODES.STANDARD,
+    subtitleOffsetMs: clampSubtitleOffsetMs(subtitleOffsetMs),
   }
 }
 
@@ -66,6 +71,7 @@ export function buildRenderJobRequestFromSpec(spec) {
     toMs: spec.toMs,
     subtitleIndex: spec.subtitleIndex,
     audioMode: spec.audioMode || AUDIO_MODES.STANDARD,
+    subtitleOffsetMs: clampSubtitleOffsetMs(spec?.subtitleOffsetMs),
   }
 }
 
@@ -86,8 +92,9 @@ export function isTransportError(error) {
 // Snapshot an immutable submitted spec for display. This is captured at job
 // creation time and never mutated — it represents what was actually submitted,
 // not the current (possibly edited) controls.
-export function snapshotJobSpec(session, startPosition, endPosition, selectedSubtitle, streams, audioMode) {
+export function snapshotJobSpec(session, startPosition, endPosition, selectedSubtitle, streams, audioMode, subtitleOffsetMs) {
   const stream = selectedSubtitle >= 0 ? streams.find(s => s.index === selectedSubtitle) : null
+  const offsetMs = clampSubtitleOffsetMs(subtitleOffsetMs)
   return {
     ratingKey: session.ratingKey,
     mediaId: normalizeMediaId(session?.Media?.[0]?.Part?.[0]?.id),
@@ -102,6 +109,8 @@ export function snapshotJobSpec(session, startPosition, endPosition, selectedSub
       : 'None',
     clipDuration: Math.max(0, endPosition - startPosition),
     audioMode: audioMode || AUDIO_MODES.STANDARD,
+    subtitleOffsetMs: offsetMs,
+    subtitleOffsetLabel: `Offset ${formatSubtitleOffsetMs(offsetMs)}`,
   }
 }
 
@@ -155,5 +164,7 @@ export function formatJobSpec(spec) {
     duration: millisToDuration(spec.clipDuration),
     subtitle: spec.subtitleLabel,
     audioMode: audioModeLabel(spec.audioMode),
+    subtitleOffsetMs: clampSubtitleOffsetMs(spec?.subtitleOffsetMs),
+    subtitleOffsetLabel: `Offset ${formatSubtitleOffsetMs(spec?.subtitleOffsetMs)}`,
   }
 }

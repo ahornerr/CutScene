@@ -26,6 +26,20 @@ func TestDecodeRenderJobRequestIsStrictAndBoundedByCaller(t *testing.T) {
 	if _, err := decodeRenderJobRequest([]byte(`{"ratingKey":"movie-1"} {}`)); err == nil {
 		t.Fatal("trailing JSON must be rejected")
 	}
+	request, err = decodeRenderJobRequest([]byte(`{"ratingKey":"movie-1","mediaId":42,"fromMs":0,"toMs":1000,"subtitleOffsetMs":-250}`))
+	if err != nil || request.SubtitleOffsetMs != -250 {
+		t.Fatalf("signed subtitle offset decode = %+v, %v", request, err)
+	}
+}
+
+func TestRenderJobValidationRejectsSubtitleOffsetOutsideRange(t *testing.T) {
+	request := RenderJobCreateRequest{
+		RatingKey: "movie-1", MediaID: 42, FromMs: 0, ToMs: 1000,
+		SubtitleIndex: -1, SubtitleOffsetMs: maxSubtitleOffsetMs + 1,
+	}
+	if _, err := validateRenderJobRequest(request, User{Uuid: "owner-a"}, nil); err == nil {
+		t.Fatal("out-of-range subtitle offset was accepted")
+	}
 }
 
 func TestFfmpegRenderOutputForcesMP4Muxer(t *testing.T) {

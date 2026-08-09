@@ -55,14 +55,15 @@ const (
 )
 
 type RenderJobCreateRequest struct {
-	RatingKey     string    `json:"ratingKey"`
-	MediaID       int64     `json:"mediaId"`
-	FromMs        int64     `json:"fromMs"`
-	ToMs          int64     `json:"toMs"`
-	SubtitleIndex int       `json:"subtitleIndex"`
-	Height        int       `json:"height"`
-	QP            int       `json:"qp"`
-	AudioMode     AudioMode `json:"audioMode"`
+	RatingKey        string    `json:"ratingKey"`
+	MediaID          int64     `json:"mediaId"`
+	FromMs           int64     `json:"fromMs"`
+	ToMs             int64     `json:"toMs"`
+	SubtitleIndex    int       `json:"subtitleIndex"`
+	SubtitleOffsetMs int64     `json:"subtitleOffsetMs"`
+	Height           int       `json:"height"`
+	QP               int       `json:"qp"`
+	AudioMode        AudioMode `json:"audioMode"`
 }
 
 type renderJobSpec struct {
@@ -74,6 +75,7 @@ type renderJobSpec struct {
 	FromMs                int64
 	ToMs                  int64
 	SubtitleIndex         int
+	SubtitleOffsetMs      int64
 	SubtitlePGS           bool
 	SubtitleExternal      bool
 	SubtitleStreamKey     string
@@ -1038,6 +1040,9 @@ func validateRenderJobRequestWithMetadata(request RenderJobCreateRequest, user U
 	if request.SubtitleIndex < -1 {
 		return renderJobSpec{}, errors.New("subtitleIndex is invalid")
 	}
+	if err := validateSubtitleOffsetMs(request.SubtitleOffsetMs); err != nil {
+		return renderJobSpec{}, err
+	}
 	if request.Height < 0 || request.Height > 2160 || request.Height > 0 && (request.Height < 144 || request.Height%2 != 0) {
 		return renderJobSpec{}, errors.New("height is invalid")
 	}
@@ -1085,6 +1090,7 @@ func validateRenderJobRequestWithMetadata(request RenderJobCreateRequest, user U
 			FromMs:                request.FromMs,
 			ToMs:                  request.ToMs,
 			SubtitleIndex:         request.SubtitleIndex,
+			SubtitleOffsetMs:      request.SubtitleOffsetMs,
 			SubtitlePGS:           subtitle.PGS,
 			SubtitleExternal:      subtitle.External,
 			SubtitleStreamKey:     subtitle.StreamKey,
@@ -1150,6 +1156,7 @@ func validateRenderJobRequestWithMetadata(request RenderJobCreateRequest, user U
 					FromMs:                request.FromMs,
 					ToMs:                  request.ToMs,
 					SubtitleIndex:         request.SubtitleIndex,
+					SubtitleOffsetMs:      request.SubtitleOffsetMs,
 					SubtitlePGS:           subtitlePGS,
 					SubtitleEmbeddedIndex: subtitleEmbeddedIndex,
 					Height:                request.Height,
@@ -1208,7 +1215,7 @@ func (a *Application) executeRenderSpec(ctx context.Context, spec renderJobSpec,
 				External:  true,
 			}
 			var err error
-			subtitleFile, err = a.prepareExternalSubtitle(ctx, source, spec.FromMs, spec.ToMs)
+			subtitleFile, err = a.prepareExternalSubtitle(ctx, source, spec.FromMs, spec.ToMs, spec.SubtitleOffsetMs)
 			if err != nil {
 				return newRenderStageFailure("subtitle", "subtitle_unavailable", err)
 			}
@@ -1221,7 +1228,7 @@ func (a *Application) executeRenderSpec(ctx context.Context, spec renderJobSpec,
 			if err != nil {
 				return classifyRenderStageError("subtitle", err)
 			}
-			subtitleFile, err = ExtractSubtitleContext(ctx, sourceURL, from, to, embeddedIndex)
+			subtitleFile, err = ExtractSubtitleContext(ctx, sourceURL, from, to, embeddedIndex, spec.SubtitleOffsetMs)
 			release()
 			if err != nil {
 				return classifyRenderStageError("subtitle", err)
@@ -1233,7 +1240,7 @@ func (a *Application) executeRenderSpec(ctx context.Context, spec renderJobSpec,
 		URL: sourceURL, From: from, To: to, Filename: "job.mp4", OutputPath: outputPartial,
 		Codec: a.config.Ffmpeg.Codec, Height: spec.Height, QP: spec.QP,
 		AudioMode:    spec.AudioMode,
-		SubtitleFile: subtitleFile, SubtitleIndex: -1, Context: ctx,
+		SubtitleFile: subtitleFile, SubtitleIndex: -1, SubtitleOffsetMs: spec.SubtitleOffsetMs, Context: ctx,
 		Metadata: FfmpegParamsMetadata{Title: spec.Title},
 	}
 	if spec.SubtitlePGS {

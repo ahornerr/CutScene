@@ -147,6 +147,18 @@ async function selectAudioMode(label) {
   await flush();
 }
 
+async function clickSubtitleOffset(direction) {
+  // direction is 'later' (+) or 'earlier' (−); each click steps by 100ms.
+  const label = direction === 'later' ? 'Subtitles later' : 'Subtitles earlier';
+  fireEvent.click(screen.getByRole('button', {name: label}));
+  await flush();
+}
+
+async function resetSubtitleOffset() {
+  fireEvent.click(screen.getByRole('button', {name: 'Reset subtitle offset'}));
+  await flush();
+}
+
 function textStreams() {
   return [
     {index: 0, type: 'text', codec: 'srt', displayTitle: 'X track'},
@@ -420,6 +432,233 @@ test('changing sessions resets audio mode to standard', async () => {
   );
 });
 
+test('positive subtitle offset delays subtitles: preview URL and render payload carry subtitleOffsetMs', async () => {
+  const pending = installFetch();
+  render(<App/>);
+  await flush();
+  await selectSession('Alpha');
+  await resolveRequest(requestFor(pending, url => url === '/streams/A?mediaId=101'), textStreams());
+
+  // Default offset is 0 — the preview URL omits the param entirely.
+  expect(screen.getByTestId('react-player').getAttribute('data-url'))
+    .toBe('/preview/A/00:00:00/00:01:00?mediaId=101&subtitle=0');
+  expect(screen.getByRole('button', {name: 'Reset subtitle offset'})).toBeDisabled();
+
+  // Two +100ms steps → +200ms. The preview URL gains subtitleOffsetMs=200.
+  await clickSubtitleOffset('later');
+  await clickSubtitleOffset('later');
+  expect(screen.getByRole('button', {name: 'Reset subtitle offset'})).toHaveTextContent('+200 ms');
+  expect(screen.getByTestId('react-player').getAttribute('data-url'))
+    .toBe('/preview/A/00:00:00/00:01:00?mediaId=101&subtitle=0&subtitleOffsetMs=200');
+  expect(screen.queryByRole('button', {name: 'Preview selection'})).not.toBeInTheDocument();
+
+  // The render-job payload carries subtitleOffsetMs alongside the other fields.
+  fireEvent.click(screen.getByRole('button', {name: 'Render clip'}));
+  const createRequest = requestFor(pending, url => url === '/render-jobs');
+  expect(JSON.parse(createRequest.options.body)).toMatchObject({
+    ratingKey: 'A', mediaId: 101, subtitleIndex: 0, audioMode: 'standard', subtitleOffsetMs: 200,
+  });
+});
+
+test('negative subtitle offset advances subtitles and renders an earlier preview param', async () => {
+  const pending = installFetch();
+  render(<App/>);
+  await flush();
+  await selectSession('Alpha');
+  await resolveRequest(requestFor(pending, url => url === '/streams/A?mediaId=101'), textStreams());
+
+  await clickSubtitleOffset('earlier');
+  expect(screen.getByRole('button', {name: 'Reset subtitle offset'})).toHaveTextContent('−100 ms');
+  expect(screen.getByTestId('react-player').getAttribute('data-url'))
+    .toBe('/preview/A/00:00:00/00:01:00?mediaId=101&subtitle=0&subtitleOffsetMs=-100');
+
+  fireEvent.click(screen.getByRole('button', {name: 'Render clip'}));
+  const createRequest = requestFor(pending, url => url === '/render-jobs');
+  expect(JSON.parse(createRequest.options.body)).toMatchObject({subtitleOffsetMs: -100});
+});
+
+test('subtitle offset is retained while selecting subtitle tracks and entries', async () => {
+  const pending = installFetch();
+  render(<App/>);
+  await flush();
+  await selectSession('Alpha');
+  await resolveRequest(requestFor(pending, url => url === '/streams/A?mediaId=101'), textStreams());
+
+  await clickSubtitleOffset('later');
+  await clickSubtitleOffset('later');
+  await clickSubtitleOffset('later'); // +300ms
+  expect(screen.getByRole('button', {name: 'Reset subtitle offset'})).toHaveTextContent('+300 ms');
+
+  // Switching the subtitle track keeps the offset.
+  await selectSubtitle('Y track');
+  expect(screen.getByRole('button', {name: 'Reset subtitle offset'})).toHaveTextContent('+300 ms');
+  const yRequest = pending.filter(r => r.url.includes('/subtitles/A?subtitle=1')).slice(-1)[0];
+  await resolveRequest(yRequest, [{start: 1000, end: 2000, text: 'Y one'}]);
+
+  // Picking a subtitle entry keeps the offset too — it must not reset.
+  fireEvent.click(screen.getByRole('button', {name: /Subtitle at 00:00:01/}));
+  await flush();
+  expect(screen.getByRole('button', {name: 'Reset subtitle offset'})).toHaveTextContent('+300 ms');
+});
+
+test('subtitle offset shifts the clip range derived from a subtitle pick', async () => {
+  const pending = installFetch();
+  render(<App/>);
+  await flush();
+  await selectSession('Alpha');
+  await resolveRequest(requestFor(pending, url => url === '/streams/A?mediaId=101'), textStreams());
+  const subtitleRequest = requestFor(pending, url => url.includes('/subtitles/A?subtitle=0'));
+  await resolveRequest(subtitleRequest, [
+    {start: 5000, end: 6000, text: 'Range set'},
+  ]);
+
+  // +500ms offset: the subtitle displays at 5500–6500 in the output, so the
+  // clip range (with 500ms padding) becomes 5000–7000 instead of 4500–6500.
+  for (let i = 0; i < 5; i++) await clickSubtitleOffset('later');
+  expect(screen.getByRole('button', {name: 'Reset subtitle offset'})).toHaveTextContent('+500 ms');
+
+  fireEvent.click(screen.getByRole('button', {name: /Subtitle at 00:00:05/}));
+  await flush();
+  expect(screen.getByTestId('react-player').getAttribute('data-url'))
+    .toContain('/preview/A/00:00:05/00:00:07');
+  expect(screen.getByTestId('react-player').getAttribute('data-url'))
+    .toContain('subtitleOffsetMs=500');
+});
+
+test('clicking the offset value resets to 0 and drops the preview param', async () => {
+  const pending = installFetch();
+  render(<App/>);
+  await flush();
+  await selectSession('Alpha');
+  await resolveRequest(requestFor(pending, url => url === '/streams/A?mediaId=101'), textStreams());
+
+  await clickSubtitleOffset('later');
+  await clickSubtitleOffset('later');
+  expect(screen.getByTestId('react-player').getAttribute('data-url'))
+    .toContain('subtitleOffsetMs=200');
+
+  await resetSubtitleOffset();
+  expect(screen.getByRole('button', {name: 'Reset subtitle offset'})).toHaveTextContent('0 ms');
+  expect(screen.getByRole('button', {name: 'Reset subtitle offset'})).toBeDisabled();
+  expect(screen.getByTestId('react-player').getAttribute('data-url'))
+    .toBe('/preview/A/00:00:00/00:01:00?mediaId=101&subtitle=0');
+});
+
+test('changing sessions resets the subtitle offset to 0', async () => {
+  const pending = installFetch();
+  render(<App/>);
+  await flush();
+  await selectSession('Alpha');
+  await resolveRequest(requestFor(pending, url => url === '/streams/A?mediaId=101'), textStreams());
+  await clickSubtitleOffset('later');
+  expect(screen.getByRole('button', {name: 'Reset subtitle offset'})).toHaveTextContent('+100 ms');
+
+  await changeSession();
+  await selectSession('Beta');
+  await resolveRequest(requestFor(pending, url => url === '/streams/B?mediaId=202'), textStreams());
+  expect(screen.getByRole('button', {name: 'Reset subtitle offset'})).toHaveTextContent('0 ms');
+  expect(screen.getByTestId('react-player').getAttribute('data-url'))
+    .toBe('/preview/B/00:00:05/00:01:05?mediaId=202&subtitle=0');
+});
+
+test('subtitle offset control is disabled when no subtitle track is selected', async () => {
+  const pending = installFetch();
+  render(<App/>);
+  await flush();
+  await selectSession('Alpha');
+  await resolveRequest(requestFor(pending, url => url === '/streams/A?mediaId=101'), []);
+
+  expect(screen.getByRole('button', {name: 'Subtitles later'})).toBeDisabled();
+  expect(screen.getByRole('button', {name: 'Subtitles earlier'})).toBeDisabled();
+  // No subtitle param in the preview URL when offset is irrelevant.
+  expect(screen.getByTestId('react-player').getAttribute('data-url')).not.toContain('subtitleOffsetMs');
+});
+
+test('changing offset refits an active single subtitle selection around shifted timings', async () => {
+  const pending = installFetch();
+  render(<App/>);
+  await flush();
+  await selectSession('Alpha');
+  await resolveRequest(requestFor(pending, url => url === '/streams/A?mediaId=101'), textStreams());
+  const subtitleRequest = requestFor(pending, url => url.includes('/subtitles/A?subtitle=0'));
+  await resolveRequest(subtitleRequest, [{start: 5000, end: 6000, text: 'Solo'}]);
+
+  // Picking the entry sets the range to 4500–6500 (500ms padding).
+  fireEvent.click(screen.getByRole('button', {name: /Subtitle at 00:00:05/}));
+  await flush();
+  expect(screen.getByTestId('react-player').getAttribute('data-url'))
+    .toContain('/preview/A/00:00:04.500/00:00:06.500');
+
+  // Changing the offset refits the active selection without re-picking.
+  // +200ms → shifted 5200–6200 → padded 4700–6700.
+  await clickSubtitleOffset('later');
+  await clickSubtitleOffset('later');
+  expect(screen.getByTestId('react-player').getAttribute('data-url'))
+    .toContain('/preview/A/00:00:04.700/00:00:06.700');
+  expect(screen.getByTestId('react-player').getAttribute('data-url'))
+    .toContain('subtitleOffsetMs=200');
+  // Auto-applied — no stale button.
+  expect(screen.queryByRole('button', {name: 'Preview selection'})).not.toBeInTheDocument();
+});
+
+test('changing offset refits an active contiguous multi-selection around the full shifted span', async () => {
+  const pending = installFetch();
+  render(<App/>);
+  await flush();
+  await selectSession('Alpha');
+  await resolveRequest(requestFor(pending, url => url === '/streams/A?mediaId=101'), textStreams());
+  const subtitleRequest = requestFor(pending, url => url.includes('/subtitles/A?subtitle=0'));
+  await resolveRequest(subtitleRequest, [
+    {start: 5000, end: 6000, text: 'A'},
+    {start: 7000, end: 8000, text: 'B'},
+    {start: 9000, end: 10000, text: 'C'},
+  ]);
+
+  // Single pick on the first entry → 4500–6500.
+  fireEvent.click(screen.getByRole('button', {name: /Subtitle at 00:00:05: A/}));
+  await flush();
+  // Shift+click the third entry extends the selection to entries 0–2.
+  fireEvent.click(screen.getByRole('button', {name: /Subtitle at 00:00:09: C/}), {shiftKey: true});
+  await flush();
+  // Span 5000–10000 → padded 4500–10500.
+  expect(screen.getByTestId('react-player').getAttribute('data-url'))
+    .toContain('/preview/A/00:00:04.500/00:00:10.500');
+
+  // +500ms refits the whole selection: shifted 5500–10500 → padded 5000–11000.
+  for (let i = 0; i < 5; i++) await clickSubtitleOffset('later');
+  expect(screen.getByTestId('react-player').getAttribute('data-url'))
+    .toContain('/preview/A/00:00:05/00:00:11');
+  expect(screen.getByTestId('react-player').getAttribute('data-url'))
+    .toContain('subtitleOffsetMs=500');
+  expect(screen.queryByRole('button', {name: 'Preview selection'})).not.toBeInTheDocument();
+});
+
+test('changing offset does not alter a manually-set range when no subtitle selection is active', async () => {
+  const pending = installFetch();
+  render(<App/>);
+  await flush();
+  await selectSession('Alpha');
+  await resolveRequest(requestFor(pending, url => url === '/streams/A?mediaId=101'), textStreams());
+  // Subtitles load but nothing is picked — anchor stays -1.
+  await resolveRequest(
+    requestFor(pending, url => url.includes('/subtitles/A?subtitle=0')),
+    [{start: 5000, end: 6000, text: 'Unpicked'}]
+  );
+
+  // Initial manual range is 00:00:00–00:01:00.
+  expect(screen.getByTestId('react-player').getAttribute('data-url'))
+    .toBe('/preview/A/00:00:00/00:01:00?mediaId=101&subtitle=0');
+
+  // The offset still reaches the preview URL, but the range is untouched.
+  await clickSubtitleOffset('later');
+  await clickSubtitleOffset('later');
+  expect(screen.getByTestId('react-player').getAttribute('data-url'))
+    .toBe('/preview/A/00:00:00/00:01:00?mediaId=101&subtitle=0&subtitleOffsetMs=200');
+  expect(screen.getByRole('slider', {name: 'Clip start time'})).toHaveValue('0');
+  expect(screen.getByRole('slider', {name: 'Clip end time'})).toHaveValue('60000');
+  expect(screen.queryByRole('button', {name: 'Preview selection'})).not.toBeInTheDocument();
+});
+
 test('subtitle entry click sets clip range and auto-applies preview', async () => {
   const pending = installFetch();
   render(<App/>);
@@ -541,6 +780,7 @@ test('render-job POST body and queued/running/succeeded polling produce a saniti
   expect(createRequest.options.headers['Content-Type']).toBe('application/json');
   expect(JSON.parse(createRequest.options.body)).toEqual({
     ratingKey: 'A', mediaId: 101, fromMs: 0, toMs: 60000, subtitleIndex: -1, audioMode: 'standard',
+    subtitleOffsetMs: 0,
   });
 
   await resolveRequestWith(createRequest, {id: 'job-1', status: 'queued'}, {status: 202});
@@ -634,6 +874,7 @@ test('retryable render failures resubmit the immutable full submitted payload', 
   const submittedBody = JSON.parse(firstCreate.options.body);
   expect(submittedBody).toEqual({
     ratingKey: 'A', mediaId: 101, fromMs: 0, toMs: 60000, subtitleIndex: 0, audioMode: 'dialogue',
+    subtitleOffsetMs: 0,
   });
 
   await resolveRequestWith(firstCreate, {id: 'job-retry', status: 'queued'}, {status: 202});
