@@ -1,13 +1,13 @@
 module github.com/ahornerr/cutscene
 
-go 1.21
+go 1.22
 
-replace github.com/LukeHagar/plexgo v0.10.1 => github.com/ahornerr/plexgo v0.0.0-20240726214452-579127ef12c3
+//replace github.com/LukeHagar/plexgo v0.10.1 => github.com/ahornerr/plexgo v0.0.0-20240726214452-579127ef12c3
 
 //replace github.com/LukeHagar/plexgo => /home/andy/Documents/projects/plexgo
 
 require (
-	github.com/LukeHagar/plexgo v0.10.1
+	github.com/LukeHagar/plexgo v0.28.5
 	github.com/gofiber/fiber/v3 v3.0.0-beta.3
 	github.com/gofiber/storage/sqlite3 v1.3.8
 	github.com/google/uuid v1.6.0
@@ -18,8 +18,6 @@ require (
 require (
 	github.com/andybalholm/brotli v1.1.0 // indirect
 	github.com/aws/aws-sdk-go v1.54.20 // indirect
-	github.com/cenkalti/backoff/v4 v4.3.0 // indirect
-	github.com/ericlagergren/decimal v0.0.0-20240411145413-00de7ca16731 // indirect
 	github.com/fsnotify/fsnotify v1.7.0 // indirect
 	github.com/gofiber/utils/v2 v2.0.0-beta.5 // indirect
 	github.com/hashicorp/hcl v1.0.0 // indirect

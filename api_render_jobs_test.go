@@ -1,0 +1,870 @@
+package main
+
+import (
+	"bufio"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/LukeHagar/plexgo"
+	"github.com/LukeHagar/plexgo/models/components"
+	"github.com/gofiber/fiber/v3"
+	"github.com/valyala/fasthttp"
+	"github.com/valyala/fasthttp/fasthttputil"
+)
+
+func TestProtectedRoutesRunAuthBeforeHandlers(t *testing.T) {
+	api, err := NewAPI(Config{}, &Application{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tests := []struct {
+		method string
+		path   string
+		json   bool
+	}{
+		{http.MethodGet, "/sessions", false},
+		{http.MethodGet, "/thumb?path=/thumb", false},
+		{http.MethodGet, "/streams/movie", false},
+		{http.MethodGet, "/subtitles/movie", false},
+		{http.MethodGet, "/preview/movie/00:00:00/00:00:01", false},
+		{http.MethodPost, "/render-jobs", true},
+		{http.MethodGet, "/render-jobs/job-1", true},
+		{http.MethodGet, "/render-jobs/job-1/download", true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.method+" "+tt.path, func(t *testing.T) {
+			req := httptest.NewRequest(tt.method, tt.path, nil)
+			if tt.json {
+				req.Header.Set("Content-Type", "application/json")
+			}
+			resp, err := api.http.Test(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer resp.Body.Close()
+			if tt.json {
+				if resp.StatusCode != http.StatusUnauthorized {
+					t.Fatalf("status = %d, want 401", resp.StatusCode)
+				}
+				return
+			}
+			if resp.StatusCode < 300 || resp.StatusCode >= 400 {
+				t.Fatalf("status = %d, want redirect", resp.StatusCode)
+			}
+		})
+	}
+}
+
+func TestAuthMiddlewareRestoresUserWhenTokenAlreadyExists(t *testing.T) {
+	api := &API{
+		app: &Application{},
+		validateUser: func(ctx context.Context) (*User, error) {
+			if AuthTokenFromContext(ctx) == nil {
+				t.Fatal("auth token was not preserved during validation")
+			}
+			return &User{Uuid: "restored-user"}, nil
+		},
+	}
+	handled := false
+	app := fiber.New()
+	app.Use(func(ctx fiber.Ctx) error {
+		ctx.SetUserContext(ContextWithAuthToken(context.Background(), "token-present"))
+		return ctx.Next()
+	})
+	app.Get("/", func(ctx fiber.Ctx) error {
+		handled = UserFromContext(ctx.UserContext()) != nil
+		return nil
+	}, api.authMiddleware)
+	response, err := app.Test(httptest.NewRequest(http.MethodGet, "/", nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	response.Body.Close()
+	if response.StatusCode != http.StatusOK || !handled {
+		t.Fatalf("restored auth response=%d handled=%v", response.StatusCode, handled)
+	}
+}
+
+func testAuthenticatedRoute(handler fiber.Handler) *fiber.App {
+	app := fiber.New()
+	app.Use(func(ctx fiber.Ctx) error {
+		ctx.SetUserContext(ContextWithUser(context.Background(), User{Uuid: "owner-a"}))
+		return ctx.Next()
+	})
+	app.All("/*", handler)
+	return app
+}
+
+func testAuthenticatedParamRoute(method, path string, handler fiber.Handler) *fiber.App {
+	app := fiber.New()
+	authenticated := func(ctx fiber.Ctx) error {
+		ctx.SetUserContext(ContextWithUser(context.Background(), User{Uuid: "owner-a"}))
+		return handler(ctx)
+	}
+	app.Add([]string{method}, path, authenticated)
+	return app
+}
+
+func executeRealFiberRequest(t *testing.T, app *fiber.App, method, path string) (*http.Response, []byte) {
+	t.Helper()
+	serverConn, clientConn := net.Pipe()
+	server := &fasthttp.Server{Handler: app.Handler()}
+	serverDone := make(chan error, 1)
+	go func() { serverDone <- server.ServeConn(serverConn) }()
+	_ = clientConn.SetDeadline(time.Now().Add(5 * time.Second))
+	if _, err := fmt.Fprintf(clientConn, "%s %s HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n", method, path); err != nil {
+		t.Fatal(err)
+	}
+	request := httptest.NewRequest(method, "http://test"+path, nil)
+	response, err := http.ReadResponse(bufio.NewReader(clientConn), request)
+	if err != nil {
+		clientConn.Close()
+		t.Fatal(err)
+	}
+	body, err := io.ReadAll(response.Body)
+	response.Body.Close()
+	clientConn.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-serverDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("HTTP server did not finish stream callback")
+	}
+	return response, body
+}
+
+type previewBrokenPipeWriter struct{}
+
+func (previewBrokenPipeWriter) Write([]byte) (int, error) {
+	return 0, fmt.Errorf("write: broken pipe")
+}
+
+func TestPreviewStreamReleasesLimiterAfterClientDisconnect(t *testing.T) {
+	limiter := newFFmpegLimiter(1)
+	release, err := limiter.acquire(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	streamCtx, cancelStream := context.WithCancel(context.Background())
+	finished := false
+	writer := bufio.NewWriterSize(previewBrokenPipeWriter{}, 1)
+	runPreviewStream(
+		streamCtx, writer, release, cancelStream, func() { finished = true },
+		"source", "00:00:00", "00:00:01", "", -1, CodecLibx264,
+		func(_ context.Context, _, _, _, _ string, _ int, _ Codec, output io.Writer) error {
+			_, err := output.Write([]byte("ab"))
+			return err
+		},
+	)
+
+	if !finished {
+		t.Fatal("preview stream cleanup did not finish")
+	}
+	if streamCtx.Err() == nil {
+		t.Fatal("client write failure did not cancel the preview context")
+	}
+
+	nextRelease, err := limiter.acquire(context.Background())
+	if err != nil {
+		t.Fatalf("limiter remained occupied after client disconnect: %v", err)
+	}
+	nextRelease()
+}
+
+func TestPreviewStreamReleasesAfterFiberStreamReaderClose(t *testing.T) {
+	limiter := newFFmpegLimiter(1)
+	release, err := limiter.acquire(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	started := make(chan struct{})
+	finished := make(chan struct{})
+	reader := fasthttp.NewStreamReader(func(writer *bufio.Writer) {
+		close(started)
+		runPreviewStream(
+			context.Background(), writer, release, func() {}, func() { close(finished) },
+			"source", "00:00:00", "00:00:01", "", -1, CodecLibx264,
+			func(_ context.Context, _, _, _, _ string, _ int, _ Codec, output io.Writer) error {
+				for {
+					if _, err := output.Write(make([]byte, 64<<10)); err != nil {
+						return err
+					}
+				}
+			},
+		)
+	})
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		reader.Close()
+		t.Fatal("stream callback did not start")
+	}
+	if err := reader.Close(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-finished:
+	case <-time.After(time.Second):
+		t.Fatal("stream callback did not finish after connection close")
+	}
+
+	nextRelease, err := limiter.acquire(context.Background())
+	if err != nil {
+		t.Fatalf("limiter remained occupied after Fiber stream close: %v", err)
+	}
+	nextRelease()
+}
+
+func TestPreviewStreamReleasesAfterRealFiberConnectionClose(t *testing.T) {
+	limiter := newFFmpegLimiter(1)
+	release, err := limiter.acquire(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	callbackStarted := make(chan struct{})
+	callbackFinished := make(chan struct{})
+	handlerReturned := make(chan struct{})
+	fiberApp := fiber.New()
+	fiberApp.Get("/preview", func(ctx fiber.Ctx) error {
+		streamCtx, cancelStream := context.WithCancel(context.Background())
+		ctx.Response().SetBodyStreamWriter(func(writer *bufio.Writer) {
+			close(callbackStarted)
+			runPreviewStream(
+				streamCtx, writer, release, cancelStream, func() { close(callbackFinished) },
+				"source", "00:00:00", "00:00:01", "", -1, CodecLibx264,
+				func(_ context.Context, _, _, _, _ string, _ int, _ Codec, output io.Writer) error {
+					for {
+						if _, err := output.Write(make([]byte, 64<<10)); err != nil {
+							return err
+						}
+					}
+				},
+			)
+		})
+		close(handlerReturned)
+		return nil
+	})
+	listener := fasthttputil.NewInmemoryListener()
+	serveDone := make(chan error, 1)
+	go func() { serveDone <- fiberApp.Listener(listener, fiber.ListenConfig{DisableStartupMessage: true}) }()
+	conn, err := listener.Dial()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.WriteString(conn, "GET /preview HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n"); err != nil {
+		conn.Close()
+		t.Fatal(err)
+	}
+	select {
+	case <-handlerReturned:
+	case <-time.After(time.Second):
+		conn.Close()
+		t.Fatal("preview handler did not return")
+	}
+	select {
+	case <-callbackStarted:
+	case <-time.After(time.Second):
+		conn.Close()
+		t.Fatal("preview callback did not start")
+	}
+	if err := conn.Close(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-callbackFinished:
+	case <-time.After(time.Second):
+		t.Fatal("preview callback did not finish after connection close")
+	}
+
+	nextRelease, err := limiter.acquire(context.Background())
+	if err != nil {
+		t.Fatalf("limiter remained occupied after real connection close: %v", err)
+	}
+	nextRelease()
+	if err := fiberApp.ShutdownWithTimeout(time.Second); err != nil && !errors.Is(err, fiber.ErrNotRunning) {
+		t.Fatal(err)
+	}
+	select {
+	case <-serveDone:
+	case <-time.After(time.Second):
+		t.Fatal("Fiber server did not stop")
+	}
+}
+
+func TestPreviewHandlerReturnsBeforeStreamingCallback(t *testing.T) {
+	plex := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/status/sessions":
+			_, _ = io.WriteString(w, `{"MediaContainer":{"Metadata":[{"key":"movie-1","Media":[{"id":1,"duration":60000,"Part":[{"id":2}]}]}]}}`)
+		case "/library/metadata/movie-1":
+			_, _ = io.WriteString(w, `{"MediaContainer":{"Metadata":[{"Media":[{"id":1,"Part":[{"id":2,"key":"/library/parts/2/file.mp4"}]}]}]}}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer plex.Close()
+
+	config := Config{}
+	config.Plex.Host = plex.URL
+	application := &Application{
+		config:        config,
+		plexAdmin:     plexgo.New(plexgo.WithServerURL(plex.URL), plexgo.WithSecurity(config.Plex.Token)),
+		ffmpegLimiter: newFFmpegLimiter(1),
+	}
+	callbackStarted := make(chan struct{})
+	api := &API{
+		config: config,
+		app:    application,
+		previewRunner: func(_ context.Context, _, _, _, _ string, _ int, _ Codec, writer io.Writer, _ AudioMode) error {
+			close(callbackStarted)
+			_, err := writer.Write([]byte("preview"))
+			return err
+		},
+	}
+	handlerReturned := make(chan struct{})
+	app := testAuthenticatedParamRoute(http.MethodGet, "/preview/:ratingKey/:from/:to", func(ctx fiber.Ctx) error {
+		err := api.preview(ctx)
+		close(handlerReturned)
+		return err
+	})
+
+	responseDone := make(chan struct {
+		response *http.Response
+		err      error
+	}, 1)
+	go func() {
+		response, err := app.Test(httptest.NewRequest(http.MethodGet, "/preview/movie-1/00:00:00/00:00:01", nil))
+		responseDone <- struct {
+			response *http.Response
+			err      error
+		}{response: response, err: err}
+	}()
+
+	select {
+	case <-handlerReturned:
+	case <-time.After(time.Second):
+		t.Fatal("preview handler did not return")
+	}
+	select {
+	case <-callbackStarted:
+	case <-time.After(time.Second):
+		t.Fatal("preview callback did not start")
+	}
+
+	select {
+	case result := <-responseDone:
+		if result.err != nil {
+			t.Fatal(result.err)
+		}
+		defer result.response.Body.Close()
+		body, err := io.ReadAll(result.response.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(body) != "preview" {
+			t.Fatalf("preview body = %q, want %q", body, "preview")
+		}
+		nextRelease, err := application.ffmpegLimiter.acquire(context.Background())
+		if err != nil {
+			t.Fatalf("preview callback did not release the limiter: %v", err)
+		}
+		nextRelease()
+	case <-time.After(time.Second):
+		t.Fatal("preview response did not finish")
+	}
+}
+
+func TestGetStreamsSelectsSubtitleBearingPartAndUsesSubtitleOrdinal(t *testing.T) {
+	plex := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Path != "/library/metadata/movie-1" {
+			http.NotFound(w, r)
+			return
+		}
+		_, _ = io.WriteString(w, `{"MediaContainer":{"Metadata":[{"Media":[{"id":10,"Part":[{"id":100,"key":"/library/parts/100/file.mp4","Stream":[{"streamType":1,"index":0},{"streamType":2,"index":1}]},{"id":200,"key":"/library/parts/200/file.mp4","Stream":[{"streamType":1,"index":4},{"streamType":3,"index":9,"codec":"subrip","language":"English","displayTitle":"English"}]}]}]}]}}`)
+	}))
+	defer plex.Close()
+
+	config := Config{}
+	config.Plex.Host = plex.URL
+	app := &Application{
+		config:    config,
+		plexAdmin: plexgo.New(plexgo.WithServerURL(plex.URL), plexgo.WithSecurity(config.Plex.Token)),
+	}
+	api := &API{app: app}
+	httpApp := testAuthenticatedParamRoute(http.MethodGet, "/streams/:ratingKey", api.getStreams)
+	response, err := httpApp.Test(httptest.NewRequest(http.MethodGet, "/streams/movie-1?mediaId=200", nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", response.StatusCode)
+	}
+	var streams []SubtitleStream
+	if err := json.NewDecoder(response.Body).Decode(&streams); err != nil {
+		t.Fatal(err)
+	}
+	if len(streams) != 1 {
+		t.Fatalf("got %d subtitle streams, want 1", len(streams))
+	}
+	if streams[0].Index != 0 {
+		t.Fatalf("subtitle index = %d, want 0 (0-based subtitle ordinal)", streams[0].Index)
+	}
+}
+
+func TestGetSubtitleEntriesUsesSelectedPartForNativeExtractionAndCache(t *testing.T) {
+	var subtitleRequests int
+	plex := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/library/metadata/movie-1" {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{"MediaContainer":{"Metadata":[{"Media":[{"id":10,"Part":[{"id":100,"key":"/library/parts/100/file.mp4"},{"id":200,"key":"/library/parts/200/file.mp4","Stream":[{"streamType":3,"codec":"subrip","key":"/library/streams/200"}]}]}]}]}}`)
+			return
+		}
+		if r.URL.Path == "/library/streams/200" {
+			subtitleRequests++
+			w.Header().Set("Content-Type", "text/plain")
+			_, _ = io.WriteString(w, "1\n00:00:01,000 --> 00:00:02,000\nselected part\n")
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer plex.Close()
+
+	config := Config{}
+	config.Plex.Host = plex.URL
+	app := &Application{
+		config:        config,
+		plexAdmin:     plexgo.New(plexgo.WithServerURL(plex.URL), plexgo.WithSecurity(config.Plex.Token)),
+		subtitleCache: newSubtitleCache(4),
+	}
+	entries, err := app.GetSubtitleEntries(context.Background(), "movie-1", "200", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].Text != "selected part" {
+		t.Fatalf("unexpected entries: %+v", entries)
+	}
+	if subtitleRequests != 1 {
+		t.Fatalf("native subtitle requests = %d, want 1", subtitleRequests)
+	}
+	if _, ok := app.GetCachedSubtitleEntries("movie-1", "200", 0); !ok {
+		t.Fatal("selected subtitle entries were not cached")
+	}
+}
+
+func TestPreviewColdCacheUsesExternalSubtitleStream(t *testing.T) {
+	plex := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/status/sessions":
+			_, _ = io.WriteString(w, `{"MediaContainer":{"Metadata":[{"key":"movie-1","Media":[{"id":10,"Part":[{"id":200}]}]}]}}`)
+		case "/library/metadata/movie-1":
+			_, _ = io.WriteString(w, `{"MediaContainer":{"Metadata":[{"Media":[{"id":10,"Part":[{"id":200,"key":"/library/parts/video","Stream":[{"streamType":3,"key":"/library/streams/external","codec":"srt"}]}]}]}]}}`)
+		case "/library/streams/external":
+			w.Header().Set("Content-Type", "text/plain")
+			_, _ = io.WriteString(w, "1\n00:00:01,000 --> 00:00:03,000\nexternal preview\n")
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer plex.Close()
+
+	config := Config{}
+	config.Plex.Host = plex.URL
+	application := &Application{
+		config:        config,
+		plexAdmin:     plexgo.New(plexgo.WithServerURL(plex.URL), plexgo.WithSecurity(config.Plex.Token)),
+		subtitleCache: newSubtitleCache(4),
+		ffmpegLimiter: newFFmpegLimiter(1),
+	}
+	var subtitleContent string
+	api := &API{
+		config: config,
+		app:    application,
+		previewRunner: func(_ context.Context, _, _, _, subtitleFile string, _ int, _ Codec, writer io.Writer, _ AudioMode) error {
+			data, err := os.ReadFile(subtitleFile)
+			if err != nil {
+				return err
+			}
+			subtitleContent = string(data)
+			_, err = writer.Write([]byte("preview"))
+			return err
+		},
+	}
+	httpApp := testAuthenticatedParamRoute(http.MethodGet, "/preview/:ratingKey/:from/:to", api.preview)
+	response, err := httpApp.Test(httptest.NewRequest(http.MethodGet, "/preview/movie-1/00:00:00/00:00:02?mediaId=200&subtitle=0", nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(response.Body)
+		t.Fatalf("status = %d body=%s", response.StatusCode, body)
+	}
+	if subtitleContent == "" || !strings.Contains(subtitleContent, "00:00:01,000 --> 00:00:02,000") {
+		t.Fatalf("cold-cache preview did not receive clip-relative external subtitle: %q", subtitleContent)
+	}
+}
+
+func TestRenderHTTPValidationUsesStructured422(t *testing.T) {
+	api := &API{app: &Application{}}
+	app := testAuthenticatedRoute(api.createRenderJob)
+	request := httptest.NewRequest(http.MethodPost, "/render-jobs", strings.NewReader(`{"ratingKey":"movie","unknown":true}`))
+	request.Header.Set("Content-Type", "application/json")
+	response, err := app.Test(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want 422", response.StatusCode)
+	}
+	var body map[string]map[string]string
+	if err := json.NewDecoder(response.Body).Decode(&body); err != nil {
+		t.Fatal(err)
+	}
+	if body["error"]["code"] != "validation_error" {
+		t.Fatalf("unexpected error envelope: %#v", body)
+	}
+}
+
+func TestRenderJobCreateAcceptsKeylessAuthorizedSessionPart(t *testing.T) {
+	plex := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/status/sessions":
+			_, _ = io.WriteString(w, `{"MediaContainer":{"Metadata":[{"key":"movie-1","title":"Test movie","Media":[{"id":293539,"duration":60000,"Part":[{"id":293546}]}]}]}}`)
+		case "/library/metadata/movie-1":
+			_, _ = io.WriteString(w, `{"MediaContainer":{"Metadata":[{"ratingKey":"movie-1","title":"Test movie","Media":[{"id":293539,"duration":60000,"Part":[{"id":293545,"key":"/library/parts/293545/file.mp4"},{"id":293546,"key":"/library/parts/293546/file.mp4","duration":60000}]}]}]}}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer plex.Close()
+
+	manager, err := newRenderJobManager(t.TempDir(), writeRenderOutput)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer manager.stopAndWait()
+	config := Config{}
+	config.Plex.Host = plex.URL
+	config.Plex.Token = "admin-token"
+	app := &Application{
+		config:     config,
+		plexAdmin:  plexgo.New(plexgo.WithServerURL(plex.URL), plexgo.WithSecurity(config.Plex.Token)),
+		renderJobs: manager,
+	}
+	api := &API{config: config, app: app}
+	httpApp := testAuthenticatedRoute(api.createRenderJob)
+	request := httptest.NewRequest(http.MethodPost, "/render-jobs", strings.NewReader(`{"ratingKey":"movie-1","mediaId":293546,"fromMs":0,"toMs":1000}`))
+	request.Header.Set("Content-Type", "application/json")
+	response, err := httpApp.Test(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusAccepted {
+		body, _ := io.ReadAll(response.Body)
+		t.Fatalf("create status = %d body=%s", response.StatusCode, body)
+	}
+	var result renderJobResponse
+	if err := json.NewDecoder(response.Body).Decode(&result); err != nil {
+		t.Fatal(err)
+	}
+	if result.ID == "" {
+		t.Fatal("successful create response did not include a job id")
+	}
+	manager.mu.Lock()
+	job := manager.jobs[result.ID]
+	var snapshot renderJobSpec
+	if job != nil {
+		snapshot = job.spec
+	}
+	manager.mu.Unlock()
+	if job == nil || snapshot.PartKey != "/library/parts/293546/file.mp4" {
+		t.Fatalf("immutable job snapshot = %+v, want metadata part key", snapshot)
+	}
+	jobStatus := waitRenderStatus(t, manager, result.ID, "owner-a", renderSucceeded)
+	if jobStatus.Error != nil {
+		t.Fatalf("created job failed: %+v", jobStatus.Error)
+	}
+}
+
+func TestPreviewRejectsOutOfBoundsRangeBeforeUpstreamCalls(t *testing.T) {
+	api := &API{app: &Application{}}
+	app := testAuthenticatedParamRoute(http.MethodGet, "/preview/:ratingKey/:from/:to", api.preview)
+	response, err := app.Test(httptest.NewRequest(http.MethodGet, "/preview/movie/00:00:00/00:16:00", nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusUnprocessableEntity {
+		t.Fatalf("preview range status = %d, want 422", response.StatusCode)
+	}
+}
+
+func TestPreviewResolvesFrontendPartIDWithoutSessionPartKey(t *testing.T) {
+	// The session endpoint identifies the playing media with parent Media.ID
+	// 293539 and the frontend sends the selected Part.ID 293546. Active
+	// sessions may omit Part.Key and Part.File; metadata is the source of the
+	// playable key.
+	sessions := []sessionMetadata{{
+		Key: "movie-1",
+		Media: []sessionMedia{{
+			ID:   float64(293539),
+			Part: []sessionPart{{ID: float64(293546)}},
+		}},
+	}}
+	selection, err := selectPreviewSessionSource(sessions, "movie-1", 293546, true)
+	if err != nil {
+		t.Fatalf("session source authorization failed: %v", err)
+	}
+
+	metadata := []components.Media{{
+		ID: 293539,
+		Part: []components.Part{
+			{ID: 293545, Key: "/library/parts/293545/file.mp4"},
+			{ID: 293546, Key: "/library/parts/293546/file.mp4"},
+		},
+	}}
+	media, part, err := resolvePreviewMetadataSource(metadata, selection)
+	if err != nil {
+		t.Fatalf("preview source preparation failed: %v", err)
+	}
+	if media.ID != 293539 || part.ID != 293546 || part.Key != "/library/parts/293546/file.mp4" {
+		t.Fatalf("resolved source = media %d part %d key %q", media.ID, part.ID, part.Key)
+	}
+	if _, err := selectPreviewSessionSource(sessions, "movie-1", 999999, true); err == nil {
+		t.Fatal("preview must reject a part ID not visible in the caller's sessions")
+	}
+}
+
+func TestUpstreamCapacityFailuresReturn503WithRetryAfter(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusBadGateway)
+	}))
+	defer upstream.Close()
+	var config Config
+	config.Plex.Host = upstream.URL
+	api := &API{config: config, app: &Application{config: config}}
+	app := testAuthenticatedRoute(api.createRenderJob)
+	request := httptest.NewRequest(http.MethodPost, "/render-jobs", strings.NewReader(`{"ratingKey":"movie","mediaId":1,"fromMs":0,"toMs":1000}`))
+	request.Header.Set("Content-Type", "application/json")
+	response, err := app.Test(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response.Body.Close()
+	if response.StatusCode != http.StatusServiceUnavailable || response.Header.Get("Retry-After") == "" {
+		t.Fatalf("upstream response = %d retry-after=%q", response.StatusCode, response.Header.Get("Retry-After"))
+	}
+}
+
+func TestProcessSignalRequestsApplicationShutdown(t *testing.T) {
+	signals := make(chan os.Signal, 1)
+	started := make(chan struct{})
+	shutdown := make(chan struct{})
+	go func() {
+		close(started)
+		<-shutdown
+	}()
+	<-started
+	go func() {
+		for {
+			select {
+			case signals <- os.Interrupt:
+				return
+			default:
+				// Let the start callback become observable before signaling.
+				time.Sleep(time.Millisecond)
+			}
+		}
+	}()
+	shutdownCalled := false
+	err := runWithSignals(
+		func() error { <-shutdown; return nil },
+		func() error { shutdownCalled = true; close(shutdown); return nil },
+		signals,
+	)
+	if err != nil || !shutdownCalled {
+		t.Fatalf("signal shutdown = %v called=%v", err, shutdownCalled)
+	}
+}
+
+func TestAPIShutdownCancelsActivePreviewBeforeHTTPDrain(t *testing.T) {
+	lifetime, cancelLifetime := context.WithCancel(context.Background())
+	application := &Application{
+		lifetime:       lifetime,
+		cancelLifetime: cancelLifetime,
+		ffmpegLimiter:  newFFmpegLimiter(1),
+	}
+	heldRelease, err := application.ffmpegLimiter.acquire(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	started := make(chan struct{})
+	finished := make(chan struct{})
+	fiberApp := fiber.New()
+	fiberApp.Get("/active-preview", func(_ fiber.Ctx) error {
+		close(started)
+		streamCtx, cancelStream := context.WithCancel(application.lifetime)
+		runPreviewStream(
+			streamCtx, bufio.NewWriter(io.Discard), heldRelease, cancelStream, func() {},
+			"source", "00:00:00", "00:00:01", "", -1, CodecLibx264,
+			func(ctx context.Context, _, _, _, _ string, _ int, _ Codec, _ io.Writer) error {
+				<-ctx.Done()
+				return ctx.Err()
+			},
+		)
+		close(finished)
+		return nil
+	})
+	listener := fasthttputil.NewInmemoryListener()
+	serveDone := make(chan error, 1)
+	go func() { serveDone <- fiberApp.Listener(listener, fiber.ListenConfig{DisableStartupMessage: true}) }()
+	conn, err := listener.Dial()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if _, err := io.WriteString(conn, "GET /active-preview HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n"); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("active preview did not start")
+	}
+
+	api := &API{app: application, http: fiberApp}
+	shutdownDone := make(chan error, 1)
+	startedShutdown := time.Now()
+	go func() { shutdownDone <- api.Shutdown() }()
+	select {
+	case err := <-shutdownDone:
+		if err != nil && !errors.Is(err, fiber.ErrNotRunning) {
+			t.Fatalf("shutdown failed: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("shutdown waited for the preview timeout")
+	}
+	if elapsed := time.Since(startedShutdown); elapsed >= time.Second {
+		t.Fatalf("shutdown took too long: %s", elapsed)
+	}
+	select {
+	case <-finished:
+	case <-time.After(time.Second):
+		t.Fatal("active preview did not finish after lifetime cancellation")
+	}
+	nextRelease, err := application.ffmpegLimiter.acquire(context.Background())
+	if err != nil {
+		t.Fatalf("limiter remained held after shutdown: %v", err)
+	}
+	nextRelease()
+	select {
+	case <-serveDone:
+	case <-time.After(time.Second):
+		t.Fatal("HTTP server did not stop")
+	}
+}
+
+func TestRenderHTTPTimeoutAndShutdownStatus(t *testing.T) {
+	manager, err := newRenderJobManager(t.TempDir(), func(ctx context.Context, _ renderJobSpec, _ string) error {
+		<-ctx.Done()
+		return ctx.Err()
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager.timeout = 5 * time.Millisecond
+	api := &API{app: &Application{renderJobs: manager}}
+	job, err := manager.enqueue("owner-a", renderTestSpec("owner-a"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	app := testAuthenticatedParamRoute(http.MethodGet, "/render-jobs/:id", api.getRenderJob)
+	var response *http.Response
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		response, err = app.Test(httptest.NewRequest(http.MethodGet, "/render-jobs/"+job.id, nil))
+		if err != nil {
+			t.Fatal(err)
+		}
+		body, readErr := io.ReadAll(response.Body)
+		response.Body.Close()
+		if readErr != nil {
+			t.Fatal(readErr)
+		}
+		if strings.Contains(string(body), `"status":"failed"`) {
+			if !strings.Contains(string(body), `"code":"render_timeout"`) {
+				t.Fatalf("timeout response = %s", body)
+			}
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if time.Now().After(deadline) {
+		t.Fatal("timed out waiting for HTTP failed status")
+	}
+	manager.stopAndWait()
+	if _, err := os.Stat(filepath.Join(manager.store.root, job.id)); !os.IsNotExist(err) {
+		t.Fatalf("shutdown did not clean failed job storage: %v", err)
+	}
+}
+
+func TestRenderHTTPDownloadLeaseStreamsCompletedOutput(t *testing.T) {
+	manager, err := newRenderJobManager(t.TempDir(), writeRenderOutput)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer manager.stopAndWait()
+	job, err := manager.enqueue("owner-a", renderTestSpec("owner-a"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitRenderStatus(t, manager, job.id, "owner-a", renderSucceeded)
+	now := time.Now()
+	manager.now = func() time.Time { return now }
+	api := &API{app: &Application{renderJobs: manager}}
+	app := testAuthenticatedParamRoute(http.MethodGet, "/render-jobs/:id/download", api.downloadRenderJob)
+	response, body := executeRealFiberRequest(t, app, http.MethodGet, "/render-jobs/"+job.id+"/download")
+	if response.StatusCode != http.StatusOK || string(body) != "valid mp4 bytes" {
+		t.Fatalf("download response = %d body=%q headers=%v", response.StatusCode, body, response.Header)
+	}
+	wantDisposition := `attachment; filename="Test_movie_00-00-00_to_00-00-01.mp4"`
+	if got := response.Header.Get(fiber.HeaderContentDisposition); got != wantDisposition {
+		t.Fatalf("content disposition = %q, want %q", got, wantDisposition)
+	}
+	now = now.Add(renderRetention + time.Second)
+	manager.cleanupExpired()
+	if _, err := os.Stat(filepath.Join(job.dir, "output.mp4")); !os.IsNotExist(err) {
+		t.Fatalf("leased output was not cleaned after transmission: %v", err)
+	}
+	statusApp := testAuthenticatedParamRoute(http.MethodGet, "/render-jobs/:id", api.getRenderJob)
+	expiredResponse, err := statusApp.Test(httptest.NewRequest(http.MethodGet, "/render-jobs/"+job.id, nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer expiredResponse.Body.Close()
+	if expiredResponse.StatusCode != http.StatusGone {
+		t.Fatalf("expired status response = %d, want 410", expiredResponse.StatusCode)
+	}
+}

@@ -1,36 +1,180 @@
-.App-logo {
-  height: 40vmin;
-  pointer-events: none;
-}
+/* CutScene app-shell layout helpers. Most layout lives in MUI sx; this file
+   holds only what utilities can't do cleanly: shell grid, sticky bar,
+   selection region tint, decorative atmosphere, and interaction feedback. */
 
-a {
-  color: #ff7300
-}
-
-@media (prefers-reduced-motion: no-preference) {
-  .App-logo {
-    animation: App-logo-spin infinite 20s linear;
-  }
-}
-
-.App-header {
-  background-color: #282c34;
-  min-height: 100vh;
+.cs-app {
+  min-height: 100%;
   display: flex;
   flex-direction: column;
+  background:
+    radial-gradient(1200px 600px at 80% -10%, rgba(255,115,0,0.10), transparent 60%),
+    radial-gradient(900px 500px at -10% 110%, rgba(245,0,87,0.06), transparent 60%),
+    var(--cs-bg);
+  position: relative;
+}
+
+/* Film-grain overlay — SVG noise as a data URI, no external request. */
+.cs-app::after {
+  content: '';
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  z-index: 1;
+  opacity: 0.022;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='200' height='200'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='3' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
+}
+
+.cs-shell-bar {
+  position: sticky;
+  top: 0;
+  z-index: 20;
+  backdrop-filter: blur(10px);
+  background: linear-gradient(180deg, rgba(19,21,26,0.92), rgba(19,21,26,0.72));
+  border-bottom: 1px solid rgba(255,255,255,0.06);
+}
+
+/* Wordmark accent — warm gradient via background-clip. */
+.cs-wordmark-accent {
+  background: linear-gradient(135deg, #ff7300 0%, #ffab1e 100%);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+}
+
+/* Workspace grid */
+.cs-workspace {
+  display: grid;
+  gap: 20px;
+  grid-template-columns: 1fr;
+  width: 100%;
+  position: relative;
+  z-index: 2;
+}
+
+@media (min-width: 960px) {
+  .cs-workspace {
+    grid-template-columns: minmax(0, 1.45fr) minmax(360px, 1fr);
+    align-items: start;
+  }
+}
+
+/* Player frame with cinematic letterbox bars */
+.cs-player-frame {
+  position: relative;
+  width: 100%;
+  aspect-ratio: 16 / 9;
+  background: #000;
+  border-radius: 12px;
+  overflow: hidden;
+  border: 1px solid rgba(255,255,255,0.07);
+  box-shadow: 0 24px 60px -28px rgba(0,0,0,0.8);
+  transition: border-color 300ms ease;
+}
+
+.cs-player-frame::before,
+.cs-player-frame::after {
+  content: '';
+  position: absolute;
+  left: 0;
+  right: 0;
+  height: 4px;
+  z-index: 2;
+  pointer-events: none;
+}
+.cs-player-frame::before {
+  top: 0;
+  background: linear-gradient(180deg, rgba(0,0,0,0.5), transparent);
+}
+.cs-player-frame::after {
+  bottom: 0;
+  background: linear-gradient(0deg, rgba(0,0,0,0.5), transparent);
+}
+
+/* Stale-preview indicator — subtle pulsing border */
+.cs-player-frame[data-stale="true"] {
+  border-color: rgba(255,115,0,0.35);
+  animation: cs-stale-pulse 2.4s ease-in-out infinite;
+}
+
+@keyframes cs-stale-pulse {
+  0%, 100% { border-color: rgba(255,115,0,0.25); }
+  50% { border-color: rgba(255,115,0,0.55); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .cs-player-frame[data-stale="true"] { animation: none; }
+}
+
+/* Preview button overlay on the player frame */
+.cs-preview-btn {
+  position: absolute;
+  top: 14px;
+  right: 14px;
+  z-index: 10;
+  animation: cs-btn-enter 280ms ease both;
+}
+
+@keyframes cs-btn-enter {
+  from { opacity: 0; transform: translateY(-6px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+/* Session context bar */
+.cs-session-context {
+  display: flex;
   align-items: center;
-  font-size: calc(10px + 1vmin);
+  gap: 16px;
+  padding-bottom: 16px;
+  border-bottom: 1px solid rgba(255,255,255,0.06);
+  margin-bottom: 4px;
 }
 
-.App-link {
-  color: #61dafb;
+/* Section label with decorative marker */
+.cs-section-label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.cs-section-label::before {
+  content: '';
+  display: block;
+  width: 20px;
+  height: 2px;
+  background: var(--cs-accent);
+  border-radius: 1px;
+  flex-shrink: 0;
 }
 
-@keyframes App-logo-spin {
-  from {
-    transform: rotate(0deg);
-  }
-  to {
-    transform: rotate(360deg);
+/* Trim flash — brief orange glow when subtitle selection sets the range */
+@keyframes cs-trim-flash {
+  0% { box-shadow: 0 0 0 0 rgba(255,115,0,0.4), 0 0 12px 2px rgba(255,115,0,0.2); }
+  100% { box-shadow: 0 0 0 0 rgba(255,115,0,0), 0 0 12px 0 rgba(255,115,0,0); }
+}
+.cs-trim-flash {
+  animation: cs-trim-flash 700ms ease-out;
+}
+
+.cs-sticky-download {
+  position: sticky;
+  bottom: 0;
+  z-index: 20;
+  background: linear-gradient(0deg, rgba(19,21,26,0.96) 60%, rgba(19,21,26,0.6));
+  border-top: 1px solid rgba(255,255,255,0.07);
+  backdrop-filter: blur(8px);
+}
+
+@media (min-width: 960px) {
+  .cs-sticky-download {
+    position: static;
+    background: none;
+    border-top: none;
+    backdrop-filter: none;
   }
 }
+
+/* Range selection tint for the dual-thumb trim slider fill. */
+.cs-trim .MuiSlider-thumb {
+  height: 20px;
+  width: 20px;
+}
+.cs-trim .MuiSlider-rail { opacity: 0.3; }

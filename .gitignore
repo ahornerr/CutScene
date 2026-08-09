@@ -1,3 +1,4 @@
 config.yaml
 .idea/
 fiber.sqlite3
+.slim/deepwork/

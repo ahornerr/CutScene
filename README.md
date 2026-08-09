@@ -1,75 +1,96 @@
 # CutScene
 
-CutScene is a tool that gives you the ability to create short clips from your Plex media.
-
-Currently, CutScene exists as an HTTP API, but in the future it will be more user-friendly (UI, browser extension, etc).
+CutScene lets you create short clips from media that is currently playing in Plex. It includes a browser UI and an HTTP API.
 
 ## Setup
 
-Copy [config.example.yaml]() to [config.yaml]() (in the same directory) and update values accordingly
+Copy [config.example.yaml](config.example.yaml) to [config.yaml](config.yaml) in the same directory and set the values for your Plex server. The Plex token is used by CutScene to read server metadata; see [Plex's instructions for finding an authentication token](https://support.plex.tv/articles/204059436-finding-an-authentication-token-x-plex-token/).
 
-Depending on your setup, the Plex host can either be a DNS record (e.g. https://my.plex.server) or an IP (http://10.0.0.100:32400). 
+Set `api.domain` to the browser-reachable base URL for CutScene. It is passed to Plex as the OAuth/PIN authentication forward URL, so it must be the URL users can return to after signing in (not a private container hostname).
 
-The Plex token can be found by following [these instructions](https://support.plex.tv/articles/204059436-finding-an-authentication-token-x-plex-token/).
+The default [docker-compose.yaml](docker-compose.yaml) uses the [GitHub Container Registry image](https://github.com/ahornerr/CutScene/pkgs/container/cutscene). Start it with:
 
-> [!IMPORTANT]
-> If you changed the listen address in the config, update the forwarded port in [docker-compose.yaml]()
+```sh
+docker compose up
+```
 
-The default [docker-compose.yaml]() file points to the [GitHub Container Registry image](https://github.com/ahornerr/CutScene/pkgs/container/cutscene). 
+If you changed the listen address or port, update the port mapping in [docker-compose.yaml](docker-compose.yaml).
 
-You can start this container by simply running `docker compose up`.
+### Authentication
+
+Open the CutScene URL in a browser and choose **Log in with Plex**. CutScene uses Plex's browser authentication flow and keeps the authenticated session in the browser. The session, preview, and render endpoints require that authenticated session; an HTTP client must preserve the session cookie established by its Plex login.
 
 ### Hardware acceleration
-AMD GPU support on Linux is supported by setting the Ffmpeg codec config to `h264_vaapi`.
 
-In Docker, the `/dev/dri/renderD*` device must also be mounted. This can be done by using the GPU Docker compose override:
+The default `libx264` codec uses software encoding. On Linux, set `ffmpeg.codec` to `h264_vaapi` for VAAPI hardware encoding. The host and container need access to a usable render device under `/dev/dri`; the supplied [docker-compose.gpu.yaml](docker-compose.gpu.yaml) mounts `/dev/dri/renderD128`:
 
 ```sh
 docker compose -f docker-compose.yaml -f docker-compose.gpu.yaml up
 ```
 
-This `h264_vaapi` codec and DRI device approach should theoretically also work for Intel Quicksync but is untested.
-
-> [!NOTE]
-> The `h264_nvenc` codec provides experimental hardware encoding for Nvidia GPUs. If running in Docker, the [Nvidia Container Toolkit](https://github.com/NVIDIA/nvidia-container-toolkit) should be installed.
+The VAAPI setup is tested with AMD GPUs on Linux. Intel QuickSync through VAAPI may work but is untested. `h264_nvenc` is also available for Nvidia, but requires a working Nvidia driver, the [Nvidia Container Toolkit](https://github.com/NVIDIA/nvidia-container-toolkit), and Docker configured to expose the GPU; the supplied GPU override only provides the VAAPI/DRI device.
 
 ## Usage
 
-Navigate your browser to the IP/port that CutScene is running on to get a web UI.
+### Browser
 
-For HTTP usage, first list the sessions and find the rating key for the video you'd like to clip.
+After authentication, choose an active Plex session in the UI, preview and trim it, then submit the render. Completed clips are downloadable from the render-job status panel.
 
-```shell
-$ curl -s http://127.0.0.1:8080/sessions | jq -r '.[0].ratingKey'
-100151
-```
+### HTTP render jobs
 
-Then call the clip endpoint with the ratingKey and start/end times you'd like to clip
+The examples below assume an authenticated session cookie in `$COOKIE`:
 
 ```sh
-curl http://127.0.0.1:8080/clip/100151/00:05:00/00:05:05 -O -J
+BASE=http://127.0.0.1:8080
+curl -sS -b "$COOKIE" "$BASE/sessions"
 ```
 
-### Query parameters
+Use an active session's `ratingKey` and media/part ID as `mediaId` to create a job. The request must be JSON:
 
-Query parameters are used to modify the resulting file (quality, size, etc)
+```sh
+curl -i -b "$COOKIE" \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "ratingKey": "100151",
+    "mediaId": 123456,
+    "fromMs": 300000,
+    "toMs": 305000,
+    "subtitleIndex": -1,
+    "height": 720,
+    "qp": 24,
+    "audioMode": "standard"
+  }' \
+  "$BASE/render-jobs"
+```
 
-#### `height` (integer)
-Determines the height in pixels of the clip. If not specified, original quality is used.
-Width is scaled appropriately to retain original aspect ratio.
+Creation returns `202 Accepted`, a JSON job object, and a `Location` header such as `/render-jobs/<id>`. Poll that URL until `status` is `succeeded` or `failed` (or the job expires):
 
-#### `qp` (integer)
-Quantization parameter as an integer. https://slhck.info/video/2017/02/24/crf-guide.html
+```sh
+curl -sS -b "$COOKIE" "$BASE/render-jobs/<id>"
+curl -fL -b "$COOKIE" "$BASE/render-jobs/<id>/download" -o clip.mp4
+```
 
-Higher values = worse quality but lower file size
+Jobs are private to the authenticated user. A successful output is temporary and normally expires within one hour; use `expiresAt` and download it before expiry. An expired job or download returns `410 Gone`.
 
-A QP between 20 and 30 is typically ideal (tested with the h264_vaapi encoder, libx264 may be different)
+If render capacity or temporary service/storage capacity is unavailable, creation can return `429` or `503` with a `Retry-After` header. Wait for that interval before retrying rather than submitting a tight loop.
+
+#### Render options
+
+- `subtitleIndex`: `-1` for no subtitles, or the selected subtitle index.
+- `height`: output height in pixels; `0` keeps the source height. Valid explicit heights are 144–2160 and even.
+- `qp`: encoder quantization parameter, `0` for the encoder default, or a value from 0–51.
+- `audioMode`: `standard` (original audio), `dialogue` (centred-dialogue boost), or `dialogue_normalized` (dialogue boost plus loudness normalization). If omitted, it defaults to `standard`.
+
+The selected range must be ordered, non-negative, and no longer than 15 minutes.
+
+`ffmpeg.concurrency` controls the maximum number of concurrent FFmpeg processes. It defaults to `2` when omitted or non-positive, and the limit is shared by previews, subtitle preparation, and render jobs.
 
 ## Development
 
-A [docker-compose.build.yaml]() file is included which will build the Docker image from source.
+The [docker-compose.build.yaml](docker-compose.build.yaml) file builds the Docker image from source:
 
-It can be used via `docker compose -f docker-compose.yaml -f docker-compose.build.yaml up --build`.
+```sh
+docker compose -f docker-compose.yaml -f docker-compose.build.yaml up --build
+```
 
-Alternatively the source can be compiled directly with `go build ./...` or ran with `go run ./...` assuming the Go SDK is installed (recommend Go >= 1.22).
-
+Alternatively, compile or run directly with `go build ./...` or `go run ./...` (Go >= 1.22 recommended).
