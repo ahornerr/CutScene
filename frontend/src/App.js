@@ -285,20 +285,6 @@ function App() {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [audioMode])
 
-  // ---------------------------------------------------------------- subtitle offset auto-preview
-  // Changing the subtitle offset is a discrete, intentional action — the
-  // preview refreshes so the user sees the shifted subtitles immediately,
-  // just like changing the audio mode or subtitle track.
-  useEffect(() => {
-    if (!selectedSession) return
-    if (startPosition == null || endPosition == null) return
-    if (!playerReadyRef.current) return
-    setPlayerPosition(startPosition, endPosition)
-    setPreviewStale(false)
-    setControlsChangedSinceJob(true)
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [subtitleOffsetMs])
-
   // ---------------------------------------------------------------- derived subtitle state
   const filteredSubtitleEntries = useMemo(() => {
     if (!subtitleSearch.trim()) return []
@@ -337,6 +323,55 @@ function App() {
   const flashTrim = useCallback(() => {
     setTrimFlashKey(k => k + 1)
   }, [])
+
+  // ---------------------------------------------------------------- subtitle selection refit
+  // Recompute the clip start/end around the active subtitle selection using
+  // shifted timings (entry.start/end + offset) and the same 500ms padding +
+  // duration clamping as a fresh pick. Returns null when no selection is
+  // active (anchor < 0) or the entries are missing — callers must not alter a
+  // manually-set range in that case.
+  const refitSelectionRange = useCallback((offset) => {
+    if (subtitleAnchor < 0) return null
+    const duration = selectedSession?.duration ?? Infinity
+    const end = subtitleSelectionEnd >= 0 ? subtitleSelectionEnd : subtitleAnchor
+    const from = Math.min(subtitleAnchor, end)
+    const to = Math.max(subtitleAnchor, end)
+    const firstEntry = subtitleEntries[from]
+    const lastEntry = subtitleEntries[to]
+    if (!firstEntry || !lastEntry) return null
+    const shiftedStart = firstEntry.start + offset
+    const shiftedEnd = lastEntry.end + offset
+    const newStart = Math.max(0, Math.min(shiftedStart - 500, duration))
+    const newEnd = Math.max(0, Math.min(shiftedEnd + 500, duration))
+    return [newStart, newEnd]
+  }, [subtitleAnchor, subtitleSelectionEnd, subtitleEntries, selectedSession])
+
+  // ---------------------------------------------------------------- subtitle offset auto-preview
+  // Changing the subtitle offset is a discrete, intentional action. When a
+  // subtitle entry or contiguous multi-selection is active, the clip range is
+  // refit around the shifted selection (same 500ms padding/clamping as a pick)
+  // before refreshing the preview. When no selection is active, a manually-set
+  // range is left untouched and only the preview URL updates.
+  useEffect(() => {
+    if (!selectedSession) return
+    if (startPosition == null || endPosition == null) return
+    if (!playerReadyRef.current) return
+    const refit = refitSelectionRange(subtitleOffsetMs)
+    if (refit) {
+      const [newStart, newEnd] = refit
+      setStartPosition(newStart)
+      setEndPosition(newEnd)
+      setPlayerPosition(newStart, newEnd)
+      flashTrim()
+      setPreviewStale(false)
+      setControlsChangedSinceJob(true)
+      return
+    }
+    setPlayerPosition(startPosition, endPosition)
+    setPreviewStale(false)
+    setControlsChangedSinceJob(true)
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [subtitleOffsetMs])
 
   // ---------------------------------------------------------------- bound setters (clamp to duration only)
   // A typed timestamp commit is a single discrete, intentional action — like

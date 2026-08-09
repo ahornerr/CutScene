@@ -574,6 +574,91 @@ test('subtitle offset control is disabled when no subtitle track is selected', a
   expect(screen.getByTestId('react-player').getAttribute('data-url')).not.toContain('subtitleOffsetMs');
 });
 
+test('changing offset refits an active single subtitle selection around shifted timings', async () => {
+  const pending = installFetch();
+  render(<App/>);
+  await flush();
+  await selectSession('Alpha');
+  await resolveRequest(requestFor(pending, url => url === '/streams/A?mediaId=101'), textStreams());
+  const subtitleRequest = requestFor(pending, url => url.includes('/subtitles/A?subtitle=0'));
+  await resolveRequest(subtitleRequest, [{start: 5000, end: 6000, text: 'Solo'}]);
+
+  // Picking the entry sets the range to 4500–6500 (500ms padding).
+  fireEvent.click(screen.getByRole('button', {name: /Subtitle at 00:00:05/}));
+  await flush();
+  expect(screen.getByTestId('react-player').getAttribute('data-url'))
+    .toContain('/preview/A/00:00:04.500/00:00:06.500');
+
+  // Changing the offset refits the active selection without re-picking.
+  // +200ms → shifted 5200–6200 → padded 4700–6700.
+  await clickSubtitleOffset('later');
+  await clickSubtitleOffset('later');
+  expect(screen.getByTestId('react-player').getAttribute('data-url'))
+    .toContain('/preview/A/00:00:04.700/00:00:06.700');
+  expect(screen.getByTestId('react-player').getAttribute('data-url'))
+    .toContain('subtitleOffsetMs=200');
+  // Auto-applied — no stale button.
+  expect(screen.queryByRole('button', {name: 'Preview selection'})).not.toBeInTheDocument();
+});
+
+test('changing offset refits an active contiguous multi-selection around the full shifted span', async () => {
+  const pending = installFetch();
+  render(<App/>);
+  await flush();
+  await selectSession('Alpha');
+  await resolveRequest(requestFor(pending, url => url === '/streams/A?mediaId=101'), textStreams());
+  const subtitleRequest = requestFor(pending, url => url.includes('/subtitles/A?subtitle=0'));
+  await resolveRequest(subtitleRequest, [
+    {start: 5000, end: 6000, text: 'A'},
+    {start: 7000, end: 8000, text: 'B'},
+    {start: 9000, end: 10000, text: 'C'},
+  ]);
+
+  // Single pick on the first entry → 4500–6500.
+  fireEvent.click(screen.getByRole('button', {name: /Subtitle at 00:00:05: A/}));
+  await flush();
+  // Shift+click the third entry extends the selection to entries 0–2.
+  fireEvent.click(screen.getByRole('button', {name: /Subtitle at 00:00:09: C/}), {shiftKey: true});
+  await flush();
+  // Span 5000–10000 → padded 4500–10500.
+  expect(screen.getByTestId('react-player').getAttribute('data-url'))
+    .toContain('/preview/A/00:00:04.500/00:00:10.500');
+
+  // +500ms refits the whole selection: shifted 5500–10500 → padded 5000–11000.
+  for (let i = 0; i < 5; i++) await clickSubtitleOffset('later');
+  expect(screen.getByTestId('react-player').getAttribute('data-url'))
+    .toContain('/preview/A/00:00:05/00:00:11');
+  expect(screen.getByTestId('react-player').getAttribute('data-url'))
+    .toContain('subtitleOffsetMs=500');
+  expect(screen.queryByRole('button', {name: 'Preview selection'})).not.toBeInTheDocument();
+});
+
+test('changing offset does not alter a manually-set range when no subtitle selection is active', async () => {
+  const pending = installFetch();
+  render(<App/>);
+  await flush();
+  await selectSession('Alpha');
+  await resolveRequest(requestFor(pending, url => url === '/streams/A?mediaId=101'), textStreams());
+  // Subtitles load but nothing is picked — anchor stays -1.
+  await resolveRequest(
+    requestFor(pending, url => url.includes('/subtitles/A?subtitle=0')),
+    [{start: 5000, end: 6000, text: 'Unpicked'}]
+  );
+
+  // Initial manual range is 00:00:00–00:01:00.
+  expect(screen.getByTestId('react-player').getAttribute('data-url'))
+    .toBe('/preview/A/00:00:00/00:01:00?mediaId=101&subtitle=0');
+
+  // The offset still reaches the preview URL, but the range is untouched.
+  await clickSubtitleOffset('later');
+  await clickSubtitleOffset('later');
+  expect(screen.getByTestId('react-player').getAttribute('data-url'))
+    .toBe('/preview/A/00:00:00/00:01:00?mediaId=101&subtitle=0&subtitleOffsetMs=200');
+  expect(screen.getByRole('slider', {name: 'Clip start time'})).toHaveValue('0');
+  expect(screen.getByRole('slider', {name: 'Clip end time'})).toHaveValue('60000');
+  expect(screen.queryByRole('button', {name: 'Preview selection'})).not.toBeInTheDocument();
+});
+
 test('subtitle entry click sets clip range and auto-applies preview', async () => {
   const pending = installFetch();
   render(<App/>);
