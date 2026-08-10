@@ -719,6 +719,35 @@ func selectLibraryMetadataSource(metadata *components.Metadata, requestedID int6
 	return resolveLibraryMetadataSource(metadata, 0, 0)
 }
 
+// selectLibraryMetadataSourceForDiscovery is intentionally separate from the
+// explicit selector. Search and hierarchy discovery may try later Plex
+// versions when the first otherwise-playable candidate cannot satisfy the
+// exact-duration safety rule. Explicit mediaId/partId requests continue to
+// resolve one requested source and fail when its duration is unsafe.
+func selectLibraryMetadataSourceForDiscovery(metadata *components.Metadata) (*components.Media, *components.Part, error) {
+	if metadata == nil || (metadata.Type != "movie" && metadata.Type != "episode") || strings.TrimSpace(metadata.Title) == "" {
+		return nil, nil, &sourceValidationError{message: "requested media is not clip-capable"}
+	}
+	for i := range metadata.Media {
+		media := &metadata.Media[i]
+		if media.ID <= 0 || media.VideoProfile != nil && *media.VideoProfile == "main 10" {
+			continue
+		}
+		for j := range media.Part {
+			part := &media.Part[j]
+			if part.Key == "" || part.ID <= 0 || part.Accessible != nil && !*part.Accessible || part.Exists != nil && !*part.Exists {
+				continue
+			}
+			duration, err := selectedDiscoverySourceDuration(metadata, media, part)
+			if err != nil || duration <= 0 {
+				continue
+			}
+			return media, part, nil
+		}
+	}
+	return nil, nil, &sourceValidationError{message: "requested media has no playable part"}
+}
+
 // resolveLibraryMetadataSource is the canonical explicit-library resolver.
 // mediaID identifies a Media and partID identifies its playable Part. A
 // missing partID selects the first playable part of the requested Media.
@@ -770,6 +799,25 @@ func selectedSourceDuration(media *components.Media, part *components.Part) (int
 	}
 	if media != nil && media.Duration != nil && *media.Duration > 0 {
 		return int64(*media.Duration), nil
+	}
+	return 0, nil
+}
+
+// selectedDiscoverySourceDuration is the discovery-only duration policy. A
+// title duration is safe only for a single-part source; multipart clipping
+// requires the selected Part's own exact duration.
+func selectedDiscoverySourceDuration(item *components.Metadata, media *components.Media, part *components.Part) (int64, error) {
+	if part != nil && part.Duration != nil && *part.Duration > 0 {
+		return int64(*part.Duration), nil
+	}
+	if media != nil && len(media.Part) > 1 {
+		return 0, &sourceValidationError{message: "multipart media requires a part duration"}
+	}
+	if media != nil && media.Duration != nil && *media.Duration > 0 {
+		return int64(*media.Duration), nil
+	}
+	if item != nil && item.Duration != nil && *item.Duration > 0 {
+		return int64(*item.Duration), nil
 	}
 	return 0, nil
 }

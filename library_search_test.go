@@ -28,7 +28,7 @@ func TestSearchLibraryUsesCallerTokenFiltersAndRefetchesHubs(t *testing.T) {
 				t.Errorf("search query = %q", r.URL.Query().Get("query"))
 			}
 			_, _ = io.WriteString(w, `{"MediaContainer":{"Hub":[{"Metadata":[
-                {"ratingKey":"movie-1","type":"movie","title":"Space Movie","year":2024,"thumb":"/library/metadata/movie-1/thumb","Media":[{"id":11,"videoResolution":"1080","videoCodec":"h264","Part":[{"id":101,"key":"/library/parts/101/file","size":1234}]}]},
+                {"ratingKey":"movie-1","type":"movie","title":"Space Movie","year":2024,"thumb":"/library/metadata/movie-1/thumb","Media":[{"id":10,"Part":[{"id":100,"key":"/library/parts/100/file"}]},{"id":11,"videoResolution":"1080","videoCodec":"h264","Part":[{"id":1011,"duration":60000,"key":"/library/parts/1011/file","size":1234}]}]},
                 {"ratingKey":"show-1","type":"show","title":"Not clip-capable"},
                 {"ratingKey":"episode-1","type":"episode","title":"Pilot","grandparentTitle":"The Show","parentTitle":"Season 1","parentIndex":1,"index":1,"Media":[{"id":12,"Part":[{"id":102,"key":"/library/parts/102/file","duration":60000}]}]},
                 {"ratingKey":"movie-2","type":"movie","title":"Needs details"}
@@ -51,7 +51,7 @@ func TestSearchLibraryUsesCallerTokenFiltersAndRefetchesHubs(t *testing.T) {
 	if len(results) != 4 {
 		t.Fatalf("got %d results, want 4: %+v", len(results), results)
 	}
-	if results[0].RatingKey != "movie-1" || results[0].MediaID != 11 || results[0].PartID != 101 || results[0].FileSize != 1234 {
+	if results[0].RatingKey != "movie-1" || results[0].MediaID != 11 || results[0].PartID != 1011 || results[0].Duration != 60000 || results[0].FileSize != 1234 {
 		t.Fatalf("first result = %+v", results[0])
 	}
 	if results[1].RatingKey != "show-1" || results[1].Type != "show" || results[1].MediaID != 0 || results[1].PartID != 0 {
@@ -221,13 +221,20 @@ func TestExplicitPartRenderSkipsSessionStatusAndUsesCallerToken(t *testing.T) {
 }
 
 func TestMultipartSourceWithoutPartDurationIsRejected(t *testing.T) {
-	metadata := &components.Metadata{RatingKey: stringPointer("movie-1"), Type: "movie", Title: "Movie", Media: []components.Media{{ID: 1, Part: []components.Part{{ID: 2, Key: "/a"}, {ID: 3, Key: "/b"}}}}}
+	duration := 2000
+	metadata := &components.Metadata{RatingKey: stringPointer("movie-1"), Type: "movie", Title: "Movie", Media: []components.Media{
+		{ID: 1, Part: []components.Part{{ID: 2, Key: "/a"}, {ID: 3, Key: "/b"}}},
+		{ID: 4, Part: []components.Part{{ID: 5, Duration: &duration, Key: "/later"}}},
+	}}
 	media, part, err := resolveLibraryMetadataSource(metadata, 1, 2)
 	if err != nil {
 		t.Fatal(err)
 	}
+	if media.ID != 1 || part.ID != 2 {
+		t.Fatalf("explicit source resolved to later candidate: media=%d part=%d", media.ID, part.ID)
+	}
 	if _, err := selectedSourceDuration(media, part); err == nil {
-		t.Fatal("multipart source without selected part duration was accepted")
+		t.Fatal("explicit unsafe part was accepted despite a later valid version")
 	}
 }
 
@@ -250,7 +257,7 @@ func newHierarchyFixture(t *testing.T) *Application {
 		case "/library/metadata/season-1/children":
 			_, _ = io.WriteString(w, `{"MediaContainer":{"Metadata":[{"ratingKey":"episode-1","type":"episode","title":"Pilot","index":2,"parentIndex":1,"parentRatingKey":"season-1","parentTitle":"Season 1","grandparentRatingKey":"show-1","grandparentTitle":"The Show"}]}}`)
 		case "/library/metadata/episode-1":
-			_, _ = io.WriteString(w, `{"MediaContainer":{"Metadata":[{"ratingKey":"episode-1","type":"episode","title":"Pilot","index":2,"parentIndex":1,"parentRatingKey":"season-1","parentTitle":"Season 1","grandparentRatingKey":"show-1","grandparentTitle":"The Show","Media":[{"id":21,"duration":60000,"Part":[{"id":31,"duration":60000,"accessible":true,"exists":true,"key":"/library/parts/31/file","size":42}]}]}]}}`)
+			_, _ = io.WriteString(w, `{"MediaContainer":{"Metadata":[{"ratingKey":"episode-1","type":"episode","title":"Pilot","duration":180000,"index":2,"parentIndex":1,"parentRatingKey":"season-1","parentTitle":"Season 1","grandparentRatingKey":"show-1","grandparentTitle":"The Show","Media":[{"id":21,"Part":[{"id":31,"accessible":true,"exists":true,"key":"/library/parts/31/file"},{"id":32,"accessible":true,"exists":true,"key":"/library/parts/32/file"}]},{"id":22,"duration":120000,"Part":[{"id":33,"duration":60000,"accessible":true,"exists":true,"key":"/library/parts/33/file","size":42}]}]}]}}`)
 		default:
 			http.NotFound(w, r)
 		}
@@ -294,14 +301,14 @@ func TestLibraryMetadataChildrenSeasonReturnsPlayableEpisodesWithoutRawPaths(t *
 		t.Fatalf("episode results = %+v", episodes)
 	}
 	episode := episodes[0]
-	if episode.Type != "episode" || episode.RatingKey != "episode-1" || episode.MediaID != 21 || episode.PartID != 31 || episode.SeasonNumber == nil || *episode.SeasonNumber != 1 || episode.EpisodeNumber == nil || *episode.EpisodeNumber != 2 {
+	if episode.Type != "episode" || episode.RatingKey != "episode-1" || episode.MediaID != 22 || episode.PartID != 33 || episode.Duration != 60000 || episode.SeasonNumber == nil || *episode.SeasonNumber != 1 || episode.EpisodeNumber == nil || *episode.EpisodeNumber != 2 {
 		t.Fatalf("normalized episode = %+v", episode)
 	}
 	body, err := json.Marshal([]LibrarySearchResult{episode})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(string(body), "/library/parts/31/file") {
+	if strings.Contains(string(body), "/library/parts/31/file") || strings.Contains(string(body), "/library/parts/33/file") {
 		t.Fatalf("hierarchy response exposed a raw file path: %s", body)
 	}
 }

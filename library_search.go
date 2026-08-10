@@ -190,7 +190,7 @@ func (a *Application) SearchLibrary(ctx context.Context, query string) ([]Librar
 		}
 
 		selectedItem := &item
-		media, part, sourceErr := selectLibraryMetadataSource(selectedItem, 0, false)
+		media, part, sourceErr := selectLibraryMetadataSourceForDiscovery(selectedItem)
 		if sourceErr != nil {
 			// Hub entries are often intentionally abbreviated. Re-fetch through
 			// the caller's PMS token before deciding that the item is not playable.
@@ -205,7 +205,7 @@ func (a *Application) SearchLibrary(ctx context.Context, query string) ([]Librar
 				}
 				continue
 			}
-			media, part, sourceErr = selectLibraryMetadataSource(selectedItem, 0, false)
+			media, part, sourceErr = selectLibraryMetadataSourceForDiscovery(selectedItem)
 		}
 		if sourceErr != nil || selectedItem == nil || media == nil || part == nil {
 			continue
@@ -213,7 +213,7 @@ func (a *Application) SearchLibrary(ctx context.Context, query string) ([]Librar
 		if !validPlayableLibraryMetadata(selectedItem, ratingKey, media, part) {
 			continue
 		}
-		if _, sourceErr = selectedSourceDuration(media, part); sourceErr != nil {
+		if duration, durationErr := selectedDiscoverySourceDuration(selectedItem, media, part); durationErr != nil || duration <= 0 {
 			continue
 		}
 		seen[ratingKey] = struct{}{}
@@ -238,12 +238,8 @@ func librarySearchResultFromMetadata(item *components.Metadata, media *component
 	result.Year = intValue(item.Year)
 	result.SeasonNumber = intValue(item.ParentIndex)
 	result.EpisodeNumber = intValue(item.Index)
-	if item.Duration != nil && *item.Duration > 0 {
-		result.Duration = int64(*item.Duration)
-	} else if media.Duration != nil && *media.Duration > 0 {
-		result.Duration = int64(*media.Duration)
-	} else if part.Duration != nil && *part.Duration > 0 {
-		result.Duration = int64(*part.Duration)
+	if duration, err := selectedDiscoverySourceDuration(item, media, part); err == nil {
+		result.Duration = duration
 	}
 	result.VideoResolution = stringValue(media.VideoResolution)
 	result.VideoCodec = stringValue(media.VideoCodec)
@@ -367,11 +363,11 @@ func (a *Application) GetLibraryMetadataChildren(ctx context.Context, ratingKey 
 		if episode == nil || !validLibraryNavigationMetadata(episode, childRatingKey, "episode") || !libraryChildBelongsTo(episode, ratingKey) {
 			continue
 		}
-		media, part, resolveErr := selectLibraryMetadataSource(episode, 0, false)
+		media, part, resolveErr := selectLibraryMetadataSourceForDiscovery(episode)
 		if resolveErr != nil || media == nil || part == nil || media.ID <= 0 || part.ID <= 0 {
 			continue
 		}
-		if _, resolveErr = selectedSourceDuration(media, part); resolveErr != nil {
+		if duration, durationErr := selectedDiscoverySourceDuration(episode, media, part); durationErr != nil || duration <= 0 {
 			continue
 		}
 		// Preserve hierarchy fields from the children listing when the detailed
