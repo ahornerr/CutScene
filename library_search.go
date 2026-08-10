@@ -360,7 +360,10 @@ func (a *Application) GetLibraryMetadataChildren(ctx context.Context, ratingKey 
 			}
 			return nil, fetchErr
 		}
-		if episode == nil || !validLibraryNavigationMetadata(episode, childRatingKey, "episode") || !libraryChildBelongsTo(episode, ratingKey) {
+		// Containment was authorized from the /children listing above. Plex's
+		// detailed metadata may omit or rewrite ParentRatingKey, so do not apply
+		// that parent-key check a second time to the refetched episode.
+		if episode == nil || !validLibraryNavigationMetadata(episode, childRatingKey, "episode") {
 			continue
 		}
 		media, part, resolveErr := selectLibraryMetadataSourceForDiscovery(episode)

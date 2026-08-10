@@ -313,6 +313,38 @@ func TestLibraryMetadataChildrenSeasonReturnsPlayableEpisodesWithoutRawPaths(t *
 	}
 }
 
+func TestLibraryMetadataChildrenTrustsValidatedListingContainment(t *testing.T) {
+	plex := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/library/metadata/season-1":
+			_, _ = io.WriteString(w, `{"MediaContainer":{"Metadata":[{"ratingKey":"season-1","type":"season","title":"Season 1","index":1}]}}`)
+		case "/library/metadata/season-1/children":
+			_, _ = io.WriteString(w, `{"MediaContainer":{"Metadata":[{"ratingKey":"episode-missing-parent","type":"episode","title":"Missing parent","parentRatingKey":"season-1","index":1},{"ratingKey":"episode-different-parent","type":"episode","title":"Different parent","parentRatingKey":"season-1","index":2},{"ratingKey":"episode-invalid-listing-parent","type":"episode","title":"Invalid listing parent","parentRatingKey":"other-season","index":3}]}}`)
+		case "/library/metadata/episode-missing-parent":
+			_, _ = io.WriteString(w, `{"MediaContainer":{"Metadata":[{"ratingKey":"episode-missing-parent","type":"episode","title":"Missing parent","Media":[{"id":101,"Part":[{"id":201,"duration":1000,"key":"/library/parts/201/file"}]}]}]}}`)
+		case "/library/metadata/episode-different-parent":
+			_, _ = io.WriteString(w, `{"MediaContainer":{"Metadata":[{"ratingKey":"episode-different-parent","type":"episode","title":"Different parent","parentRatingKey":"another-season","Media":[{"id":102,"Part":[{"id":202,"duration":1000,"key":"/library/parts/202/file"}]}]}]}}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer plex.Close()
+	config := Config{}
+	config.Plex.Host = plex.URL
+	app := &Application{config: config}
+	results, err := app.GetLibraryMetadataChildren(ContextWithAuthToken(context.Background(), "caller-token"), "season-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != 2 {
+		t.Fatalf("listing containment results = %+v, want two valid episodes", results)
+	}
+	if results[0].RatingKey != "episode-missing-parent" || results[1].RatingKey != "episode-different-parent" {
+		t.Fatalf("unexpected listing containment results = %+v", results)
+	}
+}
+
 func TestLibraryMetadataChildrenSkipsInaccessibleEpisodesAndRejectsMovies(t *testing.T) {
 	plex := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
