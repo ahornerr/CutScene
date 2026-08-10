@@ -145,3 +145,4 @@ docker compose -f docker-compose.yaml -f docker-compose.build.yaml up --build
 ```
 
 Alternatively, compile or run directly with `go build ./...` or `go run ./...` (Go >= 1.22 recommended).
+
