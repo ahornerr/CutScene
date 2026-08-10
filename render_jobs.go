@@ -24,7 +24,6 @@ import (
 	"unicode/utf8"
 
 	"github.com/LukeHagar/plexgo/models/components"
-	"github.com/LukeHagar/plexgo/models/operations"
 	"github.com/gofiber/fiber/v3"
 	"github.com/google/uuid"
 )
@@ -57,6 +56,7 @@ const (
 type RenderJobCreateRequest struct {
 	RatingKey        string    `json:"ratingKey"`
 	MediaID          int64     `json:"mediaId"`
+	PartID           *int64    `json:"partId,omitempty"`
 	FromMs           int64     `json:"fromMs"`
 	ToMs             int64     `json:"toMs"`
 	SubtitleIndex    int       `json:"subtitleIndex"`
@@ -68,8 +68,10 @@ type RenderJobCreateRequest struct {
 
 type renderJobSpec struct {
 	OwnerUUID             string
+	SourceToken           string
 	RatingKey             string
 	MediaID               int64
+	PartID                int64
 	PartKey               string
 	Title                 string
 	FromMs                int64
@@ -919,39 +921,54 @@ func (a *API) createRenderJob(ctx fiber.Ctx) error {
 	if _, err := parseAudioMode(string(request.AudioMode)); err != nil {
 		return renderAPIErrorCode(ctx, http.StatusUnprocessableEntity, "validation_error", "audioMode is invalid")
 	}
-
-	sessions, err := a.app.GetSessions(ctx.UserContext())
-	if err != nil {
-		log.Printf("render job session validation failed: %s", redactedDiagnostic(err))
-		ctx.Set("Retry-After", "5")
-		return renderAPIErrorCode(ctx, http.StatusServiceUnavailable, "session_unavailable", "could not validate the requested session")
-	}
-	selection, err := selectPreviewSessionSource(sessions, request.RatingKey, request.MediaID, true)
-	if err != nil {
+	if err := validateRenderJobRequestFields(request); err != nil {
 		return renderAPIErrorCode(ctx, http.StatusUnprocessableEntity, "validation_error", err.Error())
 	}
-	if a.app.plexAdmin == nil {
-		ctx.Set("Retry-After", "5")
-		return renderAPIErrorCode(ctx, http.StatusServiceUnavailable, "metadata_unavailable", "could not validate the requested media")
+
+	var sessions []sessionMetadata
+	var selection previewSessionSelection
+	userScoped := request.PartID != nil
+	var metadataItem *components.Metadata
+	if userScoped {
+		metadataItem, err = a.app.getMetadataItem(ctx.UserContext(), request.RatingKey, true)
+		if err == nil {
+			media, part, sourceErr := resolveLibraryMetadataSource(metadataItem, request.MediaID, *request.PartID)
+			if sourceErr != nil {
+				err = sourceErr
+			} else {
+				selection = previewSessionSelection{mediaID: media.ID, partID: part.ID, duration: mediaDurationFromSource(media, part), selected: part.ID}
+			}
+		}
+	} else {
+		sessions, err = a.app.GetSessions(ctx.UserContext())
+		if err != nil {
+			log.Printf("render job session validation failed: %s", redactedDiagnostic(err))
+			ctx.Set("Retry-After", "5")
+			return renderAPIErrorCode(ctx, http.StatusServiceUnavailable, "session_unavailable", "could not validate the requested session")
+		}
+		selection, err = selectPreviewSessionSource(sessions, request.RatingKey, request.MediaID, true)
+		if err != nil {
+			return renderAPIErrorCode(ctx, http.StatusUnprocessableEntity, "validation_error", err.Error())
+		}
+		metadataItem, err = a.app.getMetadataItem(ctx.UserContext(), request.RatingKey, false)
 	}
-	libraryMetadata, err := a.app.plexAdmin.Content.GetMetadataItem(ctx.UserContext(), operations.GetMetadataItemRequest{
-		Ids: []string{request.RatingKey},
-	})
 	if err != nil {
 		log.Printf("render job library metadata validation failed: %s", redactedDiagnostic(err))
-		ctx.Set("Retry-After", "5")
-		return renderAPIErrorCode(ctx, http.StatusServiceUnavailable, "metadata_unavailable", "could not validate the requested media")
+		if !userScoped {
+			ctx.Set("Retry-After", "5")
+			return renderAPIErrorCode(ctx, http.StatusServiceUnavailable, "metadata_unavailable", "could not validate the requested media")
+		}
+		return renderSourceAPIError(ctx, err)
 	}
-	if libraryMetadata == nil || libraryMetadata.MediaContainerWithMetadata == nil || libraryMetadata.MediaContainerWithMetadata.MediaContainer == nil {
+	if metadataItem == nil {
 		return renderAPIErrorCode(ctx, http.StatusUnprocessableEntity, "validation_error", "requested media is unavailable")
 	}
-	metadataList := libraryMetadata.MediaContainerWithMetadata.MediaContainer.Metadata
-	if len(metadataList) == 0 {
-		return renderAPIErrorCode(ctx, http.StatusUnprocessableEntity, "validation_error", "requested media is unavailable")
-	}
-	spec, err := validateRenderJobRequestWithMetadataAndItem(request, *user, sessions, metadataList[0].Media, selection, &metadataList[0])
+	spec, err := validateRenderJobRequestWithMetadataAndItem(request, *user, sessions, metadataItem.Media, selection, metadataItem)
 	if err != nil {
 		return renderAPIErrorCode(ctx, http.StatusUnprocessableEntity, "validation_error", err.Error())
+	}
+	if userScoped {
+		spec.SourceToken = a.app.plexSourceToken(ctx.UserContext(), true)
 	}
 	job, err := a.app.renderJobs.enqueue(user.Uuid, spec)
 	if err != nil {
@@ -1188,6 +1205,9 @@ func (p renderPresentation) apply(spec *renderJobSpec) {
 }
 
 func validateRenderJobRequestWithMetadataAndItem(request RenderJobCreateRequest, user User, sessions []sessionMetadata, metadata []components.Media, selection previewSessionSelection, metadataItem *components.Metadata) (renderJobSpec, error) {
+	if err := validateRenderJobRequestFields(request); err != nil {
+		return renderJobSpec{}, err
+	}
 	audioMode, err := parseAudioMode(string(request.AudioMode))
 	if err != nil {
 		return renderJobSpec{}, errors.New("audioMode is invalid")
@@ -1195,42 +1215,19 @@ func validateRenderJobRequestWithMetadataAndItem(request RenderJobCreateRequest,
 	if user.Uuid == "" {
 		return renderJobSpec{}, errors.New("authenticated user is missing a stable id")
 	}
-	if request.RatingKey == "" || len(request.RatingKey) > 512 {
-		return renderJobSpec{}, errors.New("ratingKey is invalid")
-	}
-	if request.MediaID <= 0 {
-		return renderJobSpec{}, errors.New("mediaId is invalid")
-	}
-	if request.FromMs < 0 || request.ToMs < 0 || request.ToMs <= request.FromMs {
-		return renderJobSpec{}, errors.New("fromMs and toMs must be nonnegative and ordered")
-	}
-	if request.ToMs-request.FromMs > renderMaxDurationMs {
-		return renderJobSpec{}, fmt.Errorf("clip duration exceeds %d minutes", renderMaxDurationMs/60000)
-	}
-	if request.SubtitleIndex < -1 {
-		return renderJobSpec{}, errors.New("subtitleIndex is invalid")
-	}
 	if err := validateSubtitleOffsetMs(request.SubtitleOffsetMs); err != nil {
 		return renderJobSpec{}, err
 	}
-	if request.Height < 0 || request.Height > 2160 || request.Height > 0 && (request.Height < 144 || request.Height%2 != 0) {
-		return renderJobSpec{}, errors.New("height is invalid")
-	}
-	if request.QP < 0 || request.QP > 51 {
-		return renderJobSpec{}, errors.New("qp is invalid")
-	}
-
 	if metadata != nil {
 		previewMedia, previewPart, err := resolvePreviewMetadataSource(metadata, selection)
 		if err != nil {
 			return renderJobSpec{}, err
 		}
-		mediaDuration := int64(0)
-		if previewMedia.Duration != nil && *previewMedia.Duration > 0 {
-			mediaDuration = int64(*previewMedia.Duration)
-		} else if previewPart.Duration != nil && *previewPart.Duration > 0 {
-			mediaDuration = int64(*previewPart.Duration)
-		} else if selection.duration > 0 {
+		mediaDuration, durationErr := selectedSourceDuration(previewMedia, previewPart)
+		if durationErr != nil {
+			return renderJobSpec{}, durationErr
+		}
+		if mediaDuration == 0 && selection.duration > 0 {
 			mediaDuration = selection.duration
 		}
 		if mediaDuration > 0 && request.ToMs > mediaDuration {
@@ -1251,12 +1248,17 @@ func validateRenderJobRequestWithMetadataAndItem(request RenderJobCreateRequest,
 				return renderJobSpec{}, errors.New("subtitle codec is not supported")
 			}
 		}
+		sourceMediaID := request.MediaID
+		if sourceMediaID <= 0 {
+			sourceMediaID = previewMedia.ID
+		}
 		spec := renderJobSpec{
 			OwnerUUID:             user.Uuid,
 			RatingKey:             request.RatingKey,
-			MediaID:               request.MediaID,
+			MediaID:               sourceMediaID,
+			PartID:                previewPart.ID,
 			PartKey:               previewPart.Key,
-			Title:                 sessionTitle(sessions, request.RatingKey),
+			Title:                 sourceTitle(sessions, request.RatingKey, metadataItem),
 			FromMs:                request.FromMs,
 			ToMs:                  request.ToMs,
 			SubtitleIndex:         request.SubtitleIndex,
@@ -1292,10 +1294,12 @@ func validateRenderJobRequestWithMetadataAndItem(request RenderJobCreateRequest,
 					return renderJobSpec{}, errors.New("requested media has no playable part")
 				}
 				mediaDuration := int64(0)
-				if media.Duration != nil && *media.Duration > 0 {
+				if media.Duration != nil && *media.Duration > 0 && len(media.Part) <= 1 {
 					mediaDuration = int64(*media.Duration)
-				} else if session.Duration != nil && *session.Duration > 0 {
+				} else if session.Duration != nil && *session.Duration > 0 && len(media.Part) <= 1 {
 					mediaDuration = int64(*session.Duration)
+				} else if len(media.Part) > 1 {
+					return renderJobSpec{}, errors.New("multipart media requires a part duration")
 				}
 				if mediaDuration > 0 && request.ToMs > mediaDuration {
 					return renderJobSpec{}, errors.New("requested range exceeds the selected media duration")
@@ -1319,10 +1323,12 @@ func validateRenderJobRequestWithMetadataAndItem(request RenderJobCreateRequest,
 				if request.SubtitleIndex >= 0 && subtitleEmbeddedIndex < 0 {
 					return renderJobSpec{}, errors.New("subtitle codec is not supported")
 				}
+				partID, _ := sessionIDAsInt64(part.ID)
 				spec := renderJobSpec{
 					OwnerUUID:             user.Uuid,
 					RatingKey:             request.RatingKey,
 					MediaID:               request.MediaID,
+					PartID:                partID,
 					PartKey:               part.Key,
 					Title:                 session.Title,
 					FromMs:                request.FromMs,
@@ -1341,6 +1347,47 @@ func validateRenderJobRequestWithMetadataAndItem(request RenderJobCreateRequest,
 		}
 	}
 	return renderJobSpec{}, errors.New("requested media is not visible in the caller's sessions")
+}
+
+func validateRenderJobRequestFields(request RenderJobCreateRequest) error {
+	if request.RatingKey == "" || len(request.RatingKey) > 512 {
+		return errors.New("ratingKey is invalid")
+	}
+	if request.MediaID <= 0 && request.PartID == nil {
+		return errors.New("mediaId is invalid")
+	}
+	if request.PartID != nil && *request.PartID <= 0 {
+		return errors.New("partId is invalid")
+	}
+	if request.FromMs < 0 || request.ToMs < 0 || request.ToMs <= request.FromMs {
+		return errors.New("fromMs and toMs must be nonnegative and ordered")
+	}
+	if request.ToMs-request.FromMs > renderMaxDurationMs {
+		return fmt.Errorf("clip duration exceeds %d minutes", renderMaxDurationMs/60000)
+	}
+	if request.SubtitleIndex < -1 {
+		return errors.New("subtitleIndex is invalid")
+	}
+	if err := validateSubtitleOffsetMs(request.SubtitleOffsetMs); err != nil {
+		return err
+	}
+	if request.Height < 0 || request.Height > 2160 || request.Height > 0 && (request.Height < 144 || request.Height%2 != 0) {
+		return errors.New("height is invalid")
+	}
+	if request.QP < 0 || request.QP > 51 {
+		return errors.New("qp is invalid")
+	}
+	return nil
+}
+
+func sourceTitle(sessions []sessionMetadata, ratingKey string, metadata *components.Metadata) string {
+	if title := sessionTitle(sessions, ratingKey); title != "" {
+		return title
+	}
+	if metadata != nil {
+		return metadata.Title
+	}
+	return ""
 }
 
 func sessionTitle(sessions []sessionMetadata, ratingKey string) string {
@@ -1376,7 +1423,11 @@ func sessionValueMatchesID(value any, wanted int64) bool {
 }
 
 func (a *Application) executeRenderSpec(ctx context.Context, spec renderJobSpec, outputPartial string) error {
-	sourceURL := fmt.Sprintf("%s%s?X-Plex-Token=%s", a.config.Plex.Host, spec.PartKey, a.config.Plex.Token)
+	token := spec.SourceToken
+	if token == "" {
+		token = a.config.Plex.Token
+	}
+	sourceURL := fmt.Sprintf("%s%s?X-Plex-Token=%s", a.config.Plex.Host, spec.PartKey, token)
 	from := formatRenderTimestamp(spec.FromMs)
 	to := formatRenderTimestamp(spec.ToMs)
 	var subtitleFile string
@@ -1389,7 +1440,7 @@ func (a *Application) executeRenderSpec(ctx context.Context, spec renderJobSpec,
 				External:  true,
 			}
 			var err error
-			subtitleFile, err = a.prepareExternalSubtitle(ctx, source, spec.FromMs, spec.ToMs, spec.SubtitleOffsetMs)
+			subtitleFile, err = a.prepareExternalSubtitleWithToken(ctx, source, spec.FromMs, spec.ToMs, []int64{spec.SubtitleOffsetMs}, token)
 			if err != nil {
 				return newRenderStageFailure("subtitle", "subtitle_unavailable", err)
 			}

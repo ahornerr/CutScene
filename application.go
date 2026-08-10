@@ -30,21 +30,30 @@ import (
 type subtitleCache struct {
 	mu    sync.RWMutex
 	max   int
-	m     map[subtitleCacheKey][]SubtitleEntry
-	order []subtitleCacheKey
+	m     map[subtitleCacheEntryKey][]SubtitleEntry
+	order []subtitleCacheEntryKey
+}
+
+type subtitleCacheEntryKey struct {
+	key      subtitleCacheKey
+	callerID string
 }
 
 func newSubtitleCache(max int) *subtitleCache {
 	return &subtitleCache{
 		max: max,
-		m:   make(map[subtitleCacheKey][]SubtitleEntry),
+		m:   make(map[subtitleCacheEntryKey][]SubtitleEntry),
 	}
 }
 
 func (c *subtitleCache) get(key subtitleCacheKey) ([]SubtitleEntry, bool) {
+	return c.getForCaller(key, "legacy")
+}
+
+func (c *subtitleCache) getForCaller(key subtitleCacheKey, callerID string) ([]SubtitleEntry, bool) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	entries, ok := c.m[key]
+	entries, ok := c.m[subtitleCacheEntryKey{key: key, callerID: callerID}]
 	if !ok {
 		return nil, false
 	}
@@ -55,22 +64,27 @@ func (c *subtitleCache) get(key subtitleCacheKey) ([]SubtitleEntry, bool) {
 }
 
 func (c *subtitleCache) set(key subtitleCacheKey, entries []SubtitleEntry) {
+	c.setForCaller(key, entries, "legacy")
+}
+
+func (c *subtitleCache) setForCaller(key subtitleCacheKey, entries []SubtitleEntry, callerID string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	// defensive copy
 	entriesCopy := make([]SubtitleEntry, len(entries))
 	copy(entriesCopy, entries)
 
-	if _, exists := c.m[key]; !exists && len(c.m) >= c.max && c.max > 0 {
+	entryKey := subtitleCacheEntryKey{key: key, callerID: callerID}
+	if _, exists := c.m[entryKey]; !exists && len(c.m) >= c.max && c.max > 0 {
 		// FIFO eviction: remove oldest entry
 		oldest := c.order[0]
 		delete(c.m, oldest)
 		c.order = c.order[1:]
 	}
-	if _, exists := c.m[key]; !exists {
-		c.order = append(c.order, key)
+	if _, exists := c.m[entryKey]; !exists {
+		c.order = append(c.order, entryKey)
 	}
-	c.m[key] = entriesCopy
+	c.m[entryKey] = entriesCopy
 }
 
 func (c *subtitleCache) len() int {
@@ -234,6 +248,7 @@ func NewApplication(config Config) (*Application, error) {
 	app.plexUser = plexgo.New(
 		plexgo.WithServerURL(config.Plex.Host),
 		plexgo.WithSecuritySource(app.plexSecurityUserToken),
+		plexgo.WithClient(callerPlexHTTPClient),
 	)
 
 	app.clipStore, err = newClipStore(durableStorageRoot(config), config.Storage.Database)
@@ -243,7 +258,11 @@ func NewApplication(config Config) (*Application, error) {
 	app.renderJobs, err = newRenderJobManagerWithContextAndPromotion(app.lifetime, renderRoot, app.executeRenderSpec, func(job *renderJob, outputPath string) error {
 		artworkContext, cancelArtwork := context.WithTimeout(app.lifetime, 30*time.Second)
 		defer cancelArtwork()
-		artworkPath, artworkMIME, artworkErr := app.fetchClipArtwork(artworkContext, job.spec.ThumbnailURL)
+		artworkToken := job.spec.SourceToken
+		if artworkToken == "" {
+			artworkToken = app.config.Plex.Token
+		}
+		artworkPath, artworkMIME, artworkErr := app.fetchClipArtworkWithToken(artworkContext, job.spec.ThumbnailURL, artworkToken)
 		if artworkErr != nil {
 			log.Printf("clip artwork snapshot unavailable: %s", redactedDiagnostic(artworkErr))
 		}
@@ -289,6 +308,10 @@ func (a *Application) Close() error {
 const maxClipArtworkBytes int64 = 8 << 20
 
 func (a *Application) fetchClipArtwork(ctx context.Context, artworkPath string) (string, string, error) {
+	return a.fetchClipArtworkWithToken(ctx, artworkPath, a.config.Plex.Token)
+}
+
+func (a *Application) fetchClipArtworkWithToken(ctx context.Context, artworkPath, token string) (string, string, error) {
 	if strings.TrimSpace(artworkPath) == "" {
 		return "", "", nil
 	}
@@ -322,7 +345,7 @@ func (a *Application) fetchClipArtwork(ctx context.Context, artworkPath string) 
 		return "", "", errors.New("clip artwork origin is not the configured Plex origin")
 	}
 	query := parsed.Query()
-	query.Set("X-Plex-Token", a.config.Plex.Token)
+	query.Set("X-Plex-Token", token)
 	parsed.RawQuery = query.Encode()
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, parsed.String(), nil)
 	if err != nil {
@@ -456,6 +479,47 @@ func (a *Application) plexSecurityUserToken(ctx context.Context) (components.Sec
 	return components.Security{
 		Token: authToken,
 	}, nil
+}
+
+// getMetadataItem keeps the access decision explicit. Library requests must
+// use the token belonging to the caller; the configured administrator client
+// is retained for the existing active-session path.
+func (a *Application) getMetadataItem(ctx context.Context, ratingKey string, userScoped bool) (*components.Metadata, error) {
+	var response *operations.GetMetadataItemResponse
+	var err error
+	request := operations.GetMetadataItemRequest{Ids: []string{ratingKey}}
+	if userScoped {
+		if token := AuthTokenFromContext(ctx); token == nil || strings.TrimSpace(*token) == "" {
+			return nil, errors.New("caller-scoped Plex client is unavailable")
+		} else {
+			return a.getCallerMetadataItem(ctx, ratingKey, *token)
+		}
+	} else {
+		if a.plexAdmin == nil {
+			return nil, errors.New("Plex client is unavailable")
+		}
+		response, err = a.plexAdmin.Content.GetMetadataItem(ctx, request)
+	}
+	if err != nil {
+		return nil, err
+	}
+	if response == nil || response.MediaContainerWithMetadata == nil || response.MediaContainerWithMetadata.MediaContainer == nil || len(response.MediaContainerWithMetadata.MediaContainer.Metadata) == 0 {
+		return nil, &sourceValidationError{message: "requested media is unavailable"}
+	}
+	metadata := response.MediaContainerWithMetadata.MediaContainer.Metadata[0]
+	if metadata.RatingKey != nil && *metadata.RatingKey != "" && *metadata.RatingKey != ratingKey {
+		return nil, &sourceValidationError{message: "requested media is unavailable"}
+	}
+	return &metadata, nil
+}
+
+func (a *Application) plexSourceToken(ctx context.Context, userScoped bool) string {
+	if userScoped {
+		if token := AuthTokenFromContext(ctx); token != nil && strings.TrimSpace(*token) != "" {
+			return *token
+		}
+	}
+	return a.config.Plex.Token
 }
 
 func (a *Application) GetValidatedUser(ctx context.Context) (*User, error) {
@@ -772,42 +836,62 @@ type subtitleCacheKey struct {
 	subtitleIndex int
 }
 
+func subtitleCallerID(ctx context.Context) (string, error) {
+	if user := UserFromContext(ctx); user != nil && strings.TrimSpace(user.Uuid) != "" {
+		return "plex-user:" + normalizeOwnerIdentity(user.Uuid), nil
+	}
+	if AuthTokenFromContext(ctx) != nil {
+		return "", errors.New("authenticated user is missing a stable id")
+	}
+	// Direct unauthenticated unit callers retain the old in-process namespace;
+	// HTTP callers cannot reach subtitle handlers without validated auth.
+	return "legacy", nil
+}
+
+func resolveRequestedSource(metadata *components.Metadata, mediaIDStr, partIDStr string) (*components.Media, *components.Part, error) {
+	var mediaID, partID int64
+	var err error
+	if mediaIDStr != "" {
+		mediaID, err = strconv.ParseInt(mediaIDStr, 10, 64)
+		if err != nil || mediaID <= 0 {
+			return nil, nil, errors.New("mediaId is invalid")
+		}
+	}
+	if partIDStr != "" {
+		partID, err = strconv.ParseInt(partIDStr, 10, 64)
+		if err != nil || partID <= 0 {
+			return nil, nil, errors.New("partId is invalid")
+		}
+	}
+	if partID > 0 {
+		return resolveLibraryMetadataSource(metadata, mediaID, partID)
+	}
+	if mediaID > 0 {
+		return selectLibraryMetadataSource(metadata, mediaID, true)
+	}
+	return selectLibraryMetadataSource(metadata, 0, false)
+}
+
 func (a *Application) GetSubtitleStreams(ctx context.Context, ratingKeyStr string, mediaIdStr ...string) ([]SubtitleStream, error) {
-	libraryMetadata, err := a.plexAdmin.Content.GetMetadataItem(ctx, operations.GetMetadataItemRequest{
-		Ids: []string{ratingKeyStr},
-	})
+	mediaID := ""
+	if len(mediaIdStr) > 0 {
+		mediaID = mediaIdStr[0]
+	}
+	return a.GetSubtitleStreamsForSource(ctx, ratingKeyStr, mediaID, "")
+}
+
+func (a *Application) GetSubtitleStreamsForSource(ctx context.Context, ratingKeyStr, mediaIdStr, partIdStr string) ([]SubtitleStream, error) {
+	metadata, err := a.getMetadataItem(ctx, ratingKeyStr, AuthTokenFromContext(ctx) != nil)
 	if err != nil {
 		return nil, err
 	}
-
-	metadata := libraryMetadata.MediaContainerWithMetadata.MediaContainer.Metadata[0]
 	if len(metadata.Media) == 0 {
 		return nil, nil
 	}
 
-	var selectedPart *components.Part
-	if len(metadata.Media[0].Part) > 0 {
-		selectedPart = &metadata.Media[0].Part[0]
-	}
-	if len(mediaIdStr) > 0 && mediaIdStr[0] != "" {
-		mediaId, err := strconv.ParseInt(mediaIdStr[0], 10, 64)
-		if err != nil {
-			return nil, fmt.Errorf("could not parse media id: %w", err)
-		}
-		media, err := resolveMedia(metadata.Media, mediaId, true)
-		if err != nil {
-			return nil, err
-		}
-		selectedPart, err = resolvePart(media, mediaId, true)
-		if err != nil {
-			return nil, err
-		}
-		if selectedPart == nil {
-			return nil, nil
-		}
-	}
-	if selectedPart == nil {
-		return nil, nil
+	_, selectedPart, err := resolveRequestedSource(metadata, mediaIdStr, partIdStr)
+	if err != nil {
+		return nil, err
 	}
 
 	var result []SubtitleStream
@@ -852,47 +936,35 @@ func (a *Application) GetSubtitleStreams(ctx context.Context, ratingKeyStr strin
 }
 
 func (a *Application) GetSubtitleEntries(ctx context.Context, ratingKeyStr, mediaIdStr string, subtitleIndex int) ([]SubtitleEntry, error) {
+	return a.GetSubtitleEntriesForSource(ctx, ratingKeyStr, mediaIdStr, "", subtitleIndex)
+}
+
+func (a *Application) GetSubtitleEntriesForSource(ctx context.Context, ratingKeyStr, mediaIdStr, partIdStr string, subtitleIndex int) ([]SubtitleEntry, error) {
 	operationCtx, cancelOperation := a.operationContext(ctx)
 	defer cancelOperation()
 
-	var mediaId int64
-	if mediaIdStr != "" {
-		var err error
-		mediaId, err = strconv.ParseInt(mediaIdStr, 10, 64)
-		if err != nil {
-			return nil, fmt.Errorf("could not parse media id: %w", err)
-		}
-	}
-
-	cacheKey := subtitleCacheKey{
-		ratingKey:     ratingKeyStr,
-		mediaId:       mediaId,
-		subtitleIndex: subtitleIndex,
-	}
-
-	if entries, ok := a.subtitleCache.get(cacheKey); ok {
-		return entries, nil
-	}
-
-	libraryMetadata, err := a.plexAdmin.Content.GetMetadataItem(operationCtx, operations.GetMetadataItemRequest{
-		Ids: []string{ratingKeyStr},
-	})
+	metadata, err := a.getMetadataItem(operationCtx, ratingKeyStr, AuthTokenFromContext(operationCtx) != nil)
 	if err != nil {
 		return nil, fmt.Errorf("could not get library metadata: %w", err)
 	}
 
-	metadata := libraryMetadata.MediaContainerWithMetadata.MediaContainer.Metadata[0]
-
-	media, err := resolveMedia(metadata.Media, mediaId, mediaIdStr != "")
-	if err != nil {
-		return nil, err
-	}
-	part, err := resolvePart(media, mediaId, mediaIdStr != "")
+	_, part, err := resolveRequestedSource(metadata, mediaIdStr, partIdStr)
 	if err != nil {
 		return nil, err
 	}
 	if part == nil {
 		return nil, nil
+	}
+	callerID, err := subtitleCallerID(operationCtx)
+	if err != nil {
+		return nil, err
+	}
+	if a.subtitleCache == nil {
+		return nil, errors.New("subtitle cache is unavailable")
+	}
+	cacheKey := subtitleCacheKey{ratingKey: ratingKeyStr, mediaId: part.ID, subtitleIndex: subtitleIndex}
+	if entries, ok := a.subtitleCache.getForCaller(cacheKey, callerID); ok {
+		return entries, nil
 	}
 
 	source, err := selectSubtitleSource(part.Stream, subtitleIndex)
@@ -913,14 +985,14 @@ func (a *Application) GetSubtitleEntries(ctx context.Context, ratingKeyStr, medi
 		if err != nil {
 			return nil, fmt.Errorf("could not download external subtitle: %w", err)
 		}
-		a.subtitleCache.set(cacheKey, entries)
+		a.subtitleCache.setForCaller(cacheKey, entries, callerID)
 		return entries, nil
 	}
 
 	fileURL := fmt.Sprintf("%s%s?X-Plex-Token=%s",
 		a.config.Plex.Host,
 		part.Key,
-		a.config.Plex.Token,
+		a.plexSourceToken(operationCtx, AuthTokenFromContext(operationCtx) != nil),
 	)
 
 	release, err := a.acquireFFmpeg(operationCtx)
@@ -939,16 +1011,20 @@ func (a *Application) GetSubtitleEntries(ctx context.Context, ratingKeyStr, medi
 		return nil, err
 	}
 
-	a.subtitleCache.set(cacheKey, entries)
+	a.subtitleCache.setForCaller(cacheKey, entries, callerID)
 
 	return entries, nil
 }
 
 func (a *Application) downloadSubtitle(ctx context.Context, streamKey, codec string) ([]SubtitleEntry, error) {
+	return a.downloadSubtitleWithToken(ctx, streamKey, codec, a.plexSourceToken(ctx, AuthTokenFromContext(ctx) != nil))
+}
+
+func (a *Application) downloadSubtitleWithToken(ctx context.Context, streamKey, codec, token string) ([]SubtitleEntry, error) {
 	streamURL := fmt.Sprintf("%s%s?X-Plex-Token=%s",
 		a.config.Plex.Host,
 		streamKey,
-		a.config.Plex.Token,
+		token,
 	)
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, streamURL, nil)
@@ -997,13 +1073,17 @@ func (a *Application) downloadSubtitle(ctx context.Context, streamKey, codec str
 }
 
 func (a *Application) prepareExternalSubtitle(ctx context.Context, source subtitleSource, fromMs, toMs int64, subtitleOffsets ...int64) (string, error) {
+	return a.prepareExternalSubtitleWithToken(ctx, source, fromMs, toMs, subtitleOffsets, a.plexSourceToken(ctx, AuthTokenFromContext(ctx) != nil))
+}
+
+func (a *Application) prepareExternalSubtitleWithToken(ctx context.Context, source subtitleSource, fromMs, toMs int64, subtitleOffsets []int64, token string) (string, error) {
 	if !source.External || source.StreamKey == "" {
 		return "", fmt.Errorf("external subtitle stream key is missing")
 	}
 	if source.PGS || !isSupportedTextSubtitle(source) {
 		return "", fmt.Errorf("external subtitle codec is not supported")
 	}
-	entries, err := a.downloadSubtitle(ctx, source.StreamKey, subtitleSourceCodec(source))
+	entries, err := a.downloadSubtitleWithToken(ctx, source.StreamKey, subtitleSourceCodec(source), token)
 	if err != nil {
 		return "", fmt.Errorf("could not download external subtitle: %w", err)
 	}
@@ -1014,32 +1094,32 @@ func (a *Application) prepareExternalSubtitle(ctx context.Context, source subtit
 	return subtitleFile, nil
 }
 
-func (a *Application) GetCachedSubtitleEntries(ratingKeyStr, mediaIdStr string, subtitleIndex int) ([]SubtitleEntry, bool) {
-	var mediaId int64
-	if mediaIdStr != "" {
-		var err error
-		mediaId, err = strconv.ParseInt(mediaIdStr, 10, 64)
-		if err != nil {
-			return nil, false
-		}
+func (a *Application) GetCachedSubtitleEntries(ctx context.Context, ratingKeyStr, mediaIdStr, partIdStr string, subtitleIndex int) ([]SubtitleEntry, bool) {
+	if a.subtitleCache == nil {
+		return nil, false
 	}
-
-	return a.subtitleCache.get(subtitleCacheKey{
-		ratingKey:     ratingKeyStr,
-		mediaId:       mediaId,
-		subtitleIndex: subtitleIndex,
-	})
+	metadata, err := a.getMetadataItem(ctx, ratingKeyStr, AuthTokenFromContext(ctx) != nil)
+	if err != nil {
+		return nil, false
+	}
+	_, part, err := resolveRequestedSource(metadata, mediaIdStr, partIdStr)
+	if err != nil || part == nil {
+		return nil, false
+	}
+	callerID, err := subtitleCallerID(ctx)
+	if err != nil {
+		return nil, false
+	}
+	return a.subtitleCache.getForCaller(subtitleCacheKey{
+		ratingKey: ratingKeyStr, mediaId: part.ID, subtitleIndex: subtitleIndex,
+	}, callerID)
 }
 
 func (a *Application) Clip(ctx context.Context, ratingKeyStr, mediaIdStr, from, to string, height, qp, subtitleIndex int) (string, error) {
-	libraryMetadata, err := a.plexAdmin.Content.GetMetadataItem(ctx, operations.GetMetadataItemRequest{
-		Ids: []string{ratingKeyStr},
-	})
+	metadata, err := a.getMetadataItem(ctx, ratingKeyStr, AuthTokenFromContext(ctx) != nil)
 	if err != nil {
 		return "", fmt.Errorf("could not get library metadata: %w", err)
 	}
-
-	metadata := libraryMetadata.MediaContainerWithMetadata.MediaContainer.Metadata[0]
 
 	var mediaId int64
 	mediaIdSupplied := mediaIdStr != ""
@@ -1065,7 +1145,7 @@ func (a *Application) Clip(ctx context.Context, ratingKeyStr, mediaIdStr, from, 
 	fileURL := fmt.Sprintf("%s%s?X-Plex-Token=%s",
 		a.config.Plex.Host,
 		part.Key,
-		a.config.Plex.Token,
+		a.plexSourceToken(ctx, AuthTokenFromContext(ctx) != nil),
 	)
 
 	// Extract subtitle for burning in if requested. For text subtitles, ExtractSubtitle
@@ -1161,10 +1241,11 @@ func (a *Application) Clip(ctx context.Context, ratingKeyStr, mediaIdStr, from, 
 }
 
 func (a *Application) Thumb(ctx context.Context, thumb string) (io.ReadCloser, string, error) {
+	token := a.plexSourceToken(ctx, AuthTokenFromContext(ctx) != nil)
 	transcodeURL := fmt.Sprintf("%s/photo/:/transcode?width=320&height=320&url=%s&X-Plex-Token=%s",
 		a.config.Plex.Host,
 		url.QueryEscape(thumb),
-		a.config.Plex.Token,
+		token,
 	)
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, transcodeURL, nil)

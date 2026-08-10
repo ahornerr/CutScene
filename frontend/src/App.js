@@ -3,17 +3,79 @@ import {useCallback, useEffect, useMemo, useRef, useState} from "react";
 import {
   Box, Button, Container, Stack, Toolbar, Typography,
 } from "@mui/material";
-import SessionPicker from "./components/SessionPicker";
+import LibrarySearchPanel from "./components/LibrarySearchPanel";
 import ClipWorkspace from "./components/ClipWorkspace";
 import ClipLibrary from "./components/ClipLibrary";
 import ClipDetail from "./components/ClipDetail";
 import {stripSubtitleMarkup} from "./components/subtitle-markup";
 import {
   buildRenderJobRequest, buildRenderJobRequestFromSpec, isTerminal, isActive, JOB_STATES, snapshotJobSpec, AUDIO_MODES,
+  getSourcePartId, validateLibraryResult,
 } from "./components/render-jobs";
 import {
   isAbortError, isPgsSubtitleStream, millisToDuration, MIN_GAP_MS,
 } from "./utils";
+
+// Normalize a backend LibrarySearchResult into the session-shaped object the
+// workspace expects. The shape mirrors an active Plex session (ratingKey,
+// Media[].Part[].id, duration, title/hierarchy) so the existing preview /
+// subtitle / trim flows work unchanged. Two underscore-prefixed fields tag the
+// source kind so request builders can append `partId` only for library sources:
+//   _sourceType: 'library'
+//   _partId:    numeric part id from the search result
+// Active sessions carry neither field, so they resolve through the legacy path.
+function libraryResultToSession(result) {
+  return {
+    ratingKey: result.ratingKey,
+    type: result.type,
+    title: result.title,
+    grandparentTitle: result.grandparentTitle || '',
+    parentTitle: result.parentTitle || '',
+    parentIndex: result.seasonNumber ?? null,
+    index: result.episodeNumber ?? null,
+    year: result.year ?? null,
+    duration: result.duration,
+    // Library items have no live view offset — clips start at the beginning.
+    viewOffset: 0,
+    thumb: result.artwork || '',
+    Media: [{Part: [{id: String(result.mediaId)}], videoResolution: result.videoResolution || '', audioChannels: result.audioChannels || 0}],
+    _sourceType: 'library',
+    _partId: result.partId,
+  }
+}
+
+// Build the optional `&partId=` query segment for explicit library sources.
+// Active sessions return null here so the legacy request shape is preserved.
+function partIdParam(session) {
+  const partId = getSourcePartId(session)
+  return partId != null ? `&partId=${partId}` : ''
+}
+
+// Safely parse a fetch response expected to be a JSON array. The backend's
+// error envelopes ({error: {code, message}}) and non-2xx responses are turned
+// into typed errors instead of being stored where an array is expected —
+// downstream .filter/.map calls would otherwise crash on a non-array shape.
+// Returns [] for a 2xx response whose body isn't an array, so the UI degrades
+// to an empty state rather than a render crash.
+async function safeJsonArray(response) {
+  if (!response.ok) {
+    let body = null
+    try { body = await response.json() } catch { /* non-JSON or empty */ }
+    const message = body?.error?.message || `Request failed (${response.status}).`
+    const err = new Error(message)
+    err.status = response.status
+    err.code = body?.error?.code || 'request_error'
+    throw err
+  }
+  let data
+  try { data = await response.json() }
+  catch (e) {
+    const err = new Error('Received a malformed response from the server.')
+    err.code = 'malformed_response'
+    throw err
+  }
+  return Array.isArray(data) ? data : []
+}
 
 const POLL_INTERVAL_MS = 2000
 const SESSION_REFRESH_INTERVAL_MS = 10000
@@ -254,7 +316,7 @@ function App() {
     setPlayerError(false)
     setPlayerUrl(
       `/preview/${selectedSession.ratingKey}/${millisToDuration(start)}/${millisToDuration(end)}` +
-      `?mediaId=${selectedSession.Media[0].Part[0].id}${subtitleParam}${audioModeParam}${offsetParam}`
+      `?mediaId=${selectedSession.Media[0].Part[0].id}${partIdParam(selectedSession)}${subtitleParam}${audioModeParam}${offsetParam}`
     )
   }, [selectedSession, selectedSubtitle, audioMode, subtitleOffsetMs])
 
@@ -286,11 +348,11 @@ function App() {
 
       resetRenderState()
 
-      fetch(`/streams/${selectedSession.ratingKey}?mediaId=${encodeURIComponent(mediaId)}`, {signal: controller.signal})
-        .then(r => r.json())
+      fetch(`/streams/${selectedSession.ratingKey}?mediaId=${encodeURIComponent(mediaId)}${partIdParam(selectedSession)}`, {signal: controller.signal})
+        .then(safeJsonArray)
         .then(streams => {
           if (controller.signal.aborted || sessionGenerationRef.current !== generation) return
-          const availableStreams = Array.isArray(streams) ? streams : []
+          const availableStreams = streams
           const selectedStreamIndex = availableStreams.length > 0 ? availableStreams[0].index : -1
           setSubtitleStreams(availableStreams)
           setStreamsLoading(false)
@@ -304,10 +366,10 @@ function App() {
             stream.index !== selectedStreamIndex
           )
           unselectedTextStreams.forEach(stream => {
-            fetch(`/subtitles/${selectedSession.ratingKey}?subtitle=${stream.index}&mediaId=${mediaId}`, {
+            fetch(`/subtitles/${selectedSession.ratingKey}?subtitle=${stream.index}&mediaId=${mediaId}${partIdParam(selectedSession)}`, {
               signal: controller.signal,
             })
-              .then(r => r.json())
+              .then(safeJsonArray)
               .catch(() => {})
           })
         })
@@ -347,13 +409,13 @@ function App() {
     const generation = sessionGenerationRef.current
     const controller = new AbortController()
     const mediaId = selectedSession.Media[0].Part[0].id
-    fetch(`/subtitles/${selectedSession.ratingKey}?subtitle=${selectedSubtitle}&mediaId=${mediaId}`, {
+    fetch(`/subtitles/${selectedSession.ratingKey}?subtitle=${selectedSubtitle}&mediaId=${mediaId}${partIdParam(selectedSession)}`, {
       signal: controller.signal,
     })
-      .then(r => r.json())
+      .then(safeJsonArray)
       .then(entries => {
         if (controller.signal.aborted || sessionGenerationRef.current !== generation) return
-        setSubtitleEntries(entries || [])
+        setSubtitleEntries(entries)
       })
       .catch(err => {
         if (!controller.signal.aborted && !isAbortError(err) && sessionGenerationRef.current === generation) {
@@ -838,6 +900,29 @@ function App() {
     setSelectedSession(session)
   }, [stopSessionRefresh])
 
+// Library result selection — normalize the backend LibrarySearchResult into
+// the session-shaped object the workspace expects, then route through the
+// same selection path. The `_sourceType: 'library'` tag makes partId flow
+// through streams/subtitles/preview/render only for library sources; active
+// sessions are unchanged. Malformed results (missing/invalid ratingKey,
+// mediaId, or partId) are rejected before workspace entry so the user never
+// lands in a broken workspace that can't fetch streams or render.
+const handleSelectLibraryResult = useCallback((result) => {
+  const validationError = validateLibraryResult(result)
+  if (validationError) {
+    console.warn('Rejected malformed library result:', validationError, result)
+    return
+  }
+  stopSessionRefresh()
+  setSelectedSession(libraryResultToSession(result))
+}, [stopSessionRefresh])
+
+// Stable auth-required handler for the library search panel. setNeedsAuth is
+// stable (useState setter), so this callback keeps a stable identity across
+// session-poll re-renders — paired with the panel's ref capture it guarantees
+// polling never re-fires a library search.
+const handleLibraryAuthRequired = useCallback(() => setNeedsAuth(true), [])
+
   // ---------------------------------------------------------------- clip library navigation
   const openLibrary = useCallback(() => setView({name: 'library'}), [])
   const openClip = useCallback((clipId) => setView({name: 'clip', clipId}), [])
@@ -930,23 +1015,25 @@ function App() {
               onDeleted={handleClipDeleted}
             />
           ) : !selectedSession ? (
-            <Stack spacing={2.5} className="cs-rise">
+            <Stack spacing={4} className="cs-rise">
               <Box>
                 <Typography variant="overline" className="cs-section-label" sx={{color: '#ff7300'}}>
-                  Active sessions
+                  Pick a source
                 </Typography>
                 <Typography variant="h4" sx={{mt: 0.5}}>Pick something to clip</Typography>
                 <Typography variant="body2" sx={{color: 'text.secondary', mt: 0.5, maxWidth: 520}}>
-                  Choose an active Plex session to open the clip workspace — preview, trim, and grab a clip with subtitles.
+                  Choose an active Plex session, or search your Plex library to pick a clip source.
                 </Typography>
               </Box>
-              <SessionPicker
-                sessions={sessions}
-                loading={sessionsLoading}
-                error={sessionsError}
+              <LibrarySearchPanel
+                onSelect={handleSelectLibraryResult}
                 selectedKey={selectedSession?.ratingKey}
-                onSelect={handleSelectSession}
-                onRetry={retrySessions}
+                onAuthRequired={handleLibraryAuthRequired}
+                sessions={sessions}
+                sessionsLoading={sessionsLoading}
+                sessionsError={sessionsError}
+                onSelectSession={handleSelectSession}
+                onRetrySessions={retrySessions}
               />
             </Stack>
           ) : (

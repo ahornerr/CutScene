@@ -1,8 +1,9 @@
 import {Box, Button, Typography} from "@mui/material";
 
-// Session context bar — makes the active session unmistakable in the workspace.
-// Shows the title/context and provides a graceful Change-session affordance.
-// The Change-session button is disabled when a render job is active.
+// Session context bar — makes the active source unmistakable in the workspace.
+// Shows the title/context, a small source-kind label (Active session vs. Plex
+// library), and a graceful Change-source affordance. The Change button is
+// disabled when a render job is active.
 function getVideoName(session) {
   if (session.type === "episode") {
     return {
@@ -15,6 +16,8 @@ function getVideoName(session) {
 
 export default function SessionContext({session, onChangeSession, changeDisabled, changeDisabledReason}) {
   const name = getVideoName(session)
+  const isLibrary = session?._sourceType === 'library'
+  const sourceLabel = isLibrary ? 'From your Plex library' : 'Active Plex session'
   return (
     <Box className="cs-session-context cs-rise">
       <Box sx={{flex: 1, minWidth: 0}}>
@@ -29,6 +32,9 @@ export default function SessionContext({session, onChangeSession, changeDisabled
             {name.bottom}
           </Typography>
         )}
+        <Typography variant="caption" sx={{color: 'text.disabled', mt: 0.4, display: 'block'}}>
+          {sourceLabel}
+        </Typography>
       </Box>
       <Button
         variant="outlined"
@@ -38,7 +44,7 @@ export default function SessionContext({session, onChangeSession, changeDisabled
         title={changeDisabled ? changeDisabledReason : ''}
         sx={{borderColor: 'rgba(255,255,255,0.2)', flexShrink: 0}}
       >
-        Change session
+        Change source
       </Button>
     </Box>
   )
