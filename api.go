@@ -81,6 +81,13 @@ func NewAPI(config Config, app *Application) (*API, error) {
 	api.http.Post("/render-jobs", api.createRenderJob, api.authMiddlewareJSON)
 	api.http.Get("/render-jobs/:id", api.getRenderJob, api.authMiddlewareJSON)
 	api.http.Get("/render-jobs/:id/download", api.downloadRenderJob, api.authMiddlewareJSON)
+	api.http.Get("/clips", api.listClips, api.authMiddlewareJSON)
+	api.http.Get("/clips/:id/download", api.downloadClip, api.authMiddlewareJSON)
+	api.http.Get("/clips/:id/artwork", api.downloadClipArtwork, api.authMiddlewareJSON)
+	api.http.Get("/clips/:id", api.getClip, api.authMiddlewareJSON)
+	api.http.Delete("/clips/:id", api.deleteClip, api.authMiddlewareJSON)
+	api.http.Get("/shared/clips/:token/download", api.publicDownloadClip)
+	api.http.Get("/shared/clips/:token", api.publicClip)
 	api.http.Get("/preview/:ratingKey/:from/:to", api.preview, api.authMiddleware)
 
 	api.http.Get("/authUrl", api.authUrl).Name(routeNameAuthUrl)
@@ -268,7 +275,9 @@ func (a *API) Shutdown() error {
 	}
 	var shutdownErr error
 	if a.app != nil {
-		shutdownErr = a.app.Close()
+		// Cancel active work first, but keep SQLite open while the HTTP server
+		// drains handlers that may still be reading clip metadata or bytes.
+		a.app.stopWork()
 	}
 	if a.http != nil {
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), apiShutdownTimeout)
@@ -276,6 +285,13 @@ func (a *API) Shutdown() error {
 		cancel()
 		if shutdownErr == nil {
 			shutdownErr = err
+		}
+	}
+	if a.app != nil {
+		if err := a.app.Close(); shutdownErr == nil && err != nil {
+			shutdownErr = err
+		} else if err != nil {
+			shutdownErr = errors.Join(shutdownErr, err)
 		}
 	}
 	return shutdownErr

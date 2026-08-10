@@ -85,6 +85,15 @@ type renderJobSpec struct {
 	Height                int
 	QP                    int
 	AudioMode             AudioMode
+	CreatorDisplayName    string
+	MediaKind             string
+	MovieTitle            string
+	MovieYear             *int
+	ShowTitle             string
+	SeasonNumber          *int
+	EpisodeNumber         *int
+	EpisodeTitle          string
+	ThumbnailURL          string
 }
 
 type renderJobError struct {
@@ -100,6 +109,8 @@ type renderJobResponse struct {
 	UpdatedAt   time.Time       `json:"updatedAt"`
 	ExpiresAt   *time.Time      `json:"expiresAt,omitempty"`
 	DownloadURL string          `json:"downloadUrl,omitempty"`
+	ClipID      string          `json:"clipId,omitempty"`
+	ShareURL    string          `json:"shareUrl,omitempty"`
 	Error       *renderJobError `json:"error,omitempty"`
 }
 
@@ -260,6 +271,8 @@ type renderJob struct {
 	cleanupWait  bool
 	sizeBytes    int64
 	bytesCounted bool
+	clipID       string
+	shareURL     string
 }
 
 type renderJobExecutor func(context.Context, renderJobSpec, string) error
@@ -304,25 +317,27 @@ func (a *Application) acquireFFmpeg(ctx context.Context) (func(), error) {
 }
 
 type renderJobManager struct {
-	mu               sync.Mutex
-	jobs             map[string]*renderJob
-	ownerOutstanding map[string]int
-	queue            chan *renderJob
-	store            *renderStorage
-	execute          renderJobExecutor
-	now              func() time.Time
-	lifetime         context.Context
-	cancel           context.CancelFunc
-	stop             chan struct{}
-	done             chan struct{}
-	cleanupDone      chan struct{}
-	stopOnce         sync.Once
-	stopped          bool
-	maxBytes         int64
-	bytesUsed        int64
-	maxTerminal      int
-	maxFailed        int
-	timeout          time.Duration
+	mu                 sync.Mutex
+	jobs               map[string]*renderJob
+	ownerOutstanding   map[string]int
+	queue              chan *renderJob
+	store              *renderStorage
+	execute            renderJobExecutor
+	now                func() time.Time
+	lifetime           context.Context
+	cancel             context.CancelFunc
+	stop               chan struct{}
+	done               chan struct{}
+	cleanupDone        chan struct{}
+	stopOnce           sync.Once
+	stopped            bool
+	maxBytes           int64
+	bytesUsed          int64
+	maxTerminal        int
+	maxFailed          int
+	timeout            time.Duration
+	promote            func(*renderJob, string) error
+	terminalDeleteHook func() // test synchronization point; called under both locks
 }
 
 var errRenderQueueFull = errors.New("render queue is full")
@@ -336,6 +351,10 @@ func newRenderJobManager(root string, execute renderJobExecutor) (*renderJobMana
 }
 
 func newRenderJobManagerWithContext(parent context.Context, root string, execute renderJobExecutor) (*renderJobManager, error) {
+	return newRenderJobManagerWithContextAndPromotion(parent, root, execute, nil)
+}
+
+func newRenderJobManagerWithContextAndPromotion(parent context.Context, root string, execute renderJobExecutor, promote func(*renderJob, string) error) (*renderJobManager, error) {
 	store, err := newRenderStorage(root)
 	if err != nil {
 		return nil, err
@@ -360,6 +379,7 @@ func newRenderJobManagerWithContext(parent context.Context, root string, execute
 		maxTerminal:      renderMaxTerminal,
 		maxFailed:        renderMaxFailedRecords,
 		timeout:          renderTimeout,
+		promote:          promote,
 	}
 	go m.worker()
 	go m.cleanupLoop()
@@ -506,12 +526,18 @@ func (m *renderJobManager) run(job *renderJob) {
 	if err == nil {
 		err = m.finalizeOutput(job)
 	}
+	if err == nil && m.promote != nil {
+		err = m.promote(job, filepath.Join(job.dir, "output.mp4"))
+	}
 	if err != nil {
 		failure := classifyRenderError(err)
 		public := publicRenderFailure(failure)
 		log.Printf("render job %s failed category=%s diagnostic=%s", job.id, public.Code, redactedDiagnostic(failure))
 		_ = os.Remove(filepath.Join(job.dir, "output.partial"))
-		_ = m.store.removeJobDir(job.dir)
+		// Promotion can fail after finalizeOutput has charged the transient
+		// byte budget. Use the normal storage cleanup path so that failed
+		// promotion does not leak that budget.
+		m.deleteJobStorage(job)
 		job.mu.Lock()
 		job.state = renderFailed
 		job.failure = &public
@@ -619,22 +645,38 @@ func (m *renderJobManager) enforceTerminalBudget() {
 }
 
 func (m *renderJobManager) removeTerminalJob(job *renderJob) {
+	// Map removal and the lease check share the manager lock with download
+	// acquisition. Once removed, a new downloader cannot obtain this job.
+	m.mu.Lock()
 	job.mu.Lock()
 	if job.leaseCount > 0 {
 		job.mu.Unlock()
+		m.mu.Unlock()
 		return
 	}
-	job.mu.Unlock()
-	m.deleteJobStorage(job)
-	m.mu.Lock()
+	if m.terminalDeleteHook != nil {
+		m.terminalDeleteHook()
+	}
 	delete(m.jobs, job.id)
+	m.deleteJobStorageLocked(job)
+	job.mu.Unlock()
 	m.mu.Unlock()
 }
 
 func (m *renderJobManager) deleteJobStorage(job *renderJob) {
+	m.mu.Lock()
 	job.mu.Lock()
+	m.deleteJobStorageLocked(job)
+	job.mu.Unlock()
+	m.mu.Unlock()
+}
+
+// deleteJobStorageLocked requires m.mu and job.mu. Keeping the byte-budget
+// accounting, lease check, and filesystem removal in the same critical
+// section prevents eviction from deleting a file between lease acquisition
+// and its first stat/open.
+func (m *renderJobManager) deleteJobStorageLocked(job *renderJob) {
 	if job.leaseCount > 0 {
-		job.mu.Unlock()
 		return
 	}
 	dir := job.dir
@@ -642,14 +684,11 @@ func (m *renderJobManager) deleteJobStorage(job *renderJob) {
 	counted := job.bytesCounted
 	job.sizeBytes = 0
 	job.bytesCounted = false
-	job.mu.Unlock()
 	if counted {
-		m.mu.Lock()
 		m.bytesUsed -= size
 		if m.bytesUsed < 0 {
 			m.bytesUsed = 0
 		}
-		m.mu.Unlock()
 	}
 	_ = m.store.removeJobDir(dir)
 }
@@ -672,6 +711,8 @@ func (m *renderJobManager) status(id, owner string) (renderJobResponse, error) {
 	job.mu.Lock()
 	defer job.mu.Unlock()
 	response := renderJobResponse{ID: job.id, Status: job.state, CreatedAt: job.createdAt, UpdatedAt: job.updatedAt}
+	response.ClipID = job.clipID
+	response.ShareURL = job.shareURL
 	if !job.expiresAt.IsZero() {
 		expiresAt := job.expiresAt
 		response.ExpiresAt = &expiresAt
@@ -692,11 +733,16 @@ func (m *renderJobManager) acquireDownload(id, owner string) (string, func(), er
 }
 
 func (m *renderJobManager) acquireDownloadWithSpec(id, owner string) (string, renderJobSpec, func(), error) {
-	job, err := m.ownedJob(id, owner)
-	if err != nil {
-		return "", renderJobSpec{}, nil, err
+	// Hold the manager lock while taking the job lock. Terminal eviction uses
+	// the same order, making map membership and lease acquisition atomic.
+	m.mu.Lock()
+	job := m.jobs[id]
+	if job == nil || job.ownerUUID != owner {
+		m.mu.Unlock()
+		return "", renderJobSpec{}, nil, errRenderNotFound
 	}
 	job.mu.Lock()
+	m.mu.Unlock()
 	state := job.state
 	if state != renderSucceeded {
 		job.mu.Unlock()
@@ -903,7 +949,7 @@ func (a *API) createRenderJob(ctx fiber.Ctx) error {
 	if len(metadataList) == 0 {
 		return renderAPIErrorCode(ctx, http.StatusUnprocessableEntity, "validation_error", "requested media is unavailable")
 	}
-	spec, err := validateRenderJobRequestWithMetadata(request, *user, sessions, metadataList[0].Media, selection)
+	spec, err := validateRenderJobRequestWithMetadataAndItem(request, *user, sessions, metadataList[0].Media, selection, &metadataList[0])
 	if err != nil {
 		return renderAPIErrorCode(ctx, http.StatusUnprocessableEntity, "validation_error", err.Error())
 	}
@@ -919,6 +965,7 @@ func (a *API) createRenderJob(ctx fiber.Ctx) error {
 	result, _ := a.app.renderJobs.status(job.id, user.Uuid)
 	ctx.Status(http.StatusAccepted)
 	ctx.Set("Cache-Control", "no-store")
+	ctx.Set("Referrer-Policy", "no-referrer")
 	ctx.Set("Location", "/render-jobs/"+job.id)
 	return ctx.JSON(result)
 }
@@ -943,6 +990,7 @@ func (a *API) getRenderJob(ctx fiber.Ctx) error {
 		return renderAPIError(ctx, http.StatusUnauthorized, "authentication required")
 	}
 	ctx.Set("Cache-Control", "no-store")
+	ctx.Set("Referrer-Policy", "no-referrer")
 	result, err := a.app.renderJobs.status(ctx.Params("id"), user.Uuid)
 	if err != nil {
 		return renderAPIError(ctx, http.StatusNotFound, "render job not found")
@@ -981,6 +1029,7 @@ func (a *API) downloadRenderJob(ctx fiber.Ctx) error {
 	}
 	ctx.Type(".mp4")
 	ctx.Set("Cache-Control", "no-store")
+	ctx.Set("Referrer-Policy", "no-referrer")
 	ctx.Set(fiber.HeaderContentDisposition, renderDownloadContentDisposition(spec))
 	ctx.Set("Content-Length", strconv.FormatInt(info.Size(), 10))
 	ctx.Response().SetBodyStreamWriter(func(writer *bufio.Writer) {
@@ -1018,6 +1067,127 @@ func validateRenderJobRequest(request RenderJobCreateRequest, user User, session
 }
 
 func validateRenderJobRequestWithMetadata(request RenderJobCreateRequest, user User, sessions []sessionMetadata, metadata []components.Media, selection previewSessionSelection) (renderJobSpec, error) {
+	return validateRenderJobRequestWithMetadataAndItem(request, user, sessions, metadata, selection, nil)
+}
+
+type renderPresentation struct {
+	CreatorDisplayName string
+	MediaKind          string
+	MovieTitle         string
+	MovieYear          *int
+	ShowTitle          string
+	SeasonNumber       *int
+	EpisodeNumber      *int
+	EpisodeTitle       string
+	ThumbnailURL       string
+}
+
+func creatorDisplayName(user User) string {
+	if strings.TrimSpace(user.Username) != "" {
+		return strings.TrimSpace(user.Username)
+	}
+	return strings.TrimSpace(user.Title)
+}
+
+func presentationFromSession(user User, sessions []sessionMetadata, ratingKey string) renderPresentation {
+	presentation := renderPresentation{CreatorDisplayName: creatorDisplayName(user)}
+	for _, session := range sessions {
+		key := session.Key
+		if session.RatingKey != nil {
+			key = *session.RatingKey
+		}
+		if key != ratingKey {
+			continue
+		}
+		presentation.MediaKind = session.Type
+		if session.Thumb != nil && strings.TrimSpace(*session.Thumb) != "" {
+			presentation.ThumbnailURL = *session.Thumb
+		} else if session.GrandparentThumb != nil {
+			presentation.ThumbnailURL = *session.GrandparentThumb
+		}
+		if session.Type == "episode" || session.GrandparentTitle != nil || session.ParentIndex != nil || session.Index != nil {
+			presentation.ShowTitle = stringValue(session.GrandparentTitle)
+			presentation.SeasonNumber = intValue(session.ParentIndex)
+			presentation.EpisodeNumber = intValue(session.Index)
+			presentation.EpisodeTitle = session.Title
+		}
+		break
+	}
+	return presentation
+}
+
+func presentationFromMetadata(user User, sessions []sessionMetadata, ratingKey string, metadata *components.Metadata) renderPresentation {
+	presentation := presentationFromSession(user, sessions, ratingKey)
+	if metadata == nil {
+		return presentation
+	}
+	if metadata.Type != "" {
+		presentation.MediaKind = metadata.Type
+	}
+	if presentation.ThumbnailURL == "" && metadata.Thumb != nil && strings.TrimSpace(*metadata.Thumb) != "" {
+		presentation.ThumbnailURL = *metadata.Thumb
+	} else if presentation.ThumbnailURL == "" && metadata.GrandparentThumb != nil {
+		presentation.ThumbnailURL = *metadata.GrandparentThumb
+	}
+	switch metadata.Type {
+	case "movie":
+		if metadata.Title != "" {
+			presentation.MovieTitle = metadata.Title
+		}
+		if metadata.Year != nil {
+			presentation.MovieYear = intValue(metadata.Year)
+		}
+	case "episode":
+		if value := stringValue(metadata.GrandparentTitle); value != "" {
+			presentation.ShowTitle = value
+		} else if presentation.ShowTitle == "" {
+			// ParentTitle is only a fallback when the selected session did not
+			// provide a show title; it must never replace a valid session title.
+			if value := stringValue(metadata.ParentTitle); value != "" {
+				presentation.ShowTitle = value
+			}
+		}
+		if metadata.ParentIndex != nil {
+			presentation.SeasonNumber = intValue(metadata.ParentIndex)
+		}
+		if metadata.Index != nil {
+			presentation.EpisodeNumber = intValue(metadata.Index)
+		}
+		if metadata.Title != "" {
+			presentation.EpisodeTitle = metadata.Title
+		}
+	}
+	return presentation
+}
+
+func stringValue(value *string) string {
+	if value == nil {
+		return ""
+	}
+	return *value
+}
+
+func intValue(value *int) *int {
+	if value == nil {
+		return nil
+	}
+	copy := *value
+	return &copy
+}
+
+func (p renderPresentation) apply(spec *renderJobSpec) {
+	spec.CreatorDisplayName = p.CreatorDisplayName
+	spec.MediaKind = p.MediaKind
+	spec.MovieTitle = p.MovieTitle
+	spec.MovieYear = p.MovieYear
+	spec.ShowTitle = p.ShowTitle
+	spec.SeasonNumber = p.SeasonNumber
+	spec.EpisodeNumber = p.EpisodeNumber
+	spec.EpisodeTitle = p.EpisodeTitle
+	spec.ThumbnailURL = p.ThumbnailURL
+}
+
+func validateRenderJobRequestWithMetadataAndItem(request RenderJobCreateRequest, user User, sessions []sessionMetadata, metadata []components.Media, selection previewSessionSelection, metadataItem *components.Metadata) (renderJobSpec, error) {
 	audioMode, err := parseAudioMode(string(request.AudioMode))
 	if err != nil {
 		return renderJobSpec{}, errors.New("audioMode is invalid")
@@ -1081,7 +1251,7 @@ func validateRenderJobRequestWithMetadata(request RenderJobCreateRequest, user U
 				return renderJobSpec{}, errors.New("subtitle codec is not supported")
 			}
 		}
-		return renderJobSpec{
+		spec := renderJobSpec{
 			OwnerUUID:             user.Uuid,
 			RatingKey:             request.RatingKey,
 			MediaID:               request.MediaID,
@@ -1100,7 +1270,9 @@ func validateRenderJobRequestWithMetadata(request RenderJobCreateRequest, user U
 			Height:                request.Height,
 			QP:                    request.QP,
 			AudioMode:             audioMode,
-		}, nil
+		}
+		presentationFromMetadata(user, sessions, request.RatingKey, metadataItem).apply(&spec)
+		return spec, nil
 	}
 
 	for _, session := range sessions {
@@ -1147,7 +1319,7 @@ func validateRenderJobRequestWithMetadata(request RenderJobCreateRequest, user U
 				if request.SubtitleIndex >= 0 && subtitleEmbeddedIndex < 0 {
 					return renderJobSpec{}, errors.New("subtitle codec is not supported")
 				}
-				return renderJobSpec{
+				spec := renderJobSpec{
 					OwnerUUID:             user.Uuid,
 					RatingKey:             request.RatingKey,
 					MediaID:               request.MediaID,
@@ -1162,7 +1334,9 @@ func validateRenderJobRequestWithMetadata(request RenderJobCreateRequest, user U
 					Height:                request.Height,
 					QP:                    request.QP,
 					AudioMode:             audioMode,
-				}, nil
+				}
+				presentationFromSession(user, sessions, request.RatingKey).apply(&spec)
+				return spec, nil
 			}
 		}
 	}

@@ -23,6 +23,13 @@ type Config struct {
 		Codec       Codec `mapstructure:"codec"`
 		Concurrency int   `mapstructure:"concurrency"`
 	} `mapstructure:"ffmpeg"`
+	Storage struct {
+		// Root contains durable application data, including saved clips and the
+		// clip metadata database. It is deliberately separate from the transient
+		// render-job directory.
+		Root     string `mapstructure:"root"`
+		Database string `mapstructure:"database"`
+	} `mapstructure:"storage"`
 }
 
 func loadConfig() (*Config, error) {

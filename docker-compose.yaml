@@ -6,3 +6,9 @@ services:
     volumes:
       - ./config.yaml:/config.yaml
       - ./fiber.sqlite3:/fiber.sqlite3
+      # Durable clip metadata, MP4s, and the token-encryption key. Transient
+      # render jobs intentionally remain under the container's /tmp.
+      - cutscene-data:/data
+
+volumes:
+  cutscene-data:

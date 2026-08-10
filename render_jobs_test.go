@@ -163,6 +163,35 @@ func TestRenderValidationSnapshotsExternalSubtitleSource(t *testing.T) {
 	}
 }
 
+func TestIncompleteEpisodeMetadataPreservesSessionShowAndEpisodeFields(t *testing.T) {
+	show := "Session Show"
+	season, episode := 4, 9
+	sessions := []sessionMetadata{{
+		Key: "episode-1", Type: "episode", Title: "Session Episode",
+		GrandparentTitle: &show, ParentIndex: &season, Index: &episode,
+	}}
+	parentTitle := "Season 4"
+	presentation := presentationFromMetadata(User{Username: "plex-user"}, sessions, "episode-1", &components.Metadata{
+		Type: "episode", ParentTitle: &parentTitle,
+	})
+	if presentation.ShowTitle != show {
+		t.Fatalf("metadata fallback replaced session show title: %q", presentation.ShowTitle)
+	}
+	if presentation.SeasonNumber == nil || *presentation.SeasonNumber != season || presentation.EpisodeNumber == nil || *presentation.EpisodeNumber != episode || presentation.EpisodeTitle != "Session Episode" {
+		t.Fatalf("session episode fields were not preserved: %+v", presentation)
+	}
+}
+
+func TestEpisodeMetadataUsesParentTitleOnlyWithoutSessionShowTitle(t *testing.T) {
+	parentTitle := "Season 4"
+	presentation := presentationFromMetadata(User{}, []sessionMetadata{{Key: "episode-1", Type: "episode", Title: "Episode"}}, "episode-1", &components.Metadata{
+		Type: "episode", ParentTitle: &parentTitle,
+	})
+	if presentation.ShowTitle != parentTitle {
+		t.Fatalf("explicit parent-title fallback = %q, want %q", presentation.ShowTitle, parentTitle)
+	}
+}
+
 func TestFFmpegLimiterReleaseIsIdempotent(t *testing.T) {
 	limiter := newFFmpegLimiter(1)
 	release, err := limiter.acquire(context.Background())
@@ -215,6 +244,67 @@ func TestRenderJobOwnershipTerminalStateAndDownload(t *testing.T) {
 		t.Fatalf("partial output still exists: %v", err)
 	}
 	release()
+}
+
+func TestTerminalEvictionCannotRaceDownloadLeaseAcquisition(t *testing.T) {
+	manager, err := newRenderJobManager(t.TempDir(), writeRenderOutput)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer manager.stopAndWait()
+	job, err := manager.enqueue("owner-a", renderTestSpec("owner-a"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitRenderStatus(t, manager, job.id, "owner-a", renderSucceeded)
+
+	evictionEntered := make(chan struct{})
+	allowEviction := make(chan struct{})
+	manager.terminalDeleteHook = func() {
+		close(evictionEntered)
+		<-allowEviction
+	}
+	evictionDone := make(chan struct{})
+	go func() {
+		manager.removeTerminalJob(job)
+		close(evictionDone)
+	}()
+	select {
+	case <-evictionEntered:
+	case <-time.After(time.Second):
+		t.Fatal("terminal eviction did not reach synchronization point")
+	}
+
+	downloadDone := make(chan struct {
+		path    string
+		release func()
+		err     error
+	}, 1)
+	go func() {
+		path, release, err := manager.acquireDownload(job.id, "owner-a")
+		downloadDone <- struct {
+			path    string
+			release func()
+			err     error
+		}{path: path, release: release, err: err}
+	}()
+	select {
+	case result := <-downloadDone:
+		t.Fatalf("download acquired while eviction held its locks: %+v", result.err)
+	case <-time.After(25 * time.Millisecond):
+	}
+	close(allowEviction)
+	<-evictionDone
+	result := <-downloadDone
+	if !errors.Is(result.err, errRenderNotFound) {
+		if result.release != nil {
+			result.release()
+		}
+		t.Fatalf("download/eviction interleaving error = %v, want not found", result.err)
+	}
+	if _, err := os.Stat(filepath.Join(job.dir, "output.mp4")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("evicted render output remains: %v", err)
+	}
 }
 
 func TestRenderJobExpirationRespectsDownloadLease(t *testing.T) {

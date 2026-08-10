@@ -3,6 +3,7 @@ package main
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/spf13/viper"
@@ -76,6 +77,36 @@ func TestFFmpegConcurrencyConfig(t *testing.T) {
 				t.Fatalf("ffmpeg.concurrency = %d, want %d", got, test.want)
 			}
 		})
+	}
+}
+
+func TestDurableStorageConfig(t *testing.T) {
+	config := loadConfigForTest(t, "plex:\n  host: http://plex\n"+
+		"storage:\n  root: /srv/cutscene\n  database: metadata.sqlite3\n")
+	if config.Storage.Root != "/srv/cutscene" || config.Storage.Database != "metadata.sqlite3" {
+		t.Fatalf("storage config = root %q database %q", config.Storage.Root, config.Storage.Database)
+	}
+}
+
+func TestComposeMountsDurableStorageWithoutTransientRenderRoot(t *testing.T) {
+	compose, err := os.ReadFile("docker-compose.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	composeText := string(compose)
+	if !strings.Contains(composeText, "cutscene-data:/data") || !strings.Contains(composeText, "volumes:\n  cutscene-data:") {
+		t.Fatalf("Compose does not declare the durable /data volume:\n%s", composeText)
+	}
+	if strings.Contains(composeText, "      - /tmp") {
+		t.Fatal("Compose must not persist transient /tmp render jobs")
+	}
+
+	sample, err := os.ReadFile("config.example.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(sample), "root: /data") {
+		t.Fatal("config.example.yaml does not document the Compose durable root")
 	}
 }
 

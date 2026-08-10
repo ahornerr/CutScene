@@ -15,8 +15,15 @@ export default function RenderJobBar({
   audioMode, onAudioModeChange,
   renderState, jobSpec, controlsChangedSinceJob,
   onCreateJob, onDownload, onRetry, onRetryPoll, onCreateNew,
+  onOpenClip,
 }) {
-  const {status, error, downloadUrl, expiresAt, retryAfter} = renderState
+  const {status, error, downloadUrl, expiresAt, retryAfter, clipId} = renderState
+  // A successful render is promoted to a durable saved clip (see clips.go).
+  // The terminal job response carries clipId; we surface a discoverable
+  // "Open in library" affordance that is visually distinct from the transient
+  // download (which expires after one hour). The transient download stays the
+  // primary quick-grab action; the saved clip is the durable artifact.
+  const savedToLibrary = Boolean(clipId) && (status === JOB_STATES.SUCCEEDED || status === JOB_STATES.EXPIRED)
   const spec = formatJobSpec(jobSpec)
   const ready = startPosition != null && endPosition != null && endPosition - startPosition >= 500
   const busy = status === JOB_STATES.QUEUED || status === JOB_STATES.RUNNING
@@ -174,14 +181,18 @@ export default function RenderJobBar({
       </Box>
 
       {/* Live job-state announcement for screen readers */}
-      {status && (
-        <Box aria-live="polite" sx={{position: 'absolute', width: 1, height: 1, overflow: 'hidden', clip: 'rect(0,0,0,0)'}}>
-          Render job status: {jobStatusLabel(status)}
-          {status === JOB_STATES.SUCCEEDED && downloadUrl ? '. Download ready.' : ''}
-          {status === JOB_STATES.FAILED && error ? `. ${jobErrorMessage(error)}` : ''}
-          {status === JOB_STATES.EXPIRED ? '. The clip has expired.' : ''}
-        </Box>
-      )}
+      {status && (() => {
+        const parts = [`Render job status: ${jobStatusLabel(status)}.`]
+        if (status === JOB_STATES.SUCCEEDED && downloadUrl) parts.push('Download ready.')
+        if (savedToLibrary) parts.push('Saved to your clip library.')
+        if (status === JOB_STATES.FAILED && error) parts.push(jobErrorMessage(error))
+        if (status === JOB_STATES.EXPIRED) parts.push('The transient download has expired.')
+        return (
+          <Box aria-live="polite" sx={{position: 'absolute', width: 1, height: 1, overflow: 'hidden', clip: 'rect(0,0,0,0)'}}>
+            {parts.join(' ')}
+          </Box>
+        )
+      })()}
 
       {/* Render failure message */}
       {isRenderFailure && error && (
@@ -235,6 +246,27 @@ export default function RenderJobBar({
           </Typography>
           <Button variant="outlined" size="small" color="primary" onClick={onCreateNew} sx={{px: 2, py: 0.5}}>
             Render new clip
+          </Button>
+        </Box>
+      )}
+
+      {/* Saved-clip discoverability. A successful render is promoted to a
+          durable clip; surface it here without displacing the transient
+          download above. The transient download expires after one hour, the
+          saved clip does not. */}
+      {savedToLibrary && onOpenClip && (
+        <Box sx={{mt: 1.5, pt: 1.5, borderTop: '1px solid rgba(255,255,255,0.06)'}}>
+          <Typography variant="caption" sx={{color: '#7fd391', display: 'block', mb: 0.75}}>
+            Saved to your clip library.
+          </Typography>
+          <Button
+            variant="outlined"
+            size="small"
+            color="primary"
+            onClick={() => onOpenClip(clipId)}
+            sx={{px: 2, py: 0.5, borderColor: 'rgba(255,115,0,0.4)'}}
+          >
+            Open in library
           </Button>
         </Box>
       )}

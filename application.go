@@ -1,17 +1,25 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"image"
+	_ "image/gif"
+	_ "image/jpeg"
+	_ "image/png"
 	"io"
+	"log"
+	"mime"
 	"net/http"
 	"net/url"
 	"os"
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/LukeHagar/plexgo"
 	"github.com/LukeHagar/plexgo/models/components"
@@ -180,12 +188,15 @@ type Application struct {
 	plexTv            *PlexTV
 	machineIdentifier string
 	ownerEmail        string
+	ownerUUID         string
 	subtitleCache     *subtitleCache
 	ffmpegLimiter     *ffmpegLimiter
 	renderJobs        *renderJobManager
+	clipStore         *clipStore
 	lifetime          context.Context
 	cancelLifetime    context.CancelFunc
 	closeOnce         sync.Once
+	closeErr          error
 }
 
 func NewApplication(config Config) (*Application, error) {
@@ -217,6 +228,7 @@ func NewApplication(config Config) (*Application, error) {
 	}
 
 	app.ownerEmail = tokenDetails.UserPlexAccount.Email
+	app.ownerUUID = tokenDetails.UserPlexAccount.UUID
 
 	// TODO: If configured, ignore auth from context and just use the configured token for all requests
 	app.plexUser = plexgo.New(
@@ -224,8 +236,32 @@ func NewApplication(config Config) (*Application, error) {
 		plexgo.WithSecuritySource(app.plexSecurityUserToken),
 	)
 
-	app.renderJobs, err = newRenderJobManagerWithContext(app.lifetime, renderRoot, app.executeRenderSpec)
+	app.clipStore, err = newClipStore(durableStorageRoot(config), config.Storage.Database)
 	if err != nil {
+		return nil, fmt.Errorf("could not initialize clip storage: %w", err)
+	}
+	app.renderJobs, err = newRenderJobManagerWithContextAndPromotion(app.lifetime, renderRoot, app.executeRenderSpec, func(job *renderJob, outputPath string) error {
+		artworkContext, cancelArtwork := context.WithTimeout(app.lifetime, 30*time.Second)
+		defer cancelArtwork()
+		artworkPath, artworkMIME, artworkErr := app.fetchClipArtwork(artworkContext, job.spec.ThumbnailURL)
+		if artworkErr != nil {
+			log.Printf("clip artwork snapshot unavailable: %s", redactedDiagnostic(artworkErr))
+		}
+		if artworkPath != "" {
+			defer os.Remove(artworkPath)
+		}
+		clip, promoteErr := app.clipStore.promoteWithArtwork(job.spec, outputPath, artworkPath, artworkMIME)
+		if promoteErr != nil {
+			return newRenderStageFailure("storage", "storage_full", promoteErr)
+		}
+		job.mu.Lock()
+		job.clipID = clip.ID
+		job.shareURL = clipShareURLForDomain(config.API.Domain, clip.ShareToken)
+		job.mu.Unlock()
+		return nil
+	})
+	if err != nil {
+		_ = app.clipStore.close()
 		return nil, fmt.Errorf("could not initialize render jobs: %w", err)
 	}
 
@@ -239,14 +275,160 @@ func (a *Application) Close() error {
 		return nil
 	}
 	a.closeOnce.Do(func() {
-		if a.cancelLifetime != nil {
-			a.cancelLifetime()
-		}
-		if a.renderJobs != nil {
-			a.renderJobs.stopAndWait()
+		a.stopWork()
+		if a.clipStore != nil {
+			if err := a.clipStore.close(); err != nil {
+				a.closeErr = err
+				log.Printf("clip storage close failed: %s", redactedDiagnostic(err))
+			}
 		}
 	})
-	return nil
+	return a.closeErr
+}
+
+const maxClipArtworkBytes int64 = 8 << 20
+
+func (a *Application) fetchClipArtwork(ctx context.Context, artworkPath string) (string, string, error) {
+	if strings.TrimSpace(artworkPath) == "" {
+		return "", "", nil
+	}
+	base, err := url.Parse(a.config.Plex.Host)
+	if err != nil {
+		return "", "", err
+	}
+	if (base.Scheme != "http" && base.Scheme != "https") || base.Host == "" || base.User != nil {
+		return "", "", errors.New("configured Plex origin is invalid")
+	}
+	if strings.HasPrefix(artworkPath, "//") {
+		return "", "", errors.New("scheme-relative artwork URL is not allowed")
+	}
+	parsed, err := url.Parse(artworkPath)
+	if err != nil {
+		return "", "", err
+	}
+	if parsed.User != nil {
+		return "", "", errors.New("artwork URL userinfo is not allowed")
+	}
+	if !parsed.IsAbs() && !strings.HasPrefix(parsed.Path, "/") {
+		return "", "", errors.New("artwork URL must be an absolute Plex path")
+	}
+	if parsed.IsAbs() && (!strings.EqualFold(parsed.Scheme, base.Scheme) || !strings.EqualFold(parsed.Host, base.Host)) {
+		return "", "", errors.New("clip artwork is not hosted by configured Plex")
+	}
+	if !parsed.IsAbs() {
+		parsed = base.ResolveReference(parsed)
+	}
+	if parsed.User != nil || !strings.EqualFold(parsed.Scheme, base.Scheme) || !strings.EqualFold(parsed.Host, base.Host) {
+		return "", "", errors.New("clip artwork origin is not the configured Plex origin")
+	}
+	query := parsed.Query()
+	query.Set("X-Plex-Token", a.config.Plex.Token)
+	parsed.RawQuery = query.Encode()
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, parsed.String(), nil)
+	if err != nil {
+		return "", "", err
+	}
+	client := &http.Client{CheckRedirect: func(next *http.Request, via []*http.Request) error {
+		if len(via) == 0 {
+			return nil
+		}
+		previous := via[0].URL
+		if next.URL.User != nil || !strings.EqualFold(next.URL.Scheme, previous.Scheme) || !strings.EqualFold(next.URL.Host, previous.Host) {
+			return errors.New("artwork redirect leaves configured Plex origin")
+		}
+		return nil
+	}}
+	response, err := client.Do(request)
+	if err != nil {
+		return "", "", err
+	}
+	defer response.Body.Close()
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		return "", "", fmt.Errorf("artwork returned status %d", response.StatusCode)
+	}
+	contentType, _, err := mime.ParseMediaType(response.Header.Get("Content-Type"))
+	if err != nil {
+		return "", "", errors.New("artwork response has invalid content type")
+	}
+	data, err := io.ReadAll(io.LimitReader(response.Body, maxClipArtworkBytes+1))
+	if err != nil || int64(len(data)) == 0 || int64(len(data)) > maxClipArtworkBytes {
+		if err != nil {
+			return "", "", err
+		}
+		return "", "", errors.New("artwork response is empty or too large")
+	}
+	if err := validateRasterArtwork(contentType, data); err != nil {
+		return "", "", err
+	}
+	tmp, err := os.CreateTemp("", "cutscene-artwork-*")
+	if err != nil {
+		return "", "", err
+	}
+	tmpPath := tmp.Name()
+	count, copyErr := io.Copy(tmp, bytes.NewReader(data))
+	closeErr := tmp.Close()
+	if copyErr != nil || closeErr != nil || count == 0 || count > maxClipArtworkBytes {
+		_ = os.Remove(tmpPath)
+		if copyErr != nil {
+			return "", "", copyErr
+		}
+		if closeErr != nil {
+			return "", "", closeErr
+		}
+		return "", "", errors.New("artwork response is empty or too large")
+	}
+	return tmpPath, contentType, nil
+}
+
+func validateRasterArtwork(contentType string, data []byte) error {
+	switch strings.ToLower(contentType) {
+	case "image/jpeg", "image/png", "image/gif":
+		_, format, err := image.DecodeConfig(bytes.NewReader(data))
+		if err != nil || format == "" {
+			return errors.New("artwork bytes are not a valid raster image")
+		}
+		return nil
+	case "image/webp":
+		if len(data) < 12 || string(data[:4]) != "RIFF" || string(data[8:12]) != "WEBP" {
+			return errors.New("artwork bytes are not a valid WebP image")
+		}
+		return nil
+	default:
+		return errors.New("artwork response is not an allowed raster image")
+	}
+}
+
+// stopWork cancels request-scoped background work without closing durable
+// storage. API shutdown uses this before draining HTTP handlers so handlers
+// can finish their SQLite/file operations safely.
+func (a *Application) stopWork() {
+	if a == nil {
+		return
+	}
+	if a.cancelLifetime != nil {
+		a.cancelLifetime()
+	}
+	if a.renderJobs != nil {
+		a.renderJobs.stopAndWait()
+	}
+}
+
+func normalizeOwnerIdentity(value string) string {
+	return strings.ToLower(strings.TrimSpace(value))
+}
+
+// isServerOwner is the single administrator invariant. Plex account UUID is
+// stable and preferred; older/test identities without UUID fall back to the
+// normalized account email captured from the configured server-owner token.
+func (a *Application) isServerOwner(user *User) bool {
+	if a == nil || user == nil {
+		return false
+	}
+	if ownerUUID := normalizeOwnerIdentity(a.ownerUUID); ownerUUID != "" && normalizeOwnerIdentity(user.Uuid) != "" {
+		return ownerUUID == normalizeOwnerIdentity(user.Uuid)
+	}
+	ownerEmail := normalizeOwnerIdentity(a.ownerEmail)
+	return ownerEmail != "" && ownerEmail == normalizeOwnerIdentity(user.Email)
 }
 
 func (a *Application) operationContext(parent context.Context) (context.Context, func()) {
@@ -282,7 +464,7 @@ func (a *Application) GetValidatedUser(ctx context.Context) (*User, error) {
 		return nil, err
 	}
 
-	if user.Email == a.ownerEmail {
+	if a.isServerOwner(user) {
 		return user, nil
 	}
 
@@ -330,7 +512,7 @@ func (a *Application) GetSessions(ctx context.Context) ([]sessionMetadata, error
 	}
 
 	user := UserFromContext(ctx)
-	serverOwner := user != nil && user.Email == a.ownerEmail
+	serverOwner := a.isServerOwner(user)
 	for i := range sessions.MediaContainer.Metadata {
 		sessions.MediaContainer.Metadata[i].OwnedByCurrentUser = sessionOwnedByCurrentUser(sessions.MediaContainer.Metadata[i], user, serverOwner)
 	}

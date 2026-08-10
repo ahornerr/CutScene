@@ -1615,3 +1615,105 @@ test('theater toggle is not rendered before a session is selected', async () => 
 
   expect(screen.queryByRole('button', {name: 'Theater mode'})).not.toBeInTheDocument();
 });
+
+// ---------------------------------------------------------------------------
+// Clip library navigation + saved-clip discoverability
+// ---------------------------------------------------------------------------
+
+test('the Clips header button opens the library and Back returns to sessions', async () => {
+  const pending = installFetch();
+  render(<App/>);
+  await flush();
+
+  // Header exposes a Clips navigation affordance once authenticated.
+  const clipsBtn = screen.getByRole('button', {name: 'Clips'});
+  fireEvent.click(clipsBtn);
+  await flush();
+
+  // The library fetches /clips; resolve with the authenticated list shape
+  // {clips, isAdmin} to confirm the view switched.
+  const clipsReq = requestFor(pending, url => url === '/clips');
+  await resolveRequest(clipsReq, {clips: [], isAdmin: false});
+  expect(screen.getByText('No saved clips yet.')).toBeInTheDocument();
+  // The session picker is no longer rendered.
+  expect(screen.queryByText('Pick something to clip')).not.toBeInTheDocument();
+
+  // Back returns to the session picker.
+  fireEvent.click(screen.getByRole('button', {name: 'Back to sessions'}));
+  await flush();
+  expect(screen.getByText('Pick something to clip')).toBeInTheDocument();
+});
+
+test('navigating to the clip library pauses session polling (no /sessions fetches while away)', async () => {
+  jest.useFakeTimers();
+  const {sessionRequests, pending} = installTrackedSessionsFetch();
+  render(<App/>);
+  await resolveRequest(sessionRequests[0], sessions);
+
+  // Navigate to the library view.
+  fireEvent.click(screen.getByRole('button', {name: 'Clips'}));
+  await flush();
+  // Resolve the clips list so the library view settles.
+  const clipsReq = requestFor(pending, url => url === '/clips');
+  await resolveRequest(clipsReq, {clips: [], isAdmin: false});
+
+  // Advance well past the 10s refresh cadence; no new /sessions fetch fires.
+  const sessionsBefore = sessionRequests.length;
+  await advancePolling(20000);
+  expect(sessionRequests.length).toBe(sessionsBefore);
+
+  // Returning home resumes the refresh cadence immediately.
+  fireEvent.click(screen.getByRole('button', {name: 'Back to sessions'}));
+  await flush();
+  expect(sessionRequests.length).toBe(sessionsBefore + 1);
+});
+
+test('a successful render surfaces the saved clip via Open in library without losing the transient download', async () => {
+  jest.useFakeTimers();
+  const pending = installFetch();
+  render(<App/>);
+  await flush();
+  await selectSession('Alpha');
+  fireEvent.click(screen.getByRole('button', {name: 'Render clip'}));
+  const createRequest = requestFor(pending, url => url === '/render-jobs');
+  await resolveRequestWith(createRequest, {id: 'job-saved', status: 'queued'}, {status: 202});
+
+  let poll = requestFor(pending, url => url === '/render-jobs/job-saved');
+  await resolveRequest(poll, {id: 'job-saved', status: 'running'});
+  await advancePolling();
+  poll = pending.filter(r => r.url === '/render-jobs/job-saved').slice(-1)[0];
+
+  // A successful render is promoted to a durable clip; the terminal response
+  // carries clipId alongside the transient downloadUrl.
+  const expiresAt = new Date(Date.now() + 1500).toISOString();
+  await resolveRequest(poll, {
+    id: 'job-saved', status: 'succeeded',
+    downloadUrl: '/render-jobs/job-saved/download', expiresAt,
+    clipId: 'clip-saved', shareUrl: 'https://clips.example.test/shared/clips/tok/download',
+  });
+
+  // The transient download remains the primary quick-grab action.
+  expect(screen.getByRole('link', {name: 'Download clip'})).toHaveAttribute('href', '/render-jobs/job-saved/download');
+  // The durable saved clip is surfaced distinctly.
+  expect(screen.getByText('Saved to your clip library.')).toBeInTheDocument();
+  expect(screen.getByText(/Render job status: Ready\. Download ready\. Saved to your clip library\./))
+    .toHaveAttribute('aria-live', 'polite');
+
+  // Opening the saved clip navigates to the detail view, which fetches the
+  // clip metadata. The workspace state is retained (returning is possible).
+  fireEvent.click(screen.getByRole('button', {name: 'Open in library'}));
+  await flush();
+  const detailReq = requestFor(pending, url => url === '/clips/clip-saved');
+  await resolveRequest(detailReq, {
+    id: 'clip-saved', title: 'Alpha scene', ratingKey: 'A', mediaId: 101,
+    fromMs: 0, toMs: 60000, createdAt: '2026-08-01T12:00:00.000Z',
+    shareUrl: 'https://clips.example.test/shared/clips/tok/download',
+    downloadUrl: '/clips/clip-saved/download',
+    publicDownloadUrl: 'https://clips.example.test/shared/clips/tok/download',
+    canDelete: true,
+    isAdmin: false,
+  });
+  expect(screen.getByText('Alpha scene')).toBeInTheDocument();
+  // Browser playback uses the inline public download URL (shareUrl === publicDownloadUrl).
+  expect(document.querySelector('video').getAttribute('src')).toBe('https://clips.example.test/shared/clips/tok/download');
+});

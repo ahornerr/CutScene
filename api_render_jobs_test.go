@@ -180,7 +180,7 @@ func TestGetSessionsAnnotatesOwnershipByNumericUserID(t *testing.T) {
 func testAuthenticatedRoute(handler fiber.Handler) *fiber.App {
 	app := fiber.New()
 	app.Use(func(ctx fiber.Ctx) error {
-		ctx.SetUserContext(ContextWithUser(context.Background(), User{Uuid: "owner-a"}))
+		ctx.SetUserContext(ContextWithUser(context.Background(), User{Uuid: "owner-a", Email: "owner@example.com"}))
 		return ctx.Next()
 	})
 	app.All("/*", handler)
@@ -190,7 +190,7 @@ func testAuthenticatedRoute(handler fiber.Handler) *fiber.App {
 func testAuthenticatedParamRoute(method, path string, handler fiber.Handler) *fiber.App {
 	app := fiber.New()
 	authenticated := func(ctx fiber.Ctx) error {
-		ctx.SetUserContext(ContextWithUser(context.Background(), User{Uuid: "owner-a"}))
+		ctx.SetUserContext(ContextWithUser(context.Background(), User{Uuid: "owner-a", Email: "owner@example.com"}))
 		return handler(ctx)
 	}
 	app.Add([]string{method}, path, authenticated)
@@ -404,6 +404,7 @@ func TestPreviewHandlerReturnsBeforeStreamingCallback(t *testing.T) {
 	config.Plex.Host = plex.URL
 	application := &Application{
 		config:        config,
+		ownerEmail:    "owner@example.com",
 		plexAdmin:     plexgo.New(plexgo.WithServerURL(plex.URL), plexgo.WithSecurity(config.Plex.Token)),
 		ffmpegLimiter: newFFmpegLimiter(1),
 	}
@@ -570,6 +571,7 @@ func TestPreviewColdCacheUsesExternalSubtitleStream(t *testing.T) {
 	config.Plex.Host = plex.URL
 	application := &Application{
 		config:        config,
+		ownerEmail:    "owner@example.com",
 		plexAdmin:     plexgo.New(plexgo.WithServerURL(plex.URL), plexgo.WithSecurity(config.Plex.Token)),
 		subtitleCache: newSubtitleCache(4),
 		ffmpegLimiter: newFFmpegLimiter(1),
@@ -649,6 +651,7 @@ func TestRenderJobCreateAcceptsKeylessAuthorizedSessionPart(t *testing.T) {
 	config.Plex.Token = "admin-token"
 	app := &Application{
 		config:     config,
+		ownerEmail: "owner@example.com",
 		plexAdmin:  plexgo.New(plexgo.WithServerURL(plex.URL), plexgo.WithSecurity(config.Plex.Token)),
 		renderJobs: manager,
 	}
@@ -877,6 +880,71 @@ func TestAPIShutdownCancelsActivePreviewBeforeHTTPDrain(t *testing.T) {
 	case <-serveDone:
 	case <-time.After(time.Second):
 		t.Fatal("HTTP server did not stop")
+	}
+}
+
+func TestAPIShutdownDrainsClipHandlerBeforeClosingStorage(t *testing.T) {
+	store, err := newClipStore(t.TempDir(), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	lifetime, cancelLifetime := context.WithCancel(context.Background())
+	application := &Application{clipStore: store, lifetime: lifetime, cancelLifetime: cancelLifetime}
+	started := make(chan struct{})
+	releaseHandler := make(chan struct{})
+	handlerErr := make(chan error, 1)
+	fiberApp := fiber.New()
+	fiberApp.Get("/clip", func(_ fiber.Ctx) error {
+		close(started)
+		<-releaseHandler
+		_, err := application.clipStore.list("", true)
+		handlerErr <- err
+		return nil
+	})
+	listener := fasthttputil.NewInmemoryListener()
+	serveDone := make(chan error, 1)
+	go func() { serveDone <- fiberApp.Listener(listener, fiber.ListenConfig{DisableStartupMessage: true}) }()
+	conn, err := listener.Dial()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if _, err := io.WriteString(conn, "GET /clip HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n"); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("clip handler did not start")
+	}
+
+	api := &API{app: application, http: fiberApp}
+	shutdownDone := make(chan error, 1)
+	go func() { shutdownDone <- api.Shutdown() }()
+	select {
+	case err := <-shutdownDone:
+		t.Fatalf("shutdown completed before handler drained: %v", err)
+	case <-time.After(25 * time.Millisecond):
+	}
+	if err := store.db.Ping(); err != nil {
+		t.Fatalf("clip storage closed before HTTP drain: %v", err)
+	}
+	close(releaseHandler)
+	if err := <-handlerErr; err != nil {
+		t.Fatalf("clip handler could not use storage during drain: %v", err)
+	}
+	select {
+	case err := <-shutdownDone:
+		if err != nil && !errors.Is(err, fiber.ErrNotRunning) {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("shutdown did not finish after handler drained")
+	}
+	select {
+	case <-serveDone:
+	case <-time.After(time.Second):
+		t.Fatal("Fiber server did not stop")
 	}
 }
 
