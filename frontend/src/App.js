@@ -5,6 +5,8 @@ import {
 } from "@mui/material";
 import SessionPicker from "./components/SessionPicker";
 import ClipWorkspace from "./components/ClipWorkspace";
+import ClipLibrary from "./components/ClipLibrary";
+import ClipDetail from "./components/ClipDetail";
 import {stripSubtitleMarkup} from "./components/subtitle-markup";
 import {
   buildRenderJobRequest, buildRenderJobRequestFromSpec, isTerminal, isActive, JOB_STATES, snapshotJobSpec, AUDIO_MODES,
@@ -19,6 +21,14 @@ const MAX_NETWORK_RETRIES = 5
 const EXPIRY_TICK_MS = 1000
 
 function App() {
+  // --- Navigation view ---
+  // Smallest suitable routing: an in-app view state instead of a router
+  // dependency. 'home' renders the session picker / active workspace; 'library'
+  // renders the saved-clip library; 'clip' renders a single clip detail. The
+  // workspace state (selectedSession, render job, etc.) is retained across
+  // navigation so the render workflow is never disrupted.
+  const [view, setView] = useState({name: 'home'})
+
   // --- Session list ---
   const [sessions, setSessions] = useState(null)
   const [sessionsError, setSessionsError] = useState(null)
@@ -63,7 +73,7 @@ function App() {
   const [subtitleSelectionEnd, setSubtitleSelectionEnd] = useState(-1)
 
   // --- Render job ---
-  const [renderState, setRenderState] = useState({status: null, error: null, downloadUrl: null, expiresAt: null, retryAfter: null})
+  const [renderState, setRenderState] = useState({status: null, error: null, downloadUrl: null, expiresAt: null, retryAfter: null, clipId: null, shareUrl: null})
   const [jobSpec, setJobSpec] = useState(null)
   const [downloadCompleted, setDownloadCompleted] = useState(false)
   const [controlsChangedSinceJob, setControlsChangedSinceJob] = useState(false)
@@ -104,7 +114,7 @@ function App() {
 
   const resetRenderState = useCallback(() => {
     stopPolling()
-    setRenderState({status: null, error: null, downloadUrl: null, expiresAt: null, retryAfter: null})
+    setRenderState({status: null, error: null, downloadUrl: null, expiresAt: null, retryAfter: null, clipId: null, shareUrl: null})
     setJobSpec(null)
     jobIdRef.current = null
     setDownloadCompleted(false)
@@ -209,7 +219,10 @@ function App() {
   }, [])
 
   useEffect(() => {
-    const pickerVisible = !selectedSession && !needsAuth && documentVisible
+    // Session polling is gated to the home view: the library and clip detail
+    // views don't need live session data, and polling in the background
+    // would compete for the network and surface stale workspace alerts.
+    const pickerVisible = view.name === 'home' && !selectedSession && !needsAuth && documentVisible
     if (!pickerVisible) {
       stopSessionRefresh()
       return undefined
@@ -218,7 +231,7 @@ function App() {
     sessionRefreshActiveRef.current = true
     refreshSessions()
     return stopSessionRefresh
-  }, [documentVisible, needsAuth, refreshSessions, selectedSession, sessionsRetry, stopSessionRefresh])
+  }, [documentVisible, needsAuth, refreshSessions, selectedSession, sessionsRetry, stopSessionRefresh, view.name])
 
   const retrySessions = useCallback(() => {
     stopSessionRefresh()
@@ -576,14 +589,14 @@ function App() {
       setRenderState({
         status: JOB_STATES.FAILED,
         error: {code: 'validation_error', message: error?.message || 'The selected media part has an invalid media ID.', retryable: false},
-        downloadUrl: null, expiresAt: null, retryAfter: null,
+        downloadUrl: null, expiresAt: null, retryAfter: null, clipId: null, shareUrl: null,
       })
       return
     }
 
     setJobSpec(spec)
     setControlsChangedSinceJob(false)
-    setRenderState({status: JOB_STATES.QUEUED, error: null, downloadUrl: null, expiresAt: null, retryAfter: null})
+    setRenderState({status: JOB_STATES.QUEUED, error: null, downloadUrl: null, expiresAt: null, retryAfter: null, clipId: null, shareUrl: null})
 
     const controller = new AbortController()
     pollControllerRef.current = controller
@@ -617,6 +630,8 @@ function App() {
           downloadUrl: job.downloadUrl || null,
           expiresAt: job.expiresAt || null,
           retryAfter: null,
+          clipId: job.clipId || null,
+          shareUrl: job.shareUrl || null,
         })
         pollForJobRef.current(job.id, controller)
       })
@@ -625,7 +640,7 @@ function App() {
         setRenderState({
           status: JOB_STATES.FAILED,
           error: {code: 'request_error', message: err?.message || 'Could not start rendering.', retryable: err?.retryable || false},
-          downloadUrl: null, expiresAt: null, retryAfter: err?.retryAfter || null,
+          downloadUrl: null, expiresAt: null, retryAfter: err?.retryAfter || null, clipId: null, shareUrl: null,
         })
       })
   }, [selectedSession, startPosition, endPosition, selectedSubtitle, subtitleStreams, audioMode, subtitleOffsetMs, stopPolling])
@@ -664,6 +679,8 @@ function App() {
               downloadUrl: job.downloadUrl || null,
               expiresAt: job.expiresAt || null,
               retryAfter: null,
+              clipId: job.clipId || null,
+              shareUrl: job.shareUrl || null,
             })
             if (!isTerminal(job.status)) {
               pollTimeoutRef.current = setTimeout(poll, POLL_INTERVAL_MS)
@@ -672,14 +689,14 @@ function App() {
           .catch(err => {
             if (controller.signal.aborted || isAbortError(err)) return
             if (err?.message === '__gone__') {
-              setRenderState({status: JOB_STATES.EXPIRED, error: null, downloadUrl: null, expiresAt: null, retryAfter: null})
+              setRenderState(prev => ({...prev, status: JOB_STATES.EXPIRED, error: null, downloadUrl: null, expiresAt: null, retryAfter: null}))
               return
             }
             if (err?.message === '__auth__') {
               setRenderState({
                 status: JOB_STATES.FAILED,
                 error: {code: 'auth_error', message: 'Authentication expired. Reload the page and sign in again.', retryable: false},
-                downloadUrl: null, expiresAt: null, retryAfter: null,
+                downloadUrl: null, expiresAt: null, retryAfter: null, clipId: null, shareUrl: null,
               })
               return
             }
@@ -690,7 +707,7 @@ function App() {
                 setRenderState({
                   status: JOB_STATES.FAILED,
                   error: {code: 'service_unavailable', message: 'The server is temporarily unavailable. Try again later.', retryable: true},
-                  downloadUrl: null, expiresAt: null, retryAfter: null,
+                  downloadUrl: null, expiresAt: null, retryAfter: null, clipId: null, shareUrl: null,
                 })
                 return
               }
@@ -704,7 +721,7 @@ function App() {
               setRenderState({
                 status: JOB_STATES.FAILED,
                 error: {code: 'network_error', message: 'Lost connection to the server. Check your network and try again.', retryable: true},
-                downloadUrl: null, expiresAt: null, retryAfter: null,
+                downloadUrl: null, expiresAt: null, retryAfter: null, clipId: null, shareUrl: null,
               })
               return
             }
@@ -761,8 +778,10 @@ function App() {
     const tick = () => {
       setExpiryTick(t => t + 1)
       if (Date.now() >= expiresDate.getTime()) {
-        // Transition to expired — clear the download URL so it can't be used.
+        // The transient download expires; the durable saved clip (clipId)
+        // persists in the library and remains discoverable.
         setRenderState(prev => ({
+          ...prev,
           status: JOB_STATES.EXPIRED,
           error: null,
           downloadUrl: null,
@@ -801,7 +820,7 @@ function App() {
     setStreamsLoading(false)
     setStreamsError(null)
     setSubtitlesError(null)
-    setRenderState({status: null, error: null, downloadUrl: null, expiresAt: null, retryAfter: null})
+    setRenderState({status: null, error: null, downloadUrl: null, expiresAt: null, retryAfter: null, clipId: null, shareUrl: null})
     setJobSpec(null)
     jobIdRef.current = null
     setDownloadCompleted(false)
@@ -818,6 +837,16 @@ function App() {
     stopSessionRefresh()
     setSelectedSession(session)
   }, [stopSessionRefresh])
+
+  // ---------------------------------------------------------------- clip library navigation
+  const openLibrary = useCallback(() => setView({name: 'library'}), [])
+  const openClip = useCallback((clipId) => setView({name: 'clip', clipId}), [])
+  const goHome = useCallback(() => setView({name: 'home'}), [])
+  const handleClipDeleted = useCallback(() => {
+    // After deleting from the detail view, return to the library (which
+    // re-fetches and reconciles).
+    setView({name: 'library'})
+  }, [])
 
   // ---------------------------------------------------------------- cleanup on unmount
   useEffect(() => {
@@ -839,7 +868,18 @@ function App() {
       <Box className="cs-shell-bar" component="header">
         <Container maxWidth="lg">
           <Toolbar disableGutters sx={{gap: 2, minHeight: 64}}>
-            <Box sx={{display: 'flex', alignItems: 'baseline', gap: 0}}>
+            <Box
+              component="button"
+              type="button"
+              onClick={goHome}
+              aria-label="CutScene home"
+              sx={{
+                display: 'flex', alignItems: 'baseline', gap: 0,
+                background: 'none', border: 0, padding: 0, cursor: 'pointer',
+                color: 'inherit', fontFamily: 'inherit',
+                '&:focus-visible': {outline: '2px solid #ff7300', outlineOffset: 4, borderRadius: 2},
+              }}
+            >
               <Typography variant="h5" component="h1" sx={{fontWeight: 700, letterSpacing: '-0.02em'}}>
                 Cut
               </Typography>
@@ -848,12 +888,25 @@ function App() {
               </Typography>
             </Box>
             <Box sx={{flex: 1}}/>
+            {!needsAuth && (
+              <Button
+                variant={view.name === 'library' || view.name === 'clip' ? 'contained' : 'text'}
+                color="primary"
+                onClick={openLibrary}
+                sx={view.name === 'library' || view.name === 'clip'
+                  ? {px: 2, py: 0.5}
+                  : {color: 'text.secondary', '&:hover': {color: '#ffd9b0'}}}
+                aria-current={view.name === 'library' || view.name === 'clip' ? 'page' : undefined}
+              >
+                Clips
+              </Button>
+            )}
           </Toolbar>
         </Container>
       </Box>
 
       <Box component="main" sx={{flex: 1, py: {xs: 2, md: 3}, position: 'relative', zIndex: 2}}>
-        <Container className="cs-main-container" maxWidth={selectedSession && theaterMode ? 'xl' : 'lg'}>
+        <Container className="cs-main-container" maxWidth={selectedSession && theaterMode && view.name === 'home' ? 'xl' : 'lg'}>
           {needsAuth ? (
             <Stack spacing={2} alignItems="center" className="cs-rise" sx={{py: 5, textAlign: 'center'}}>
               <Typography variant="h4">Connect CutScene to Plex</Typography>
@@ -864,6 +917,18 @@ function App() {
                 Log in with Plex
               </Button>
             </Stack>
+          ) : view.name === 'library' ? (
+            <ClipLibrary
+              onOpenClip={openClip}
+              onBack={goHome}
+              hasActiveWorkspace={Boolean(selectedSession)}
+            />
+          ) : view.name === 'clip' ? (
+            <ClipDetail
+              clipId={view.clipId}
+              onBack={openLibrary}
+              onDeleted={handleClipDeleted}
+            />
           ) : !selectedSession ? (
             <Stack spacing={2.5} className="cs-rise">
               <Box>
@@ -909,6 +974,7 @@ function App() {
               onRetryJob={retryRenderJob}
               onRetryPoll={retryPollJob}
               onCreateNewJob={() => createRenderJob()}
+              onOpenClip={openClip}
               audioMode={audioMode}
               onAudioModeChange={setAudioMode}
               theaterMode={theaterMode}
@@ -938,7 +1004,7 @@ function App() {
         </Container>
       </Box>
 
-      {playerError && selectedSession && (
+      {playerError && selectedSession && view.name === 'home' && (
         <Container maxWidth="lg" sx={{pb: 2, position: 'relative', zIndex: 2}}>
           <Typography variant="caption" sx={{color: '#ffb4a8'}} role="alert">
             Preview failed to load. Adjust the trim or change the session to retry.
@@ -946,7 +1012,7 @@ function App() {
         </Container>
       )}
 
-      {downloadCompleted && (
+      {downloadCompleted && view.name === 'home' && (
         <Container maxWidth="lg" sx={{pb: 2, position: 'relative', zIndex: 2}}>
           <Typography variant="caption" sx={{color: '#7fd391'}} role="status">
             Download started — check your browser downloads.

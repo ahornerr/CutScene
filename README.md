@@ -18,6 +18,55 @@ docker compose up
 
 If you changed the listen address or port, update the port mapping in [docker-compose.yaml](docker-compose.yaml).
 
+### Durable clips and storage
+
+Completed renders are promoted to durable clips. Configure `storage.root` (the
+sample uses `/data`) as the local application-data directory. CutScene stores
+the SQLite clip metadata database there, MP4s below `clips/`, and the
+`clip-token.key` encryption key. The default Compose file mounts the named
+`cutscene-data` volume at `/data`; it deliberately does not mount `/tmp`, which
+contains transient render jobs and may be cleared on restart.
+
+If `storage.root` is omitted it defaults to `./data` relative to the CutScene
+process working directory. If `storage.database` is omitted it defaults to
+`clips.sqlite3` directly below that root; configured database paths must remain
+relative to the root.
+
+Do not use `docker compose down -v` unless you intend to delete the durable
+volume and all saved clips.
+
+The storage root and clip directory are created with owner-only permissions;
+the root and clip directory use `0700`, and `clip-token.key` must be exactly
+`0600`. Restrict access to that key as you would any capability secret. Keep
+the database, MP4s, and key in the same encrypted backup set. Before upgrading
+from an older release, take a complete encrypted backup of the storage root;
+the key is required to preserve encrypted share links. Backups should be taken
+with CutScene stopped (or with a filesystem/database snapshot) so metadata and
+files represent one point in time. If the key is missing or wrong, startup
+refuses to run until the matching key is restored; it does not generate a
+replacement key. The MP4s may remain, but the service will not expose or serve
+encrypted share links without that matching key.
+
+To use a host path or a custom volume, set `storage.root` and mount that exact
+path into the container. For example, with `storage.root: /srv/cutscene`, use
+`/host/cutscene:/srv/cutscene` rather than mounting `/data`; the database path
+is relative to the root by default and absolute or escaping paths are rejected.
+Startup validates the restored schema, key, encrypted tokens, and clip files.
+A missing database, missing/wrong key, or ambiguous restore fails closed and
+leaves existing MP4s untouched; restore the matching backup and retry.
+
+Durable clip capacity is intentionally unbounded by application policy. Monitor
+the mounted filesystem and plan disk alerts/backups; the existing queue,
+per-owner, FFmpeg, and transient render limits still apply.
+
+On startup, CutScene preflights clip metadata and files before any migration
+or reconciliation. Mismatched, stale, partial, or unreferenced durable state
+fails closed without deleting either side. A legacy Phase 1 hash-only database
+is migrated to encrypted token storage; because the old
+raw token was not retained, those legacy clips receive newly generated share
+tokens while their metadata and MP4s are preserved. Deleting a clip is a hard
+delete of both its SQLite metadata and MP4 bytes and is permanent.
+
 ### Authentication
 
 Open the CutScene URL in a browser and choose **Log in with Plex**. CutScene uses Plex's browser authentication flow and keeps the authenticated session in the browser. The session, preview, and render endpoints require that authenticated session; an HTTP client must preserve the session cookie established by its Plex login.

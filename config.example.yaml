@@ -13,3 +13,11 @@ ffmpeg:
   # h264_nvenc requires Nvidia drivers, Docker GPU access, and the Nvidia
   # Container Toolkit. See README.md for the Docker GPU setup.
   codec: libx264
+storage:
+  # Durable clips, clips.sqlite3, and clip-token.key live below this root.
+  # In the supplied Compose setup this is the mounted cutscene-data volume.
+  # If omitted, the backend defaults to ./data relative to its working directory.
+  root: /data
+  # Relative paths are resolved below storage.root. Omit to use clips.sqlite3.
+  # Absolute paths and paths escaping root are rejected.
+  database: clips.sqlite3

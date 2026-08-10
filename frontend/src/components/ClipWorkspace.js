@@ -18,6 +18,7 @@ export default function ClipWorkspace({
   onChangeSession, changeSessionDisabled, changeSessionDisabledReason,
   renderState, jobSpec, controlsChangedSinceJob,
   onCreateJob, onDownloadJob, onRetryJob, onRetryPoll, onCreateNewJob,
+  onOpenClip,
   audioMode, onAudioModeChange,
   theaterMode, onToggleTheater,
               subtitleOffsetMs, onSubtitleOffsetChange,
@@ -68,6 +69,7 @@ export default function ClipWorkspace({
             onRetry={onRetryJob}
             onRetryPoll={onRetryPoll}
             onCreateNew={onCreateNewJob}
+            onOpenClip={onOpenClip}
           />
         </Box>
 
