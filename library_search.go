@@ -196,7 +196,10 @@ func (a *Application) SearchLibrary(ctx context.Context, query string) ([]Librar
 			// Hub entries are often intentionally abbreviated. Re-fetch through
 			// the caller's PMS token before deciding that the item is not playable.
 			if refetches >= maxLibrarySearchRefetches {
-				return nil, errors.New("library metadata detail resolution limit exceeded")
+				// The detail budget is an intentional bound, not an upstream
+				// failure. Preserve the successfully resolved prefix rather than
+				// turning it into an all-or-nothing error response.
+				break
 			}
 			refetches++
 			selectedItem, sourceErr = a.getMetadataItem(searchCtx, ratingKey, true)

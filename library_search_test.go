@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -124,6 +125,45 @@ func TestSearchLibraryPropagatesSystemicDetailFailures(t *testing.T) {
 				t.Fatalf("results=%v err=%v; systemic detail failure returned partial success", results, err)
 			}
 		})
+	}
+}
+
+func TestSearchLibraryDetailRefetchBudgetPreservesResolvedResults(t *testing.T) {
+	plex := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Path == "/hubs/search" {
+			var hubs strings.Builder
+			hubs.WriteString(`{"MediaContainer":{"Hub":[{"Metadata":[`)
+			for i := 1; i <= maxLibrarySearchRefetches+1; i++ {
+				if i > 1 {
+					hubs.WriteString(",")
+				}
+				_, _ = fmt.Fprintf(&hubs, `{"ratingKey":"abbreviated-%d","type":"movie","title":"Movie %d"}`, i, i)
+			}
+			hubs.WriteString(`]}]}}`)
+			_, _ = io.WriteString(w, hubs.String())
+			return
+		}
+		if strings.HasPrefix(r.URL.Path, "/library/metadata/abbreviated-") {
+			key := strings.TrimPrefix(r.URL.Path, "/library/metadata/")
+			_, _ = fmt.Fprintf(w, `{"MediaContainer":{"Metadata":[{"ratingKey":%q,"type":"movie","title":%q,"Media":[{"id":1,"Part":[{"id":2,"duration":1000,"key":"/library/parts/2/file"}]}]}]}}`, key, key)
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer plex.Close()
+	config := Config{}
+	config.Plex.Host = plex.URL
+	app := &Application{config: config}
+	results, err := app.SearchLibrary(ContextWithAuthToken(context.Background(), "caller-token"), "movies")
+	if err != nil {
+		t.Fatalf("search returned detail-budget error: %v", err)
+	}
+	if len(results) != maxLibrarySearchRefetches {
+		t.Fatalf("resolved results = %d, want %d: %+v", len(results), maxLibrarySearchRefetches, results)
+	}
+	if results[0].RatingKey != "abbreviated-1" || results[len(results)-1].RatingKey != fmt.Sprintf("abbreviated-%d", maxLibrarySearchRefetches) {
+		t.Fatalf("unexpected resolved result prefix: first=%q last=%q", results[0].RatingKey, results[len(results)-1].RatingKey)
 	}
 }
 
