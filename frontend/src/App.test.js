@@ -808,8 +808,9 @@ test('session cards surface existing metadata: progress, player state, resolutio
   expect(alphaCard).toHaveTextContent('00:50:00');
   // Player state dot label.
   expect(alphaCard).toHaveTextContent('Playing');
-  // Quality accent pill — resolution + audio combined.
-  expect(alphaCard).toHaveTextContent('1080 · 5.1');
+  // Resolution and audio are independently scannable chips.
+  expect(alphaCard).toHaveTextContent('1080');
+  expect(alphaCard).toHaveTextContent('5.1');
   // Footer — device + location. The user ('viewer') is omitted on owned cards
   // because the "Your session" badge already conveys ownership.
   expect(alphaCard).toHaveTextContent('Plex Web (Chrome)');
@@ -819,7 +820,8 @@ test('session cards surface existing metadata: progress, player state, resolutio
   // Beta — paused, 4k/7.1, remote, not owned.
   const betaCard = screen.getByRole('button', {name: /Beta/});
   expect(betaCard).toHaveTextContent('Paused');
-  expect(betaCard).toHaveTextContent('4K · 7.1');
+  expect(betaCard).toHaveTextContent('4K');
+  expect(betaCard).toHaveTextContent('7.1');
   // Footer includes the user (not owned), device, and location.
   expect(betaCard).toHaveTextContent('someone else');
   expect(betaCard).toHaveTextContent('Apple TV');
@@ -1814,7 +1816,8 @@ test('library search shows loading, then results with title, context, year, dura
   const movieCard = screen.getByRole('button', {name: /Library result.*Library Movie/});
   expect(movieCard).toHaveTextContent('Library Movie');
   expect(movieCard).toHaveTextContent('(2023)');
-  expect(movieCard).toHaveTextContent('1080 · 5.1');
+  expect(movieCard).toHaveTextContent('1080');
+  expect(movieCard).toHaveTextContent('5.1');
   expect(movieCard).toHaveTextContent('Movie');
   expect(movieCard).toHaveTextContent('01:30:00');
 
@@ -1822,7 +1825,8 @@ test('library search shows loading, then results with title, context, year, dura
   const episodeCard = screen.getByRole('button', {name: /Library result.*Library Show/});
   expect(episodeCard).toHaveTextContent('Library Show');
   expect(episodeCard).toHaveTextContent('S01E01 Pilot');
-  expect(episodeCard).toHaveTextContent('720 · 2.0');
+  expect(episodeCard).toHaveTextContent('720');
+  expect(episodeCard).toHaveTextContent('2.0');
   expect(episodeCard).toHaveTextContent('Episode');
   expect(episodeCard).toHaveTextContent('00:45:00');
 

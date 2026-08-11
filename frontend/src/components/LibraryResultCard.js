@@ -86,9 +86,10 @@ export default function LibraryResultCard({result, active, onSelect, onNavigate}
   const name = getResultName(result)
   const res = resolutionLabel(result.videoResolution)
   const audio = audioLayoutLabel(result.audioChannels)
-  const quality = qualitySummary(res, audio)
+  const quality = qualitySummary(res, null)
   const codec = result.videoCodec ? String(result.videoCodec).toUpperCase() : null
   const main10 = String(result.videoProfile || '').toLowerCase() === 'main 10'
+  const audioInfo = [result.audioCodec ? String(result.audioCodec).toUpperCase() : null, audio].filter(Boolean).join(' · ')
   const tLabel = typeLabel(result.type)
   const navigation = result.type === 'show' || result.type === 'season'
   const selectable = result.type === 'movie' || result.type === 'episode'
@@ -188,7 +189,7 @@ export default function LibraryResultCard({result, active, onSelect, onNavigate}
               </Typography>
             )}
 
-            {(quality || codec || main10) && (
+            {(quality || audioInfo || codec || main10) && (
               <Box sx={{display: 'flex', flexWrap: 'wrap', gap: 0.75, mt: 0.5}}>
               {quality && <Box sx={{
                 alignSelf: 'flex-start',
@@ -208,6 +209,9 @@ export default function LibraryResultCard({result, active, onSelect, onNavigate}
               {codec && <Box sx={{px: 1.25, py: 0.35, borderRadius: 999, fontSize: '0.72rem', fontWeight: 700,
                 letterSpacing: '0.03em', fontFamily: 'var(--cs-mono-font)', color: '#cfe3ff',
                 backgroundColor: 'rgba(73,121,193,0.14)', border: '1px solid rgba(143,184,255,0.32)'}}>{codec}</Box>}
+              {audioInfo && <Box sx={{px: 1.25, py: 0.35, borderRadius: 999, fontSize: '0.72rem', fontWeight: 700,
+                letterSpacing: '0.03em', fontFamily: 'var(--cs-mono-font)', color: '#d6dbe5',
+                backgroundColor: 'rgba(255,255,255,0.06)', border: '1px solid rgba(255,255,255,0.14)'}}>{audioInfo}</Box>}
               {main10 && <Box sx={{px: 1.25, py: 0.35, borderRadius: 999, fontSize: '0.72rem', fontWeight: 700,
                 letterSpacing: '0.03em', fontFamily: 'var(--cs-mono-font)', color: '#d9c6ff',
                 backgroundColor: 'rgba(137,98,201,0.15)', border: '1px solid rgba(185,151,246,0.38)'}}>Main 10</Box>}

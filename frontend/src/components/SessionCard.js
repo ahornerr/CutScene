@@ -88,9 +88,10 @@ export default function SessionCard({session, active, onSelect}) {
   const playerTitle = session.Player?.title
   const res = resolutionLabel(session.Media?.[0]?.videoResolution)
   const audio = audioLayoutLabel(session.Media?.[0]?.audioChannels)
-  const quality = qualitySummary(res, audio)
+  const quality = qualitySummary(res, null)
   const codec = session.Media?.[0]?.videoCodec ? String(session.Media[0].videoCodec).toUpperCase() : null
   const main10 = String(session.Media?.[0]?.videoProfile || '').toLowerCase() === 'main 10'
+  const audioInfo = [session.Media?.[0]?.audioCodec ? String(session.Media[0].audioCodec).toUpperCase() : null, audio].filter(Boolean).join(' · ')
   const loc = locationLabel(session.Session?.location)
   const userTitle = session.User?.title
   const thumbPath = session.thumb || session.grandparentThumb || null
@@ -236,7 +237,7 @@ export default function SessionCard({session, active, onSelect}) {
               </Box>
             )}
 
-            {(quality || codec || main10) && (
+            {(quality || audioInfo || codec || main10) && (
               <Box sx={{display: 'flex', flexWrap: 'wrap', gap: 0.75, mt: 0.5}}>
               {quality && <Box sx={{
                 alignSelf: 'flex-start',
@@ -256,6 +257,9 @@ export default function SessionCard({session, active, onSelect}) {
               {codec && <Box sx={{px: 1.25, py: 0.35, borderRadius: 999, fontSize: '0.72rem', fontWeight: 700,
                 letterSpacing: '0.03em', fontFamily: 'var(--cs-mono-font)', color: '#cfe3ff',
                 backgroundColor: 'rgba(73,121,193,0.14)', border: '1px solid rgba(143,184,255,0.32)'}}>{codec}</Box>}
+              {audioInfo && <Box sx={{px: 1.25, py: 0.35, borderRadius: 999, fontSize: '0.72rem', fontWeight: 700,
+                letterSpacing: '0.03em', fontFamily: 'var(--cs-mono-font)', color: '#d6dbe5',
+                backgroundColor: 'rgba(255,255,255,0.06)', border: '1px solid rgba(255,255,255,0.14)'}}>{audioInfo}</Box>}
               {main10 && <Box sx={{px: 1.25, py: 0.35, borderRadius: 999, fontSize: '0.72rem', fontWeight: 700,
                 letterSpacing: '0.03em', fontFamily: 'var(--cs-mono-font)', color: '#d9c6ff',
                 backgroundColor: 'rgba(137,98,201,0.15)', border: '1px solid rgba(185,151,246,0.38)'}}>Main 10</Box>}

@@ -25,6 +25,7 @@ export default function SessionContext({session, onChangeSession, changeDisabled
   const codec = media?.videoCodec ? String(media.videoCodec).toUpperCase() : null
   const main10 = String(media?.videoProfile || '').toLowerCase() === 'main 10'
   const audioCodec = media?.audioCodec ? String(media.audioCodec).toUpperCase() : null
+  const audioInfo = [audioCodec, audio].filter(Boolean).join(' · ')
   return (
     <Box className="cs-session-context cs-rise">
       <Box sx={{flex: 1, minWidth: 0}}>
@@ -42,13 +43,12 @@ export default function SessionContext({session, onChangeSession, changeDisabled
         <Typography variant="caption" sx={{color: 'text.disabled', mt: 0.4, display: 'block'}}>
           {sourceLabel}
         </Typography>
-        {(resolution || audio || codec || main10 || audioCodec) && (
+        {(resolution || audioInfo || codec || main10) && (
           <Box aria-label="Source media details" sx={{display: 'flex', flexWrap: 'wrap', gap: 0.75, mt: 1}}>
             {resolution && <MediaChip>{resolution}</MediaChip>}
-            {audio && <MediaChip>{audio}</MediaChip>}
+            {audioInfo && <MediaChip>{audioInfo}</MediaChip>}
             {codec && <MediaChip tone="blue">{codec}</MediaChip>}
             {main10 && <MediaChip tone="purple">Main 10</MediaChip>}
-            {audioCodec && <MediaChip tone="muted">{audioCodec}</MediaChip>}
           </Box>
         )}
       </Box>
