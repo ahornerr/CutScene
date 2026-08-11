@@ -38,7 +38,7 @@ function libraryResultToSession(result) {
     // Library items have no live view offset — clips start at the beginning.
     viewOffset: 0,
     thumb: result.artwork || '',
-    Media: [{Part: [{id: String(result.mediaId)}], videoResolution: result.videoResolution || '', audioChannels: result.audioChannels || 0}],
+    Media: [{Part: [{id: String(result.mediaId)}], videoResolution: result.videoResolution || '', videoCodec: result.videoCodec || '', videoProfile: result.videoProfile || '', audioChannels: result.audioChannels || 0, audioCodec: result.audioCodec || ''}],
     _sourceType: 'library',
     _partId: result.partId,
   }
