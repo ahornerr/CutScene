@@ -320,7 +320,7 @@ func TestLibraryMetadataChildrenTrustsValidatedListingContainment(t *testing.T) 
 		case "/library/metadata/season-1":
 			_, _ = io.WriteString(w, `{"MediaContainer":{"Metadata":[{"ratingKey":"season-1","type":"season","title":"Season 1","index":1}]}}`)
 		case "/library/metadata/season-1/children":
-			_, _ = io.WriteString(w, `{"MediaContainer":{"Metadata":[{"ratingKey":"episode-missing-parent","type":"episode","title":"Missing parent","parentRatingKey":"season-1","index":1},{"ratingKey":"episode-different-parent","type":"episode","title":"Different parent","parentRatingKey":"season-1","index":2},{"ratingKey":"episode-invalid-listing-parent","type":"episode","title":"Invalid listing parent","parentRatingKey":"other-season","index":3}]}}`)
+			_, _ = io.WriteString(w, `{"MediaContainer":{"Metadata":[{"ratingKey":"episode-complete","type":"episode","title":"Complete listing","parentRatingKey":"season-1","index":0,"Media":[{"id":103,"Part":[{"id":203,"duration":1000,"key":"/library/parts/203/file"}]}]},{"ratingKey":"episode-missing-parent","type":"episode","title":"Missing parent","parentRatingKey":"season-1","index":1},{"ratingKey":"episode-different-parent","type":"episode","title":"Different parent","parentRatingKey":"season-1","index":2},{"ratingKey":"episode-invalid-listing-parent","type":"episode","title":"Invalid listing parent","parentRatingKey":"other-season","index":3}]}}`)
 		case "/library/metadata/episode-missing-parent":
 			_, _ = io.WriteString(w, `{"MediaContainer":{"Metadata":[{"ratingKey":"episode-missing-parent","type":"episode","title":"Missing parent","Media":[{"id":101,"Part":[{"id":201,"duration":1000,"key":"/library/parts/201/file"}]}]}]}}`)
 		case "/library/metadata/episode-different-parent":
@@ -337,10 +337,10 @@ func TestLibraryMetadataChildrenTrustsValidatedListingContainment(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(results) != 2 {
-		t.Fatalf("listing containment results = %+v, want two valid episodes", results)
+	if len(results) != 3 {
+		t.Fatalf("listing containment results = %+v, want three valid episodes", results)
 	}
-	if results[0].RatingKey != "episode-missing-parent" || results[1].RatingKey != "episode-different-parent" {
+	if results[0].RatingKey != "episode-complete" || results[1].RatingKey != "episode-missing-parent" || results[2].RatingKey != "episode-different-parent" {
 		t.Fatalf("unexpected listing containment results = %+v", results)
 	}
 }

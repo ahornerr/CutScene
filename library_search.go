@@ -351,6 +351,16 @@ func (a *Application) GetLibraryMetadataChildren(ctx context.Context, ratingKey 
 		if child.Type != "episode" {
 			continue
 		}
+		// A complete /children item is already caller-scoped and has passed the
+		// listing containment check above. Use it directly when it is already
+		// clip-ready; Plex detail responses are not guaranteed to preserve the
+		// same parent-key representation.
+		if media, part, resolveErr := selectLibraryMetadataSourceForDiscovery(child); resolveErr == nil && media != nil && part != nil {
+			if duration, durationErr := selectedDiscoverySourceDuration(child, media, part); durationErr == nil && duration > 0 {
+				results = append(results, librarySearchResultFromMetadata(child, media, part))
+				continue
+			}
+		}
 		// Hub/children entries are commonly abbreviated. Re-fetch each episode
 		// through the caller-scoped Plex client before resolving a playable Part.
 		episode, fetchErr := a.getMetadataItem(childrenCtx, childRatingKey, true)
