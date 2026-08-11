@@ -191,6 +191,7 @@ function textStreams() {
 afterEach(() => {
   jest.useRealTimers();
   jest.restoreAllMocks();
+  window.history.replaceState(null, '', '#/');
   Object.defineProperty(document, 'visibilityState', {configurable: true, value: 'visible'});
   mockPlayerUrls.length = 0;
 });
@@ -200,7 +201,7 @@ beforeAll(() => {
 });
 
 test('subtitle stream discovery sends the selected media part ID URL-encoded', async () => {
-  const mediaId = 'part/101?segment=2';
+  const mediaId = '101';
   const selectedSessions = sessions.map(session => session.ratingKey === 'A'
     ? {...session, Media: [{Part: [{id: mediaId}]}]}
     : session
@@ -1132,7 +1133,7 @@ test('render-job POST body and queued/running/succeeded polling produce a saniti
   expect(screen.queryByRole('link', {name: 'Download clip'})).not.toBeInTheDocument();
 });
 
-test('invalid media IDs fail clearly without posting an invalid render payload', async () => {
+test('invalid active media IDs stay on the canonical picker without starting workspace work', async () => {
   const invalidSessions = sessions.map(session => session.ratingKey === 'A'
     ? {...session, Media: [{Part: [{id: '101.5'}]}]}
     : session
@@ -1142,10 +1143,11 @@ test('invalid media IDs fail clearly without posting an invalid render payload',
   await flush();
   await selectSession('Alpha');
 
-  fireEvent.click(screen.getByRole('button', {name: 'Render clip'}));
-
+  expect(window.location.hash).toBe('#/');
+  expect(screen.getByText('Pick something to clip')).toBeInTheDocument();
+  expect(screen.queryByText('Now clipping')).not.toBeInTheDocument();
+  expect(pending.some(request => request.url.startsWith('/streams/'))).toBe(false);
   expect(pending.some(request => request.url === '/render-jobs')).toBe(false);
-  expect(screen.getByRole('alert')).toHaveTextContent('invalid media ID');
 });
 
 test('render jobs keep an immutable submitted spec separate from edited controls', async () => {
@@ -1670,6 +1672,120 @@ test('navigating to the clip library pauses session polling (no /sessions fetche
   expect(sessionRequests.length).toBe(sessionsBefore + 1);
 });
 
+test('selecting an active session serializes its canonical workspace URL', async () => {
+  installFetch(response(sessions));
+  render(<App/>);
+  await flush();
+
+  await selectSession('Alpha');
+
+  expect(window.location.hash).toBe('#/workspace/A?mediaId=101');
+  expect(screen.getByText('Now clipping')).toBeInTheDocument();
+});
+
+test('workspace selection followed by browser back or home shows the picker at #/', async () => {
+  const pending = installFetch(response(sessions));
+  render(<App/>);
+  await flush();
+  await selectSession('Alpha');
+
+  expect(window.location.hash).toBe('#/workspace/A?mediaId=101');
+  expect(screen.getByText('Now clipping')).toBeInTheDocument();
+
+  await act(async () => {
+    const changed = new Promise(resolve => window.addEventListener('hashchange', resolve, {once: true}));
+    window.history.back();
+    await changed;
+  });
+  await flush();
+
+  expect(window.location.hash).toBe('#/');
+  expect(screen.getByText('Pick something to clip')).toBeInTheDocument();
+  expect(screen.queryByText('Now clipping')).not.toBeInTheDocument();
+
+  await selectSession('Alpha');
+  fireEvent.click(screen.getByRole('button', {name: 'CutScene home'}));
+  await flush();
+  expect(window.location.hash).toBe('#/');
+  expect(screen.getByText('Pick something to clip')).toBeInTheDocument();
+
+  fireEvent.click(screen.getByRole('button', {name: 'Clips'}));
+  await flush();
+  await resolveRequest(requestFor(pending, url => url === '/clips'), {clips: [], isAdmin: false});
+  fireEvent.click(screen.getByRole('button', {name: 'Back to editing'}));
+  await flush();
+  expect(window.location.hash).toBe('#/workspace/A?mediaId=101');
+  expect(screen.getByText('Now clipping')).toBeInTheDocument();
+});
+
+test('an active workspace deep link hydrates only the matching live media part', async () => {
+  window.history.replaceState(null, '', '#/workspace/A?mediaId=101');
+  const pending = installFetch(response(sessions));
+  render(<App/>);
+  await flush();
+
+  expect(screen.getByText('Now clipping')).toBeInTheDocument();
+  expect(screen.getByText('Alpha')).toBeInTheDocument();
+  expect(window.location.hash).toBe('#/workspace/A?mediaId=101');
+  expect(requestFor(pending, url => url === '/streams/A?mediaId=101')).toBeDefined();
+});
+
+test('initial clip deep links are rendered from the hash', async () => {
+  window.history.replaceState(null, '', '#/clips/deep-link');
+  const pending = installFetch();
+  render(<App/>);
+  await flush();
+
+  const detailReq = requestFor(pending, url => url === '/clips/deep-link');
+  await resolveRequest(detailReq, {
+    id: 'deep-link', title: 'Deep linked clip', ratingKey: 'A', mediaId: 101,
+    fromMs: 0, toMs: 60000, createdAt: '2026-08-01T12:00:00.000Z',
+    shareUrl: 'https://clips.example.test/shared/deep-link',
+    downloadUrl: '/clips/deep-link/download',
+    publicDownloadUrl: 'https://clips.example.test/shared/deep-link',
+    canDelete: false, isAdmin: false,
+  });
+
+  expect(screen.getByText('Deep linked clip')).toBeInTheDocument();
+  expect(window.location.hash).toBe('#/clips/deep-link');
+});
+
+test('in-app hash navigation updates history and browser back/forward restores views', async () => {
+  const pending = installFetch();
+  render(<App/>);
+  await flush();
+
+  fireEvent.click(screen.getByRole('button', {name: 'Clips'}));
+  await flush();
+  expect(window.location.hash).toBe('#/clips');
+  await resolveRequest(requestFor(pending, url => url === '/clips'), {clips: [], isAdmin: false});
+  expect(screen.getByText('No saved clips yet.')).toBeInTheDocument();
+
+  fireEvent.click(screen.getByRole('button', {name: 'Back to sessions'}));
+  await flush();
+  expect(window.location.hash).toBe('#/');
+  expect(screen.getByText('Pick something to clip')).toBeInTheDocument();
+
+  await act(async () => {
+    const changed = new Promise(resolve => window.addEventListener('hashchange', resolve, {once: true}));
+    window.history.back();
+    await changed;
+  });
+  await flush();
+  expect(window.location.hash).toBe('#/clips');
+  await resolveRequest(requestFor(pending, url => url === '/clips', 1), {clips: [], isAdmin: false});
+  expect(screen.getByText('No saved clips yet.')).toBeInTheDocument();
+
+  await act(async () => {
+    const changed = new Promise(resolve => window.addEventListener('hashchange', resolve, {once: true}));
+    window.history.forward();
+    await changed;
+  });
+  await flush();
+  expect(window.location.hash).toBe('#/');
+  expect(screen.getByText('Pick something to clip')).toBeInTheDocument();
+});
+
 test('a successful render surfaces the saved clip via Open in library without losing the transient download', async () => {
   jest.useFakeTimers();
   const pending = installFetch();
@@ -1741,6 +1857,21 @@ const libraryResults = [
     duration: 2700000, artwork: '/thumb/L2', videoResolution: '720', audioChannels: 2,
   },
 ];
+
+test('a library workspace deep link hydrates through the explicit source endpoint', async () => {
+  window.history.replaceState(null, '', '#/workspace/L1?mediaId=5001&partId=6001');
+  const pending = installFetch();
+  render(<App/>);
+  await flush();
+
+  const sourceRequest = requestFor(pending, url => url.startsWith('/library/source/'));
+  expect(sourceRequest.url).toBe('/library/source/L1?mediaId=5001&partId=6001');
+  await resolveRequest(sourceRequest, libraryResults[0]);
+
+  expect(window.location.hash).toBe('#/workspace/L1?mediaId=5001&partId=6001');
+  expect(screen.getByText('From your Plex library')).toBeInTheDocument();
+  expect(requestFor(pending, url => url === '/streams/L1?mediaId=5001&partId=6001')).toBeDefined();
+});
 
 function librarySearchRequest(pending, occurrence = 0) {
   return requestFor(pending, url => url.startsWith('/library/search?query='), occurrence);
@@ -1886,6 +2017,7 @@ test('selecting a library result opens the workspace and passes partId through s
   await flush();
 
   // The workspace opens with the library source context.
+  expect(window.location.hash).toBe('#/workspace/L1?mediaId=5001&partId=6001');
   expect(screen.getByText('Now clipping')).toBeInTheDocument();
   expect(screen.getByText('From your Plex library')).toBeInTheDocument();
   expect(screen.getByText('Library Movie')).toBeInTheDocument();

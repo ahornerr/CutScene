@@ -76,6 +76,7 @@ func NewAPI(config Config, app *Application) (*API, error) {
 
 	api.http.Get("/sessions", api.getSessions, api.authMiddleware)
 	api.http.Get("/library/search", api.searchLibrary, api.authMiddlewareJSON)
+	api.http.Get("/library/source/:ratingKey", api.getLibrarySource, api.authMiddlewareJSON)
 	api.http.Get("/library/metadata/:ratingKey/children", api.getLibraryMetadataChildren, api.authMiddlewareJSON)
 	api.http.Get("/thumb", api.thumb, api.authMiddleware)
 	api.http.Get("/streams/:ratingKey", api.getStreams, api.authMiddleware)
@@ -350,6 +351,28 @@ func (a *API) getLibraryMetadataChildren(ctx fiber.Ctx) error {
 	return ctx.JSON(results)
 }
 
+func (a *API) getLibrarySource(ctx fiber.Ctx) error {
+	ratingKey, err := validateLibraryRatingKey(ctx.Params("ratingKey"))
+	if err != nil {
+		return renderAPIErrorCode(ctx, http.StatusUnprocessableEntity, "validation_error", "ratingKey is invalid")
+	}
+	token := AuthTokenFromContext(ctx.UserContext())
+	if UserFromContext(ctx.UserContext()) == nil || token == nil || strings.TrimSpace(*token) == "" {
+		return renderAPIError(ctx, http.StatusUnauthorized, "authentication required")
+	}
+	mediaID, partID, err := parseRequiredLibrarySourceQuery(ctx)
+	if err != nil {
+		return renderAPIErrorCode(ctx, http.StatusUnprocessableEntity, "validation_error", err.Error())
+	}
+	result, err := a.app.GetLibrarySource(ctx.UserContext(), ratingKey, mediaID, partID)
+	if err != nil {
+		log.Printf("library source failed: %s", redactedDiagnostic(err))
+		return renderLibrarySourceAPIError(ctx, err)
+	}
+	ctx.Set("Cache-Control", "no-store")
+	return ctx.JSON(result)
+}
+
 func (a *API) getStreams(ctx fiber.Ctx) error {
 	ratingKeyStr := ctx.Params("ratingKey")
 	if ratingKeyStr == "" || len(ratingKeyStr) > 512 {
@@ -386,6 +409,28 @@ func parseSourceQuery(ctx fiber.Ctx) (string, string, error) {
 	return mediaID, partID, nil
 }
 
+func parseRequiredLibrarySourceQuery(ctx fiber.Ctx) (int64, int64, error) {
+	mediaIDStr, partIDStr, err := parseSourceQuery(ctx)
+	if err != nil {
+		return 0, 0, err
+	}
+	if mediaIDStr == "" {
+		return 0, 0, errors.New("mediaId is required")
+	}
+	if partIDStr == "" {
+		return 0, 0, errors.New("partId is required")
+	}
+	mediaID, err := strconv.ParseInt(mediaIDStr, 10, 64)
+	if err != nil || mediaID <= 0 {
+		return 0, 0, errors.New("mediaId is invalid")
+	}
+	partID, err := strconv.ParseInt(partIDStr, 10, 64)
+	if err != nil || partID <= 0 {
+		return 0, 0, errors.New("partId is invalid")
+	}
+	return mediaID, partID, nil
+}
+
 func plexMetadataStatus(err error) int {
 	var sdkErr *sdkerrors.SDKError
 	if errors.As(err, &sdkErr) {
@@ -408,6 +453,21 @@ func renderLibraryHierarchyAPIError(ctx fiber.Ctx, err error) error {
 		return renderAPIErrorCode(ctx, http.StatusNotFound, "not_found", "requested library item is unavailable")
 	}
 	return renderAPIErrorCode(ctx, http.StatusServiceUnavailable, "metadata_unavailable", "could not load the library hierarchy")
+}
+
+func renderLibrarySourceAPIError(ctx fiber.Ctx, err error) error {
+	var validationErr *sourceValidationError
+	if errors.As(err, &validationErr) {
+		return renderAPIErrorCode(ctx, http.StatusUnprocessableEntity, "validation_error", validationErr.Error())
+	}
+	status := plexMetadataStatus(err)
+	if status == http.StatusUnauthorized || status == http.StatusForbidden || status == http.StatusNotFound {
+		return renderAPIErrorCode(ctx, http.StatusNotFound, "not_found", "requested library source is unavailable")
+	}
+	if status == 0 || status >= 500 {
+		return renderAPIErrorCode(ctx, http.StatusServiceUnavailable, "metadata_unavailable", "could not load the library source")
+	}
+	return renderAPIErrorCode(ctx, http.StatusUnprocessableEntity, "validation_error", "requested library source is unavailable")
 }
 
 func normalizeSourceError(err error) error {

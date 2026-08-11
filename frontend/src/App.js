@@ -82,6 +82,87 @@ const SESSION_REFRESH_INTERVAL_MS = 10000
 const MAX_NETWORK_RETRIES = 5
 const EXPIRY_TICK_MS = 1000
 
+function viewFromHash(hash) {
+  if (!hash || hash === '#' || hash === '#/') return {name: 'home'}
+  if (hash === '#/clips') return {name: 'library'}
+
+  const workspaceMatch = hash.match(/^#\/workspace\/([^/?#]+)\?mediaId=([1-9]\d*)(?:&partId=([1-9]\d*))?$/)
+  if (workspaceMatch) {
+    try {
+      const ratingKey = decodeURIComponent(workspaceMatch[1])
+      const mediaId = Number(workspaceMatch[2])
+      const partId = workspaceMatch[3] == null ? null : Number(workspaceMatch[3])
+      if (ratingKey && isPositiveSafeInteger(mediaId) && (partId == null || isPositiveSafeInteger(partId))) {
+        return {name: 'workspace', ratingKey, mediaId, partId}
+      }
+    } catch {
+      // Fall through to the canonical home route for malformed escapes.
+    }
+    return {name: 'home'}
+  }
+
+  const clipPrefix = '#/clips/'
+  if (!hash.startsWith(clipPrefix)) return {name: 'home'}
+
+  const encodedClipId = hash.slice(clipPrefix.length)
+  if (!encodedClipId || encodedClipId.includes('/')) return {name: 'home'}
+  try {
+    const clipId = decodeURIComponent(encodedClipId)
+    return clipId ? {name: 'clip', clipId} : {name: 'home'}
+  } catch {
+    return {name: 'home'}
+  }
+}
+
+function isPositiveSafeInteger(value) {
+  return Number.isSafeInteger(value) && value > 0
+}
+
+function hashForView(view) {
+  if (view.name === 'library') return '#/clips'
+  if (view.name === 'clip' && view.clipId) return `#/clips/${encodeURIComponent(view.clipId)}`
+  if (view.name === 'workspace' && view.ratingKey && isPositiveSafeInteger(view.mediaId)) {
+    const partParam = view.partId != null && isPositiveSafeInteger(view.partId) ? `&partId=${view.partId}` : ''
+    return `#/workspace/${encodeURIComponent(view.ratingKey)}?mediaId=${view.mediaId}${partParam}`
+  }
+  return '#/'
+}
+
+function workspaceViewForSession(session) {
+  const ratingKey = session?.ratingKey
+  const mediaId = Number(session?.Media?.[0]?.Part?.[0]?.id)
+  if (typeof ratingKey !== 'string' || !ratingKey || !isPositiveSafeInteger(mediaId)) return null
+  const view = {name: 'workspace', ratingKey, mediaId, partId: null}
+  if (session?._sourceType === 'library') {
+    const partId = Number(session._partId)
+    if (!isPositiveSafeInteger(partId)) return null
+    view.partId = partId
+  }
+  return view
+}
+
+function sessionMatchesWorkspace(session, workspace) {
+  if (!session || !workspace || String(session.ratingKey) !== workspace.ratingKey) return false
+  const mediaId = Number(session?.Media?.[0]?.Part?.[0]?.id)
+  if (mediaId !== workspace.mediaId) return false
+  if (workspace.partId == null) return session._sourceType !== 'library'
+  return session._sourceType === 'library' && Number(session._partId) === workspace.partId
+}
+
+function authRequiredError() {
+  const error = new Error('Authentication required.')
+  error.code = 'auth'
+  return error
+}
+
+async function fetchWorkspaceSessions(signal) {
+  const response = await fetch('/sessions', {redirect: 'manual', signal})
+  if (response.type === 'opaqueredirect' || response.status === 401 || response.status === 403) {
+    throw authRequiredError()
+  }
+  return safeJsonArray(response)
+}
+
 function App() {
   // --- Navigation view ---
   // Smallest suitable routing: an in-app view state instead of a router
@@ -89,7 +170,32 @@ function App() {
   // renders the saved-clip library; 'clip' renders a single clip detail. The
   // workspace state (selectedSession, render job, etc.) is retained across
   // navigation so the render workflow is never disrupted.
-  const [view, setView] = useState({name: 'home'})
+  const [view, setView] = useState(() => viewFromHash(window.location.hash))
+
+  // Hash navigation is deliberately kept outside the workspace state. The
+  // browser owns the history entries, while this listener makes back/forward
+  // navigation update the rendered view without disturbing the workspace.
+  useEffect(() => {
+    const syncViewToHash = () => {
+      const nextView = viewFromHash(window.location.hash)
+      setView(nextView)
+
+      // Invalid routes resolve to the canonical home URL without adding a
+      // second history entry for the malformed hash.
+      const canonicalHash = hashForView(nextView)
+      if (window.location.hash !== canonicalHash) {
+        window.history.replaceState(null, '', canonicalHash)
+      }
+    }
+
+    syncViewToHash()
+    window.addEventListener('hashchange', syncViewToHash)
+    window.addEventListener('popstate', syncViewToHash)
+    return () => {
+      window.removeEventListener('hashchange', syncViewToHash)
+      window.removeEventListener('popstate', syncViewToHash)
+    }
+  }, [])
 
   // --- Session list ---
   const [sessions, setSessions] = useState(null)
@@ -160,6 +266,7 @@ function App() {
   const sessionRefreshActiveRef = useRef(false)
   const sessionRefreshRunnerRef = useRef(null)
   const sessionsHaveDataRef = useRef(false)
+  const workspaceHydrationControllerRef = useRef(null)
 
   // ---------------------------------------------------------------- render-job cleanup
   const stopPolling = useCallback(() => {
@@ -860,6 +967,15 @@ function App() {
   // ---------------------------------------------------------------- session switching (blocked during active job)
   const jobIsActive = isActive(renderState.status)
 
+  // ---------------------------------------------------------------- hash navigation
+  const navigateTo = useCallback((nextView, replace = false) => {
+    setView(nextView)
+    const nextHash = hashForView(nextView)
+    if (window.location.hash === nextHash) return
+    if (replace) window.history.replaceState(null, '', nextHash)
+    else window.location.hash = nextHash
+  }, [])
+
   const handleChangeSession = useCallback(() => {
     // Blocked during active jobs — all session-change affordances are
     // disabled so a successful download cannot disappear.
@@ -893,12 +1009,19 @@ function App() {
     setSubtitleOffsetMs(0)
     setTheaterMode(false)
     setTrimFlashKey(0)
-  }, [jobIsActive, stopPolling, stopSessionRefresh])
+    navigateTo({name: 'home'})
+  }, [jobIsActive, navigateTo, stopPolling, stopSessionRefresh])
 
   const handleSelectSession = useCallback((session) => {
+    const workspaceView = workspaceViewForSession(session)
+    if (!workspaceView) {
+      console.warn('Rejected active session without a canonical workspace identity:', session)
+      return
+    }
     stopSessionRefresh()
     setSelectedSession(session)
-  }, [stopSessionRefresh])
+    navigateTo(workspaceView)
+  }, [navigateTo, stopSessionRefresh])
 
 // Library result selection — normalize the backend LibrarySearchResult into
 // the session-shaped object the workspace expects, then route through the
@@ -914,8 +1037,10 @@ const handleSelectLibraryResult = useCallback((result) => {
     return
   }
   stopSessionRefresh()
-  setSelectedSession(libraryResultToSession(result))
-}, [stopSessionRefresh])
+  const session = libraryResultToSession(result)
+  setSelectedSession(session)
+  navigateTo(workspaceViewForSession(session))
+}, [navigateTo, stopSessionRefresh])
 
 // Stable auth-required handler for the library search panel. setNeedsAuth is
 // stable (useState setter), so this callback keeps a stable identity across
@@ -923,15 +1048,97 @@ const handleSelectLibraryResult = useCallback((result) => {
 // polling never re-fires a library search.
 const handleLibraryAuthRequired = useCallback(() => setNeedsAuth(true), [])
 
+  // ---------------------------------------------------------------- workspace deep-link hydration
+  // A workspace URL is only a source identity. Trim, subtitle, audio, and job
+  // state intentionally stay in React state rather than becoming shareable
+  // URL state. Reuse an already-selected matching source when navigating back
+  // to a workspace; otherwise hydrate it from the authoritative backend lane.
+  useEffect(() => {
+    workspaceHydrationControllerRef.current?.abort()
+    workspaceHydrationControllerRef.current = null
+
+    if (view.name !== 'workspace') return undefined
+    if (selectedSession && sessionMatchesWorkspace(selectedSession, view)) {
+      stopSessionRefresh()
+      return undefined
+    }
+
+    const controller = new AbortController()
+    workspaceHydrationControllerRef.current = controller
+    let current = true
+
+    const failToHome = (error) => {
+      if (!current || controller.signal.aborted || isAbortError(error)) return
+      if (error?.code === 'auth') {
+        setNeedsAuth(true)
+        stopSessionRefresh()
+      }
+      navigateTo({name: 'home'}, true)
+    }
+
+    const hydrate = async () => {
+      try {
+        let session
+        if (view.partId == null) {
+          const liveSessions = await fetchWorkspaceSessions(controller.signal)
+          session = liveSessions.find(candidate => sessionMatchesWorkspace(candidate, view))
+          if (!session) throw new Error('The active session is no longer available.')
+        } else {
+          const response = await fetch(
+            `/library/source/${encodeURIComponent(view.ratingKey)}?mediaId=${view.mediaId}&partId=${view.partId}`,
+            {redirect: 'manual', signal: controller.signal}
+          )
+          if (response.type === 'opaqueredirect' || response.status === 401 || response.status === 403) {
+            throw authRequiredError()
+          }
+          if (!response.ok) throw new Error(`Could not load this library source (${response.status}).`)
+          const result = await response.json()
+          const validationError = validateLibraryResult(result)
+          if (validationError) throw new Error(validationError)
+          if (
+            String(result.ratingKey) !== view.ratingKey ||
+            Number(result.mediaId) !== view.mediaId ||
+            Number(result.partId) !== view.partId
+          ) {
+            throw new Error('The requested library source is no longer available.')
+          }
+          session = libraryResultToSession(result)
+        }
+
+        if (!current || controller.signal.aborted) return
+        stopSessionRefresh()
+        setSelectedSession(session)
+      } catch (error) {
+        failToHome(error)
+      }
+    }
+
+    hydrate()
+    return () => {
+      current = false
+      controller.abort()
+      if (workspaceHydrationControllerRef.current === controller) {
+        workspaceHydrationControllerRef.current = null
+      }
+    }
+  }, [
+    navigateTo, selectedSession, stopSessionRefresh,
+    view.name, view.ratingKey, view.mediaId, view.partId,
+  ])
+
   // ---------------------------------------------------------------- clip library navigation
-  const openLibrary = useCallback(() => setView({name: 'library'}), [])
-  const openClip = useCallback((clipId) => setView({name: 'clip', clipId}), [])
-  const goHome = useCallback(() => setView({name: 'home'}), [])
+  const openLibrary = useCallback(() => navigateTo({name: 'library'}), [navigateTo])
+  const openClip = useCallback((clipId) => navigateTo({name: 'clip', clipId}), [navigateTo])
+  const goHome = useCallback(() => navigateTo({name: 'home'}), [navigateTo])
+  const goBackFromLibrary = useCallback(() => {
+    const workspaceView = workspaceViewForSession(selectedSession)
+    navigateTo(workspaceView || {name: 'home'})
+  }, [navigateTo, selectedSession])
   const handleClipDeleted = useCallback(() => {
     // After deleting from the detail view, return to the library (which
     // re-fetches and reconciles).
-    setView({name: 'library'})
-  }, [])
+    navigateTo({name: 'library'})
+  }, [navigateTo])
 
   // ---------------------------------------------------------------- cleanup on unmount
   useEffect(() => {
@@ -944,6 +1151,7 @@ const handleLibraryAuthRequired = useCallback(() => setNeedsAuth(true), [])
   // ---------------------------------------------------------------- render
   const sessionsLoading = sessions === null && !sessionsError && !needsAuth
   const changeSessionDisabledReason = 'Finish or cancel the active render before changing sessions'
+  const workspaceVisible = view.name === 'workspace'
 
   // Reference expiryTick so the countdown re-renders without affecting logic.
   void expiryTick
@@ -991,7 +1199,7 @@ const handleLibraryAuthRequired = useCallback(() => setNeedsAuth(true), [])
       </Box>
 
       <Box component="main" sx={{flex: 1, py: {xs: 2, md: 3}, position: 'relative', zIndex: 2}}>
-        <Container className="cs-main-container" maxWidth={selectedSession && theaterMode && view.name === 'home' ? 'xl' : 'lg'}>
+        <Container className="cs-main-container" maxWidth={selectedSession && theaterMode && workspaceVisible ? 'xl' : 'lg'}>
           {needsAuth ? (
             <Stack spacing={2} alignItems="center" className="cs-rise" sx={{py: 5, textAlign: 'center'}}>
               <Typography variant="h4">Connect CutScene to Plex</Typography>
@@ -1005,7 +1213,7 @@ const handleLibraryAuthRequired = useCallback(() => setNeedsAuth(true), [])
           ) : view.name === 'library' ? (
             <ClipLibrary
               onOpenClip={openClip}
-              onBack={goHome}
+              onBack={goBackFromLibrary}
               hasActiveWorkspace={Boolean(selectedSession)}
             />
           ) : view.name === 'clip' ? (
@@ -1014,7 +1222,7 @@ const handleLibraryAuthRequired = useCallback(() => setNeedsAuth(true), [])
               onBack={openLibrary}
               onDeleted={handleClipDeleted}
             />
-          ) : !selectedSession ? (
+          ) : view.name !== 'workspace' || !selectedSession ? (
             <Stack spacing={4} className="cs-rise">
               <Box>
                 <Typography variant="overline" className="cs-section-label" sx={{color: '#ff7300'}}>
@@ -1091,7 +1299,7 @@ const handleLibraryAuthRequired = useCallback(() => setNeedsAuth(true), [])
         </Container>
       </Box>
 
-      {playerError && selectedSession && view.name === 'home' && (
+      {playerError && selectedSession && workspaceVisible && (
         <Container maxWidth="lg" sx={{pb: 2, position: 'relative', zIndex: 2}}>
           <Typography variant="caption" sx={{color: '#ffb4a8'}} role="alert">
             Preview failed to load. Adjust the trim or change the session to retry.
@@ -1099,7 +1307,7 @@ const handleLibraryAuthRequired = useCallback(() => setNeedsAuth(true), [])
         </Container>
       )}
 
-      {downloadCompleted && view.name === 'home' && (
+      {downloadCompleted && workspaceVisible && (
         <Container maxWidth="lg" sx={{pb: 2, position: 'relative', zIndex: 2}}>
           <Typography variant="caption" sx={{color: '#7fd391'}} role="status">
             Download started — check your browser downloads.

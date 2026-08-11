@@ -655,3 +655,97 @@ func TestLibraryHierarchyUsesCurrentCallerTokenForEachRequest(t *testing.T) {
 		t.Fatalf("cross-caller token sequence = %v", seenTokens)
 	}
 }
+
+func TestGetLibrarySourceResolvesOneCallerSourceAndNormalizesIt(t *testing.T) {
+	plex := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/library/metadata/movie-1" {
+			http.NotFound(w, r)
+			return
+		}
+		if got := r.Header.Get("X-Plex-Token"); got != "caller-token" {
+			t.Errorf("metadata token = %q, want caller-token", got)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"MediaContainer":{"Metadata":[{"ratingKey":"movie-1","type":"movie","title":"Library movie","year":2024,"thumb":"/library/metadata/movie-1/thumb","Media":[{"id":10,"duration":120000,"Part":[{"id":100,"duration":120000,"key":"/library/parts/100/file"}]},{"id":11,"duration":90000,"videoResolution":"4k","videoCodec":"hevc","videoProfile":"main 10","audioCodec":"eac3","audioChannels":6,"container":"mkv","bitrate":8000,"width":3840,"height":2160,"Part":[{"id":101,"duration":60000,"key":"/library/parts/101/file","size":9876}]}]}]}}`)
+	}))
+	defer plex.Close()
+	config := Config{}
+	config.Plex.Host = plex.URL
+	app := &Application{config: config}
+
+	result, err := app.GetLibrarySource(ContextWithAuthToken(context.Background(), "caller-token"), "movie-1", 11, 101)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.RatingKey != "movie-1" || result.MediaID != 11 || result.PartID != 101 || result.Title != "Library movie" || result.Type != "movie" || result.Duration != 60000 {
+		t.Fatalf("normalized source identity = %+v", result)
+	}
+	if result.Year == nil || *result.Year != 2024 || result.Artwork != "/library/metadata/movie-1/thumb" || result.VideoResolution != "4k" || result.VideoCodec != "hevc" || result.VideoProfile != "main 10" || result.AudioCodec != "eac3" || result.AudioChannels != 6 || result.Container != "mkv" || result.Bitrate != 8000 || result.Width != 3840 || result.Height != 2160 || result.FileSize != 9876 {
+		t.Fatalf("normalized source metadata = %+v", result)
+	}
+	body, err := json.Marshal(result)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(body), "/library/parts/101/file") {
+		t.Fatalf("source response exposed a raw file path: %s", body)
+	}
+	if _, err := app.GetLibrarySource(ContextWithAuthToken(context.Background(), "caller-token"), "movie-1", 11, 100); err == nil {
+		t.Fatal("source resolver accepted a part belonging to another media")
+	}
+}
+
+func TestLibrarySourceAPIUsesAuthValidationAndNotFoundConventions(t *testing.T) {
+	plex := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer plex.Close()
+	config := Config{}
+	config.Plex.Host = plex.URL
+	api := &API{app: &Application{config: config}}
+
+	unauthenticated := fiber.New()
+	unauthenticated.Get("/library/source/:ratingKey", api.getLibrarySource)
+	response, err := unauthenticated.Test(httptest.NewRequest(http.MethodGet, "/library/source/movie-1?mediaId=11&partId=101", nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("unauthenticated status = %d, want 401", response.StatusCode)
+	}
+	_ = response.Body.Close()
+
+	validated := fiber.New()
+	validated.Get("/library/source/:ratingKey", func(ctx fiber.Ctx) error {
+		ctx.SetUserContext(ContextWithUser(ContextWithAuthToken(context.Background(), "caller-token"), User{Uuid: "user-a"}))
+		return api.getLibrarySource(ctx)
+	})
+	response, err = validated.Test(httptest.NewRequest(http.MethodGet, "/library/source/movie-1?mediaId=0&partId=101", nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.StatusCode != http.StatusUnprocessableEntity {
+		t.Fatalf("invalid source status = %d, want 422", response.StatusCode)
+	}
+	_ = response.Body.Close()
+
+	response, err = validated.Test(httptest.NewRequest(http.MethodGet, "/library/source/movie-1?mediaId=11&partId=101", nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusNotFound {
+		t.Fatalf("missing source status = %d, want 404", response.StatusCode)
+	}
+	var envelope struct {
+		Error struct {
+			Code string `json:"code"`
+		} `json:"error"`
+	}
+	if err := json.NewDecoder(response.Body).Decode(&envelope); err != nil {
+		t.Fatal(err)
+	}
+	if envelope.Error.Code != "not_found" {
+		t.Fatalf("missing source error code = %q, want not_found", envelope.Error.Code)
+	}
+}
