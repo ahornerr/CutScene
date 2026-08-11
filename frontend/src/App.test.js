@@ -140,7 +140,7 @@ async function selectSession(title) {
 }
 
 async function changeSession() {
-  const buttons = screen.getAllByRole('button', {name: 'Change session'});
+  const buttons = screen.getAllByRole('button', {name: 'Change source'});
   fireEvent.click(buttons[0]);
   await flush();
 }
@@ -808,8 +808,9 @@ test('session cards surface existing metadata: progress, player state, resolutio
   expect(alphaCard).toHaveTextContent('00:50:00');
   // Player state dot label.
   expect(alphaCard).toHaveTextContent('Playing');
-  // Quality accent pill — resolution + audio combined.
-  expect(alphaCard).toHaveTextContent('1080 · 5.1');
+  // Resolution and audio are independently scannable chips.
+  expect(alphaCard).toHaveTextContent('1080');
+  expect(alphaCard).toHaveTextContent('5.1');
   // Footer — device + location. The user ('viewer') is omitted on owned cards
   // because the "Your session" badge already conveys ownership.
   expect(alphaCard).toHaveTextContent('Plex Web (Chrome)');
@@ -819,7 +820,8 @@ test('session cards surface existing metadata: progress, player state, resolutio
   // Beta — paused, 4k/7.1, remote, not owned.
   const betaCard = screen.getByRole('button', {name: /Beta/});
   expect(betaCard).toHaveTextContent('Paused');
-  expect(betaCard).toHaveTextContent('4K · 7.1');
+  expect(betaCard).toHaveTextContent('4K');
+  expect(betaCard).toHaveTextContent('7.1');
   // Footer includes the user (not owned), device, and location.
   expect(betaCard).toHaveTextContent('someone else');
   expect(betaCard).toHaveTextContent('Apple TV');
@@ -1413,7 +1415,7 @@ test('active render jobs constrain session changes and keep polling alive', asyn
   const poll = requestFor(pending, url => url === '/render-jobs/job-session');
   await resolveRequest(poll, {id: 'job-session', status: 'running'});
 
-  const changeButtons = screen.getAllByRole('button', {name: 'Change session'});
+  const changeButtons = screen.getAllByRole('button', {name: 'Change source'});
   expect(changeButtons).toHaveLength(1);
   changeButtons.forEach(button => {
     expect(button).toBeDisabled();
@@ -1716,4 +1718,571 @@ test('a successful render surfaces the saved clip via Open in library without lo
   expect(screen.getByText('Alpha scene')).toBeInTheDocument();
   // Browser playback uses the inline public download URL (shareUrl === publicDownloadUrl).
   expect(document.querySelector('video').getAttribute('src')).toBe('https://clips.example.test/shared/clips/tok/download');
+});
+
+// ---------------------------------------------------------------------------
+// Phase 2 — Plex library search source selection
+// ---------------------------------------------------------------------------
+//
+// The library search panel is presented as a peer source choice to active
+// sessions. Selecting a library result normalizes it into a session-shaped
+// object and routes partId through streams/subtitles/preview/render, while
+// active-session sources remain unchanged (no partId).
+
+const libraryResults = [
+  {
+    ratingKey: 'L1', mediaId: 5001, partId: 6001, type: 'movie',
+    title: 'Library Movie', year: 2023, duration: 5400000,
+    artwork: '/thumb/L1', videoResolution: '1080', audioChannels: 6,
+  },
+  {
+    ratingKey: 'L2', mediaId: 5002, partId: 6002, type: 'episode',
+    title: 'Pilot', grandparentTitle: 'Library Show', seasonNumber: 1, episodeNumber: 1,
+    duration: 2700000, artwork: '/thumb/L2', videoResolution: '720', audioChannels: 2,
+  },
+];
+
+function librarySearchRequest(pending, occurrence = 0) {
+  return requestFor(pending, url => url.startsWith('/library/search?query='), occurrence);
+}
+
+async function searchLibrary(query) {
+  const input = screen.getByRole('textbox', {name: 'Search Plex library'});
+  fireEvent.change(input, {target: {value: query}});
+  // Debounce is 300ms with real timers; advance microtasks only.
+  await act(async () => {
+    await Promise.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+  });
+}
+
+async function searchLibraryWithFakeTimers(query) {
+  const input = screen.getByRole('textbox', {name: 'Search Plex library'});
+  fireEvent.change(input, {target: {value: query}});
+  // Only flush microtasks — the test advances the debounce timer explicitly.
+  await act(async () => { await Promise.resolve(); });
+}
+
+test('library search panel is presented as a peer source choice on the home view', async () => {
+  installFetch(response(sessions));
+  render(<App/>);
+  await flush();
+
+  // The unified picker has one shared result region: active sessions are the
+  // default contents, with library search taking over after a valid query.
+  expect(screen.getByRole('textbox', {name: 'Search Plex library'})).toBeInTheDocument();
+  expect(screen.getByText('Alpha')).toBeInTheDocument();
+  expect(screen.queryByText('Active sessions')).not.toBeInTheDocument();
+});
+
+test('library search debounces the query and does not fire below the 2-character minimum', async () => {
+  jest.useFakeTimers();
+  const pending = installFetch();
+  render(<App/>);
+  await flush();
+
+  // A single character is below the minimum — no search request fires.
+  await searchLibraryWithFakeTimers('A');
+  expect(pending.some(r => r.url.startsWith('/library/search'))).toBe(false);
+
+  // A second character crosses the minimum, but the debounce hasn't elapsed.
+  await searchLibraryWithFakeTimers('Al');
+  expect(pending.some(r => r.url.startsWith('/library/search'))).toBe(false);
+
+  // After the 300ms debounce, the search request fires.
+  await act(async () => { jest.advanceTimersByTime(300); });
+  const searchReq = librarySearchRequest(pending);
+  expect(searchReq).toBeDefined();
+  expect(decodeURIComponent(searchReq.url)).toBe('/library/search?query=Al');
+});
+
+test('library search shows loading, then results with title, context, year, duration, and quality', async () => {
+  const pending = installFetch();
+  render(<App/>);
+  await flush();
+
+  jest.useFakeTimers();
+  await searchLibraryWithFakeTimers('show');
+  await act(async () => { jest.advanceTimersByTime(300); });
+  jest.useRealTimers();
+
+  // Loading state is announced before results resolve.
+  expect(screen.getByText('Searching…')).toBeInTheDocument();
+
+  await resolveRequest(librarySearchRequest(pending), libraryResults);
+
+  // Movie result — title, year, duration, quality pill.
+  const movieCard = screen.getByRole('button', {name: /Library result.*Library Movie/});
+  expect(movieCard).toHaveTextContent('Library Movie');
+  expect(movieCard).toHaveTextContent('(2023)');
+  expect(movieCard).toHaveTextContent('1080');
+  expect(movieCard).toHaveTextContent('5.1');
+  expect(movieCard).toHaveTextContent('Movie');
+  expect(movieCard).toHaveTextContent('01:30:00');
+
+  // Episode result — show title, S01E01 + episode title, quality, duration.
+  const episodeCard = screen.getByRole('button', {name: /Library result.*Library Show/});
+  expect(episodeCard).toHaveTextContent('Library Show');
+  expect(episodeCard).toHaveTextContent('S01E01 Pilot');
+  expect(episodeCard).toHaveTextContent('720');
+  expect(episodeCard).toHaveTextContent('2.0');
+  expect(episodeCard).toHaveTextContent('Episode');
+  expect(episodeCard).toHaveTextContent('00:45:00');
+
+  // Both cards carry the distinguishing "Library" badge.
+  expect(screen.getAllByText('Library')).toHaveLength(2);
+});
+
+test('library search empty state is presented clearly', async () => {
+  jest.useFakeTimers();
+  const pending = installFetch();
+  render(<App/>);
+  await flush();
+
+  await searchLibraryWithFakeTimers('zzz');
+  await act(async () => { jest.advanceTimersByTime(300); });
+  await resolveRequest(librarySearchRequest(pending), []);
+  jest.useRealTimers();
+
+  expect(screen.getByText('No matching titles in your Plex library.')).toBeInTheDocument();
+  expect(screen.getByText('Try a different search term.')).toBeInTheDocument();
+});
+
+test('library search error state offers a retry that re-runs the search', async () => {
+  jest.useFakeTimers();
+  const pending = installFetch();
+  render(<App/>);
+  await flush();
+
+  await searchLibraryWithFakeTimers('fail');
+  await act(async () => { jest.advanceTimersByTime(300); });
+  const firstSearch = librarySearchRequest(pending);
+  await resolveRequestWith(firstSearch, {}, {ok: false, status: 503});
+  jest.useRealTimers();
+
+  expect(screen.getByText(/Couldn’t search the Plex library/)).toBeInTheDocument();
+  expect(screen.getByRole('button', {name: 'Try again'})).toBeInTheDocument();
+
+  fireEvent.click(screen.getByRole('button', {name: 'Try again'}));
+  const secondSearch = librarySearchRequest(pending, 1);
+  expect(secondSearch).toBeDefined();
+  await resolveRequest(secondSearch, libraryResults);
+  expect(screen.getByText('Library Movie')).toBeInTheDocument();
+});
+
+test('selecting a library result opens the workspace and passes partId through streams, preview, and render', async () => {
+  jest.useFakeTimers();
+  const pending = installFetch();
+  render(<App/>);
+  await flush();
+
+  await searchLibraryWithFakeTimers('movie');
+  await act(async () => { jest.advanceTimersByTime(300); });
+  await resolveRequest(librarySearchRequest(pending), [libraryResults[0]]);
+  jest.useRealTimers();
+
+  fireEvent.click(screen.getByRole('button', {name: /Library result.*Library Movie/}));
+  await flush();
+
+  // The workspace opens with the library source context.
+  expect(screen.getByText('Now clipping')).toBeInTheDocument();
+  expect(screen.getByText('From your Plex library')).toBeInTheDocument();
+  expect(screen.getByText('Library Movie')).toBeInTheDocument();
+
+  // Streams request carries partId for the library source.
+  const streamsReq = requestFor(pending, url => url.startsWith('/streams/L1?mediaId=5001'));
+  expect(streamsReq.url).toBe('/streams/L1?mediaId=5001&partId=6001');
+
+  await resolveRequest(streamsReq, textStreams());
+
+  // Preview URL carries partId, and the clip starts at 00:00:00 (no viewOffset).
+  expect(mockPlayerUrls).toEqual([
+    '/preview/L1/00:00:00/00:01:00?mediaId=5001&partId=6001&subtitle=0',
+  ]);
+
+  // Render-job POST body carries partId for the library source.
+  fireEvent.click(screen.getByRole('button', {name: 'Render clip'}));
+  const createRequest = requestFor(pending, url => url === '/render-jobs');
+  expect(JSON.parse(createRequest.options.body)).toMatchObject({
+    ratingKey: 'L1', mediaId: 5001, partId: 6001,
+    fromMs: 0, toMs: 60000, subtitleIndex: 0, audioMode: 'standard', subtitleOffsetMs: 0,
+  });
+});
+
+test('library result subtitle prewarm requests carry partId', async () => {
+  jest.useFakeTimers();
+  const pending = installFetch();
+  render(<App/>);
+  await flush();
+
+  await searchLibraryWithFakeTimers('movie');
+  await act(async () => { jest.advanceTimersByTime(300); });
+  await resolveRequest(librarySearchRequest(pending), [libraryResults[0]]);
+  jest.useRealTimers();
+
+  fireEvent.click(screen.getByRole('button', {name: /Library result.*Library Movie/}));
+  const streamsReq = requestFor(pending, url => url.startsWith('/streams/L1?mediaId=5001'));
+  await resolveRequest(streamsReq, [
+    {index: 0, type: 'text', codec: 'srt', displayTitle: 'Selected'},
+    {index: 1, type: 'text', codec: 'webvtt', displayTitle: 'Prewarm'},
+  ]);
+
+  // The unselected text track is prewarmed with partId.
+  const prewarm = pending.find(r => r.url.includes('/subtitles/L1?subtitle=1'));
+  expect(prewarm).toBeDefined();
+  expect(prewarm.url).toBe('/subtitles/L1?subtitle=1&mediaId=5001&partId=6001');
+});
+
+test('library result subtitle entry fetch carries partId', async () => {
+  jest.useFakeTimers();
+  const pending = installFetch();
+  render(<App/>);
+  await flush();
+
+  await searchLibraryWithFakeTimers('movie');
+  await act(async () => { jest.advanceTimersByTime(300); });
+  await resolveRequest(librarySearchRequest(pending), [libraryResults[0]]);
+  jest.useRealTimers();
+
+  fireEvent.click(screen.getByRole('button', {name: /Library result.*Library Movie/}));
+  await resolveRequest(requestFor(pending, url => url.startsWith('/streams/L1?mediaId=5001')), textStreams());
+
+  // Switching subtitle track fires a subtitle-entry fetch with partId.
+  await selectSubtitle('Y track');
+  const yRequest = pending.filter(r => r.url.includes('/subtitles/L1?subtitle=1')).slice(-1)[0];
+  expect(yRequest.url).toBe('/subtitles/L1?subtitle=1&mediaId=5001&partId=6001');
+  await resolveRequest(yRequest, [{start: 1000, end: 2000, text: 'Y one'}]);
+  expect(screen.getByText('Y one')).toBeInTheDocument();
+});
+
+test('retry render from a library source resubmits the immutable spec with partId', async () => {
+  jest.useFakeTimers();
+  const pending = installFetch();
+  render(<App/>);
+  await flush();
+
+  await searchLibraryWithFakeTimers('movie');
+  await act(async () => { jest.advanceTimersByTime(300); });
+  await resolveRequest(librarySearchRequest(pending), [libraryResults[0]]);
+  jest.useRealTimers();
+
+  fireEvent.click(screen.getByRole('button', {name: /Library result.*Library Movie/}));
+  await resolveRequest(requestFor(pending, url => url.startsWith('/streams/L1?mediaId=5001')), textStreams());
+
+  fireEvent.click(screen.getByRole('button', {name: 'Render clip'}));
+  const firstCreate = requestFor(pending, url => url === '/render-jobs');
+  const submittedBody = JSON.parse(firstCreate.options.body);
+  expect(submittedBody).toEqual({
+    ratingKey: 'L1', mediaId: 5001, partId: 6001,
+    fromMs: 0, toMs: 60000, subtitleIndex: 0, audioMode: 'standard', subtitleOffsetMs: 0,
+  });
+
+  await resolveRequestWith(firstCreate, {id: 'job-lib-retry', status: 'queued'}, {status: 202});
+  const poll = requestFor(pending, url => url === '/render-jobs/job-lib-retry');
+  await resolveRequest(poll, {
+    id: 'job-lib-retry', status: 'failed',
+    error: {code: 'source_unavailable', message: 'Source unavailable.', retryable: true},
+  });
+
+  fireEvent.click(screen.getByRole('button', {name: 'Try again'}));
+  const secondCreate = requestFor(pending, url => url === '/render-jobs', 1);
+  expect(JSON.parse(secondCreate.options.body)).toEqual(submittedBody);
+  expect(JSON.parse(secondCreate.options.body)).toMatchObject({partId: 6001});
+});
+
+test('changing from a library source back to an active session omits partId (active-session regression)', async () => {
+  jest.useFakeTimers();
+  const pending = installFetch();
+  render(<App/>);
+  await flush();
+
+  // Select a library source first.
+  await searchLibraryWithFakeTimers('movie');
+  await act(async () => { jest.advanceTimersByTime(300); });
+  await resolveRequest(librarySearchRequest(pending), [libraryResults[0]]);
+  jest.useRealTimers();
+  fireEvent.click(screen.getByRole('button', {name: /Library result.*Library Movie/}));
+  await resolveRequest(requestFor(pending, url => url.startsWith('/streams/L1?mediaId=5001')), textStreams());
+
+  // Change source back to the picker, then select an active session.
+  await changeSession();
+  await selectSession('Alpha');
+
+  // Streams + preview for the active session omit partId entirely.
+  const streamsReq = requestFor(pending, url => url === '/streams/A?mediaId=101');
+  expect(streamsReq.url).toBe('/streams/A?mediaId=101');
+  await resolveRequest(streamsReq, textStreams());
+  expect(mockPlayerUrls.slice(-1)[0]).toBe('/preview/A/00:00:00/00:01:00?mediaId=101&subtitle=0');
+
+  // The render payload for an active session omits partId.
+  fireEvent.click(screen.getByRole('button', {name: 'Render clip'}));
+  const createRequest = requestFor(pending, url => url === '/render-jobs');
+  expect(JSON.parse(createRequest.options.body)).toEqual({
+    ratingKey: 'A', mediaId: 101, fromMs: 0, toMs: 60000,
+    subtitleIndex: 0, audioMode: 'standard', subtitleOffsetMs: 0,
+  });
+  expect(JSON.parse(createRequest.options.body)).not.toHaveProperty('partId');
+});
+
+test('session context shows the source kind for an active session (regression)', async () => {
+  const pending = installFetch();
+  render(<App/>);
+  await flush();
+  await selectSession('Alpha');
+
+  expect(screen.getByText('Now clipping')).toBeInTheDocument();
+  expect(screen.getByText('Active Plex session')).toBeInTheDocument();
+  expect(screen.getByRole('button', {name: 'Change source'})).toBeInTheDocument();
+});
+
+// ---------------------------------------------------------------------------
+// Gate 2 regressions — malformed library-source responses and search races.
+// ---------------------------------------------------------------------------
+
+async function selectLibraryResultForRegression(pending, result = libraryResults[0]) {
+  await searchLibraryWithFakeTimers('movie');
+  await act(async () => { jest.advanceTimersByTime(300); });
+  await resolveRequest(librarySearchRequest(pending), [result]);
+  jest.useRealTimers();
+  fireEvent.click(screen.getByRole('button', {name: /Library result/}));
+  await flush();
+}
+
+test.each([422, 503])(
+  'library-source streams %s responses keep the workspace alive and surface an error',
+  async status => {
+    jest.useFakeTimers();
+    const pending = installFetch();
+    render(<App/>);
+    await flush();
+    await selectLibraryResultForRegression(pending);
+
+    const streamsRequest = requestFor(pending, url => url.startsWith('/streams/L1?mediaId=5001'));
+    expect(streamsRequest.url).toBe('/streams/L1?mediaId=5001&partId=6001');
+    await resolveRequestWith(streamsRequest, {error: {message: `streams failed (${status})`}}, {
+      ok: false, status,
+    });
+
+    expect(screen.getByText('From your Plex library')).toBeInTheDocument();
+    expect(screen.getByRole('alert')).toHaveTextContent('Couldn’t load subtitle tracks.');
+    expect(screen.getByText('Subtitles')).toBeInTheDocument();
+  }
+);
+
+test.each([422, 503])(
+  'library-source subtitle %s responses keep the workspace alive and surface an error',
+  async status => {
+    jest.useFakeTimers();
+    const pending = installFetch();
+    render(<App/>);
+    await flush();
+    await selectLibraryResultForRegression(pending);
+
+    const streamsRequest = requestFor(pending, url => url.startsWith('/streams/L1?mediaId=5001'));
+    await resolveRequest(streamsRequest, [{index: 0, type: 'text', codec: 'srt', displayTitle: 'Only track'}]);
+    const subtitleRequest = requestFor(pending, url => url === '/subtitles/L1?subtitle=0&mediaId=5001&partId=6001');
+    await resolveRequestWith(subtitleRequest, {error: {message: `subtitle failed (${status})`}}, {
+      ok: false, status,
+    });
+
+    expect(screen.getByText('From your Plex library')).toBeInTheDocument();
+    expect(screen.getByRole('alert')).toHaveTextContent('Couldn’t load subtitles for this track.');
+    expect(screen.getByText('Only track')).toBeInTheDocument();
+  }
+);
+
+test('non-array library stream bodies degrade to an empty state without crashing', async () => {
+  jest.useFakeTimers();
+  const pending = installFetch();
+  render(<App/>);
+  await flush();
+  await selectLibraryResultForRegression(pending);
+
+  const streamsRequest = requestFor(pending, url => url.startsWith('/streams/L1?mediaId=5001'));
+  await resolveRequest(streamsRequest, {streams: 'not an array'});
+  expect(screen.getByText('From your Plex library')).toBeInTheDocument();
+  expect(screen.getByText('No subtitle tracks available for this session.')).toBeInTheDocument();
+});
+
+test('non-array library subtitle bodies degrade to an empty state without crashing', async () => {
+  jest.useFakeTimers();
+  const pending = installFetch();
+  render(<App/>);
+  await flush();
+  await selectLibraryResultForRegression(pending);
+
+  const streamsRequest = requestFor(pending, url => url.startsWith('/streams/L1?mediaId=5001'));
+  await resolveRequest(streamsRequest, [{index: 0, type: 'text', codec: 'srt', displayTitle: 'Only track'}]);
+  const subtitleRequest = requestFor(pending, url => url === '/subtitles/L1?subtitle=0&mediaId=5001&partId=6001');
+  await resolveRequest(subtitleRequest, {entries: 'not an array'});
+
+  expect(screen.getByText('From your Plex library')).toBeInTheDocument();
+  expect(screen.getByText('No subtitle entries.')).toBeInTheDocument();
+});
+
+test('raw library query edits immediately invalidate late results from the old query', async () => {
+  jest.useFakeTimers();
+  const pending = installFetch();
+  render(<App/>);
+  await flush();
+
+  await searchLibraryWithFakeTimers('old');
+  await act(async () => { jest.advanceTimersByTime(300); });
+  const oldRequest = librarySearchRequest(pending);
+
+  await searchLibraryWithFakeTimers('new');
+  expect(oldRequest.options.signal.aborted).toBe(true);
+
+  // Resolve while the replacement query is still inside its debounce window.
+  await resolveRequest(oldRequest, [libraryResults[0]]);
+  expect(screen.queryByText('Library Movie')).not.toBeInTheDocument();
+
+  await act(async () => { jest.advanceTimersByTime(300); });
+  const newResult = {...libraryResults[0], ratingKey: 'L-new', title: 'New query result'};
+  const newRequest = librarySearchRequest(pending, 1);
+  await resolveRequest(newRequest, [newResult]);
+  jest.useRealTimers();
+  expect(screen.getByText('New query result')).toBeInTheDocument();
+  expect(screen.queryByText('Library Movie')).not.toBeInTheDocument();
+});
+
+test('malformed library result IDs are rejected before workspace entry or stream requests', async () => {
+  const malformedResults = [
+    {...libraryResults[0], ratingKey: 'bad-media', title: 'Bad media ID', mediaId: '5001.5'},
+    {...libraryResults[0], ratingKey: 'bad-part', title: 'Bad part ID', partId: 'not-an-id'},
+  ];
+  const pending = installFetch();
+  const warning = jest.spyOn(console, 'warn').mockImplementation(() => {});
+  render(<App/>);
+  await flush();
+
+  jest.useFakeTimers();
+  await searchLibraryWithFakeTimers('bad');
+  await act(async () => { jest.advanceTimersByTime(300); });
+  await resolveRequest(librarySearchRequest(pending), malformedResults);
+  jest.useRealTimers();
+
+  fireEvent.click(screen.getByRole('button', {name: /Bad media ID/}));
+  await flush();
+  expect(screen.queryByText('Now clipping')).not.toBeInTheDocument();
+  expect(pending.some(request => request.url.startsWith('/streams/'))).toBe(false);
+
+  fireEvent.click(screen.getByRole('button', {name: /Bad part ID/}));
+  await flush();
+  expect(screen.queryByText('Now clipping')).not.toBeInTheDocument();
+  expect(pending.some(request => request.url.startsWith('/streams/'))).toBe(false);
+  expect(warning).toHaveBeenCalledTimes(2);
+});
+
+test('library artwork is encoded and partial episode hierarchy omits SnullEnull', async () => {
+  const result = {
+    ratingKey: 'L-art', mediaId: 7001, partId: 8001, type: 'episode',
+    title: 'Pilot', parentTitle: 'The Show', duration: 1200000,
+    artwork: '/library/poster?token=a&path=/show poster',
+  };
+  const pending = installFetch();
+  render(<App/>);
+  await flush();
+
+  jest.useFakeTimers();
+  await searchLibraryWithFakeTimers('art');
+  await act(async () => { jest.advanceTimersByTime(300); });
+  await resolveRequest(librarySearchRequest(pending), [result]);
+  jest.useRealTimers();
+
+  const card = screen.getByRole('button', {name: /Library result.*The Show.*Pilot/});
+  expect(card.querySelector('img')).toHaveAttribute(
+    'src', `/thumb?path=${encodeURIComponent(result.artwork)}`
+  );
+  expect(card).toHaveTextContent('The Show');
+  expect(card).toHaveTextContent('Pilot');
+  expect(card).not.toHaveTextContent('SnullEnull');
+});
+
+test('library search exposes one accessible live status region while loading and after empty results', async () => {
+  jest.useFakeTimers();
+  const pending = installFetch();
+  render(<App/>);
+  await flush();
+  await searchLibraryWithFakeTimers('status');
+  await act(async () => { jest.advanceTimersByTime(300); });
+
+  const status = screen.getByLabelText('Plex library search status');
+  expect(status).toHaveAttribute('aria-live', 'polite');
+  expect(status).toHaveAttribute('aria-busy', 'true');
+  expect(screen.getByText('Searching…')).toBeInTheDocument();
+
+  await resolveRequest(librarySearchRequest(pending), []);
+  expect(status).toHaveAttribute('aria-live', 'polite');
+  expect(status).not.toHaveAttribute('aria-busy', 'true');
+  expect(status).toHaveTextContent('No matching titles in your Plex library.');
+});
+
+test('a session-poll re-render does not refire a settled library search', async () => {
+  // Regression: App passed an inline onAuthRequired to LibrarySearchPanel, and
+  // the panel's search effect once listed it in its dependency array. Session
+  // polling on the home view calls setSessions ~every 10s, re-rendering App
+  // with a fresh callback identity and retriggering the search effect — a
+  // visible periodic refetch for a query that hadn't changed. The effect now
+  // reads onAuthRequired through a ref, so only committed query / explicit
+  // retry refire.
+  jest.useFakeTimers();
+  const {sessionRequests, pending} = installTrackedSessionsFetch();
+  render(<App/>);
+  await resolveRequest(sessionRequests[0], sessions);
+
+  await searchLibraryWithFakeTimers('movie');
+  await act(async () => { jest.advanceTimersByTime(300); });
+  await resolveRequest(librarySearchRequest(pending), [libraryResults[0]]);
+
+  expect(screen.getByText('Library Movie')).toBeInTheDocument();
+  const searchesBefore = pending.filter(r => r.url.startsWith('/library/search')).length;
+  expect(searchesBefore).toBe(1);
+
+  // Let the picker cadence run. A refresh request may or may not be created
+  // before the test's microtask turn; either way, a session update must not
+  // refire the settled library search.
+  await advancePolling(10000);
+  const refreshRequests = sessionRequests.slice(1);
+  for (const request of refreshRequests) await resolveRequest(request, sessions);
+  await advancePolling(10000);
+  const laterRefreshRequests = sessionRequests.slice(1 + refreshRequests.length);
+  for (const request of laterRefreshRequests) await resolveRequest(request, sessions);
+
+  const searchesAfter = pending.filter(r => r.url.startsWith('/library/search')).length;
+  expect(searchesAfter).toBe(searchesBefore);
+  expect(screen.getByText('Library Movie')).toBeInTheDocument();
+});
+
+test('library search classifies authentication, validation, and retryable failures', async () => {
+  const cases = [
+    {query: 'auth', status: 401, expected: 'auth'},
+    {query: 'valid', status: 422, expected: 'validation'},
+    {query: 'busy', status: 503, expected: 'retryable'},
+  ];
+
+  for (const testCase of cases) {
+    jest.useFakeTimers();
+    const pending = installFetch();
+    const view = render(<App/>);
+    await flush();
+    await searchLibraryWithFakeTimers(testCase.query);
+    await act(async () => { jest.advanceTimersByTime(300); });
+    const searchRequest = librarySearchRequest(pending);
+    const body = testCase.status === 422 ? {error: {message: 'The search query is invalid.'}} : {};
+    await resolveRequestWith(searchRequest, body, {ok: false, status: testCase.status});
+
+    if (testCase.expected === 'auth') {
+      expect(screen.getByRole('link', {name: 'Log in with Plex'})).toBeInTheDocument();
+    } else if (testCase.expected === 'validation') {
+      expect(screen.getByRole('alert')).toHaveTextContent('The search query is invalid.');
+      expect(screen.queryByRole('button', {name: 'Try again'})).not.toBeInTheDocument();
+    } else {
+      expect(screen.getByRole('alert')).toHaveTextContent('Couldn’t search the Plex library.');
+      expect(screen.getByRole('button', {name: 'Try again'})).toBeInTheDocument();
+    }
+    view.unmount();
+    jest.useRealTimers();
+  }
 });

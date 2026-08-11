@@ -34,6 +34,8 @@ func TestProtectedRoutesRunAuthBeforeHandlers(t *testing.T) {
 		json   bool
 	}{
 		{http.MethodGet, "/sessions", false},
+		{http.MethodGet, "/library/search?query=movie", true},
+		{http.MethodGet, "/library/metadata/show-1/children", true},
 		{http.MethodGet, "/thumb?path=/thumb", false},
 		{http.MethodGet, "/streams/movie", false},
 		{http.MethodGet, "/subtitles/movie", false},
@@ -478,7 +480,7 @@ func TestGetStreamsSelectsSubtitleBearingPartAndUsesSubtitleOrdinal(t *testing.T
 			http.NotFound(w, r)
 			return
 		}
-		_, _ = io.WriteString(w, `{"MediaContainer":{"Metadata":[{"Media":[{"id":10,"Part":[{"id":100,"key":"/library/parts/100/file.mp4","Stream":[{"streamType":1,"index":0},{"streamType":2,"index":1}]},{"id":200,"key":"/library/parts/200/file.mp4","Stream":[{"streamType":1,"index":4},{"streamType":3,"index":9,"codec":"subrip","language":"English","displayTitle":"English"}]}]}]}]}}`)
+		_, _ = io.WriteString(w, `{"MediaContainer":{"Metadata":[{"ratingKey":"movie-1","type":"movie","title":"Movie","Media":[{"id":10,"Part":[{"id":100,"key":"/library/parts/100/file.mp4","Stream":[{"streamType":1,"index":0},{"streamType":2,"index":1}]},{"id":200,"key":"/library/parts/200/file.mp4","Stream":[{"streamType":1,"index":4},{"streamType":3,"index":9,"codec":"subrip","language":"English","displayTitle":"English"}]}]}]}]}}`)
 	}))
 	defer plex.Close()
 
@@ -515,7 +517,7 @@ func TestGetSubtitleEntriesUsesSelectedPartForNativeExtractionAndCache(t *testin
 	plex := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/library/metadata/movie-1" {
 			w.Header().Set("Content-Type", "application/json")
-			_, _ = io.WriteString(w, `{"MediaContainer":{"Metadata":[{"Media":[{"id":10,"Part":[{"id":100,"key":"/library/parts/100/file.mp4"},{"id":200,"key":"/library/parts/200/file.mp4","Stream":[{"streamType":3,"codec":"subrip","key":"/library/streams/200"}]}]}]}]}}`)
+			_, _ = io.WriteString(w, `{"MediaContainer":{"Metadata":[{"ratingKey":"movie-1","type":"movie","title":"Movie","Media":[{"id":10,"Part":[{"id":100,"key":"/library/parts/100/file.mp4"},{"id":200,"key":"/library/parts/200/file.mp4","Stream":[{"streamType":3,"codec":"subrip","key":"/library/streams/200"}]}]}]}]}}`)
 			return
 		}
 		if r.URL.Path == "/library/streams/200" {
@@ -545,7 +547,7 @@ func TestGetSubtitleEntriesUsesSelectedPartForNativeExtractionAndCache(t *testin
 	if subtitleRequests != 1 {
 		t.Fatalf("native subtitle requests = %d, want 1", subtitleRequests)
 	}
-	if _, ok := app.GetCachedSubtitleEntries("movie-1", "200", 0); !ok {
+	if _, ok := app.GetCachedSubtitleEntries(context.Background(), "movie-1", "10", "200", 0); !ok {
 		t.Fatal("selected subtitle entries were not cached")
 	}
 }

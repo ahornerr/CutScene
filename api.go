@@ -17,7 +17,7 @@ import (
 	"time"
 
 	"github.com/LukeHagar/plexgo/models/components"
-	"github.com/LukeHagar/plexgo/models/operations"
+	"github.com/LukeHagar/plexgo/models/sdkerrors"
 	"github.com/gofiber/fiber/v3"
 	"github.com/gofiber/fiber/v3/middleware/session"
 	"github.com/gofiber/fiber/v3/middleware/static"
@@ -75,6 +75,8 @@ func NewAPI(config Config, app *Application) (*API, error) {
 	}
 
 	api.http.Get("/sessions", api.getSessions, api.authMiddleware)
+	api.http.Get("/library/search", api.searchLibrary, api.authMiddlewareJSON)
+	api.http.Get("/library/metadata/:ratingKey/children", api.getLibraryMetadataChildren, api.authMiddlewareJSON)
 	api.http.Get("/thumb", api.thumb, api.authMiddleware)
 	api.http.Get("/streams/:ratingKey", api.getStreams, api.authMiddleware)
 	api.http.Get("/subtitles/:ratingKey", api.getSubtitleEntries, api.authMiddleware)
@@ -306,27 +308,143 @@ func (a *API) getSessions(ctx fiber.Ctx) error {
 	return ctx.JSON(sessions)
 }
 
+func (a *API) searchLibrary(ctx fiber.Ctx) error {
+	token := AuthTokenFromContext(ctx.UserContext())
+	if UserFromContext(ctx.UserContext()) == nil || token == nil || strings.TrimSpace(*token) == "" {
+		return renderAPIError(ctx, http.StatusUnauthorized, "authentication required")
+	}
+	query := ctx.Query("query")
+	if query == "" {
+		// Accept the conventional short spelling without changing the stable
+		// response contract.
+		query = ctx.Query("q")
+	}
+	if _, err := validateLibrarySearchQuery(query); err != nil {
+		return renderAPIErrorCode(ctx, http.StatusUnprocessableEntity, "validation_error", err.Error())
+	}
+	results, err := a.app.SearchLibrary(ctx.UserContext(), query)
+	if err != nil {
+		log.Printf("library search failed: %s", redactedDiagnostic(err))
+		ctx.Set("Retry-After", "5")
+		return renderAPIErrorCode(ctx, http.StatusServiceUnavailable, "search_unavailable", "could not search the Plex library")
+	}
+	ctx.Set("Cache-Control", "no-store")
+	return ctx.JSON(results)
+}
+
+func (a *API) getLibraryMetadataChildren(ctx fiber.Ctx) error {
+	ratingKey, err := validateLibraryRatingKey(ctx.Params("ratingKey"))
+	if err != nil {
+		return renderAPIErrorCode(ctx, http.StatusUnprocessableEntity, "validation_error", "ratingKey is invalid")
+	}
+	token := AuthTokenFromContext(ctx.UserContext())
+	if UserFromContext(ctx.UserContext()) == nil || token == nil || strings.TrimSpace(*token) == "" {
+		return renderAPIError(ctx, http.StatusUnauthorized, "authentication required")
+	}
+	results, err := a.app.GetLibraryMetadataChildren(ctx.UserContext(), ratingKey)
+	if err != nil {
+		log.Printf("library hierarchy failed: %s", redactedDiagnostic(err))
+		return renderLibraryHierarchyAPIError(ctx, err)
+	}
+	ctx.Set("Cache-Control", "no-store")
+	return ctx.JSON(results)
+}
+
 func (a *API) getStreams(ctx fiber.Ctx) error {
 	ratingKeyStr := ctx.Params("ratingKey")
-	if ratingKeyStr == "" {
+	if ratingKeyStr == "" || len(ratingKeyStr) > 512 {
 		return fmt.Errorf("ratingKey not specified")
 	}
 
-	streams, err := a.app.GetSubtitleStreams(ctx.UserContext(), ratingKeyStr, ctx.Query("mediaId"))
+	mediaID, partID, err := parseSourceQuery(ctx)
 	if err != nil {
-		return err
+		return renderAPIErrorCode(ctx, http.StatusUnprocessableEntity, "validation_error", err.Error())
+	}
+	streams, err := a.app.GetSubtitleStreamsForSource(ctx.UserContext(), ratingKeyStr, mediaID, partID)
+	if err != nil {
+		return renderSourceAPIError(ctx, err)
 	}
 
 	return ctx.JSON(streams)
 }
 
+func parseSourceQuery(ctx fiber.Ctx) (string, string, error) {
+	mediaID := ctx.Query("mediaId")
+	partID := ctx.Query("partId")
+	if mediaID != "" {
+		value, err := strconv.ParseInt(mediaID, 10, 64)
+		if err != nil || value <= 0 {
+			return "", "", errors.New("mediaId is invalid")
+		}
+	}
+	if partID != "" {
+		value, err := strconv.ParseInt(partID, 10, 64)
+		if err != nil || value <= 0 {
+			return "", "", errors.New("partId is invalid")
+		}
+	}
+	return mediaID, partID, nil
+}
+
+func plexMetadataStatus(err error) int {
+	var sdkErr *sdkerrors.SDKError
+	if errors.As(err, &sdkErr) {
+		return sdkErr.StatusCode
+	}
+	var libraryErr *libraryHTTPError
+	if errors.As(err, &libraryErr) {
+		return libraryErr.status
+	}
+	return 0
+}
+
+func renderLibraryHierarchyAPIError(ctx fiber.Ctx, err error) error {
+	var validationErr *sourceValidationError
+	if errors.As(err, &validationErr) {
+		return renderAPIErrorCode(ctx, http.StatusUnprocessableEntity, "validation_error", validationErr.Error())
+	}
+	status := plexMetadataStatus(err)
+	if status == http.StatusUnauthorized || status == http.StatusForbidden || status == http.StatusNotFound {
+		return renderAPIErrorCode(ctx, http.StatusNotFound, "not_found", "requested library item is unavailable")
+	}
+	return renderAPIErrorCode(ctx, http.StatusServiceUnavailable, "metadata_unavailable", "could not load the library hierarchy")
+}
+
+func normalizeSourceError(err error) error {
+	var validationErr *sourceValidationError
+	if errors.As(err, &validationErr) {
+		return err
+	}
+	status := plexMetadataStatus(err)
+	if status == http.StatusUnauthorized || status == http.StatusForbidden || status == http.StatusNotFound {
+		return errors.New("requested media is unavailable")
+	}
+	return newPreviewUpstreamFailure("could not get library metadata", errors.New("Plex metadata service unavailable"))
+}
+
+func renderSourceAPIError(ctx fiber.Ctx, err error) error {
+	var validationErr *sourceValidationError
+	if errors.As(err, &validationErr) {
+		return renderAPIErrorCode(ctx, http.StatusUnprocessableEntity, "validation_error", validationErr.Error())
+	}
+	status := plexMetadataStatus(err)
+	if status == 0 || status >= 500 {
+		return renderAPIErrorCode(ctx, http.StatusServiceUnavailable, "metadata_unavailable", "could not validate the requested media")
+	}
+	return renderAPIErrorCode(ctx, http.StatusUnprocessableEntity, "validation_error", "requested media is unavailable")
+}
+
 func (a *API) getSubtitleEntries(ctx fiber.Ctx) error {
 	ratingKeyStr := ctx.Params("ratingKey")
-	if ratingKeyStr == "" {
+	if ratingKeyStr == "" || len(ratingKeyStr) > 512 {
 		return fmt.Errorf("ratingKey not specified")
 	}
 
 	mediaIdStr := ctx.Query("mediaId")
+	partIdStr := ctx.Query("partId")
+	if _, _, err := parseSourceQuery(ctx); err != nil {
+		return renderAPIErrorCode(ctx, http.StatusUnprocessableEntity, "validation_error", err.Error())
+	}
 
 	subtitleIndexStr := ctx.Query("subtitle", "-1")
 	subtitleIndex, err := strconv.Atoi(subtitleIndexStr)
@@ -338,9 +456,9 @@ func (a *API) getSubtitleEntries(ctx fiber.Ctx) error {
 		return ctx.JSON([]SubtitleEntry{})
 	}
 
-	entries, err := a.app.GetSubtitleEntries(ctx.UserContext(), ratingKeyStr, mediaIdStr, subtitleIndex)
+	entries, err := a.app.GetSubtitleEntriesForSource(ctx.UserContext(), ratingKeyStr, mediaIdStr, partIdStr, subtitleIndex)
 	if err != nil {
-		return err
+		return renderSourceAPIError(ctx, err)
 	}
 
 	return ctx.JSON(entries)
@@ -348,7 +466,7 @@ func (a *API) getSubtitleEntries(ctx fiber.Ctx) error {
 
 func (a *API) clip(ctx fiber.Ctx) error {
 	ratingKeyStr := ctx.Params("ratingKey")
-	if ratingKeyStr == "" {
+	if ratingKeyStr == "" || len(ratingKeyStr) > 512 {
 		return fmt.Errorf("ratingKey not specified")
 	}
 
@@ -481,6 +599,10 @@ type previewSessionSelection struct {
 	selected int64
 }
 
+type sourceValidationError struct{ message string }
+
+func (e *sourceValidationError) Error() string { return e.message }
+
 // selectPreviewSessionSource authorizes a preview against the caller-visible
 // session list. Active-session responses do not reliably include the part key
 // (or file), so this deliberately checks IDs only. The playable key is taken
@@ -577,6 +699,126 @@ func resolvePreviewMetadataSource(metadata []components.Media, selection preview
 	return nil, nil, errors.New("requested preview source is unavailable")
 }
 
+// selectLibraryMetadataSource applies the one source policy used by search,
+// preview, subtitles, and render: movie/episode metadata must resolve to a
+// real, accessible Part with a Plex stream key. Media are considered in PMS
+// order; source codec/profile is left to the FFmpeg render pipeline.
+// A supplied ID may identify either the parent Media or one of its Parts.
+func selectLibraryMetadataSource(metadata *components.Metadata, requestedID int64, supplied bool) (*components.Media, *components.Part, error) {
+	if metadata == nil {
+		return nil, nil, &sourceValidationError{message: "requested media is not clip-capable"}
+	}
+	if supplied {
+		for _, media := range metadata.Media {
+			if media.ID == requestedID {
+				return resolveLibraryMetadataSource(metadata, requestedID, 0)
+			}
+		}
+		return resolveLibraryMetadataSource(metadata, 0, requestedID)
+	}
+	return resolveLibraryMetadataSource(metadata, 0, 0)
+}
+
+// selectLibraryMetadataSourceForDiscovery is intentionally separate from the
+// explicit selector. Search and hierarchy discovery may try later Plex
+// versions when the first otherwise-playable candidate cannot satisfy the
+// exact-duration safety rule. Explicit mediaId/partId requests continue to
+// resolve one requested source and fail when its duration is unsafe.
+func selectLibraryMetadataSourceForDiscovery(metadata *components.Metadata) (*components.Media, *components.Part, error) {
+	if metadata == nil || (metadata.Type != "movie" && metadata.Type != "episode") || strings.TrimSpace(metadata.Title) == "" {
+		return nil, nil, &sourceValidationError{message: "requested media is not clip-capable"}
+	}
+	for i := range metadata.Media {
+		media := &metadata.Media[i]
+		if media.ID <= 0 {
+			continue
+		}
+		for j := range media.Part {
+			part := &media.Part[j]
+			if part.Key == "" || part.ID <= 0 || part.Accessible != nil && !*part.Accessible || part.Exists != nil && !*part.Exists {
+				continue
+			}
+			duration, err := selectedDiscoverySourceDuration(metadata, media, part)
+			if err != nil || duration <= 0 {
+				continue
+			}
+			return media, part, nil
+		}
+	}
+	return nil, nil, &sourceValidationError{message: "requested media has no playable part"}
+}
+
+// resolveLibraryMetadataSource is the canonical explicit-library resolver.
+// mediaID identifies a Media and partID identifies its playable Part. A
+// missing partID selects the first playable part of the requested Media.
+func resolveLibraryMetadataSource(metadata *components.Metadata, mediaID, partID int64) (*components.Media, *components.Part, error) {
+	if metadata == nil || (metadata.Type != "movie" && metadata.Type != "episode") || strings.TrimSpace(metadata.Title) == "" {
+		return nil, nil, &sourceValidationError{message: "requested media is not clip-capable"}
+	}
+	for i := range metadata.Media {
+		media := &metadata.Media[i]
+		if media.ID <= 0 || mediaID > 0 && media.ID != mediaID {
+			continue
+		}
+		for j := range media.Part {
+			part := &media.Part[j]
+			if partID > 0 && part.ID != partID {
+				continue
+			}
+			if part.Key == "" || part.ID <= 0 || part.Accessible != nil && !*part.Accessible || part.Exists != nil && !*part.Exists {
+				continue
+			}
+			return media, part, nil
+		}
+	}
+	return nil, nil, &sourceValidationError{message: "requested media has no playable part"}
+}
+
+func mediaDurationFromSource(media *components.Media, part *components.Part) int64 {
+	if part != nil && part.Duration != nil && *part.Duration > 0 {
+		return int64(*part.Duration)
+	}
+	if media != nil && len(media.Part) > 1 {
+		return 0
+	}
+	if media != nil && media.Duration != nil && *media.Duration > 0 {
+		return int64(*media.Duration)
+	}
+	return 0
+}
+
+func selectedSourceDuration(media *components.Media, part *components.Part) (int64, error) {
+	if part != nil && part.Duration != nil && *part.Duration > 0 {
+		return int64(*part.Duration), nil
+	}
+	if media != nil && len(media.Part) > 1 {
+		return 0, &sourceValidationError{message: "multipart media requires a part duration"}
+	}
+	if media != nil && media.Duration != nil && *media.Duration > 0 {
+		return int64(*media.Duration), nil
+	}
+	return 0, nil
+}
+
+// selectedDiscoverySourceDuration is the discovery-only duration policy. A
+// title duration is safe only for a single-part source; multipart clipping
+// requires the selected Part's own exact duration.
+func selectedDiscoverySourceDuration(item *components.Metadata, media *components.Media, part *components.Part) (int64, error) {
+	if part != nil && part.Duration != nil && *part.Duration > 0 {
+		return int64(*part.Duration), nil
+	}
+	if media != nil && len(media.Part) > 1 {
+		return 0, &sourceValidationError{message: "multipart media requires a part duration"}
+	}
+	if media != nil && media.Duration != nil && *media.Duration > 0 {
+		return int64(*media.Duration), nil
+	}
+	if item != nil && item.Duration != nil && *item.Duration > 0 {
+		return int64(*item.Duration), nil
+	}
+	return 0, nil
+}
+
 func findVisiblePartKey(sessions []sessionMetadata, ratingKey string, requestedID int64) string {
 	for _, session := range sessions {
 		key := session.Key
@@ -644,7 +886,7 @@ func (a *API) previewStream(ctx fiber.Ctx) error {
 	}()
 
 	ratingKeyStr := ctx.Params("ratingKey")
-	if ratingKeyStr == "" {
+	if ratingKeyStr == "" || len(ratingKeyStr) > 512 {
 		return fmt.Errorf("ratingKey not specified")
 	}
 
@@ -680,11 +922,19 @@ func (a *API) previewStream(ctx fiber.Ctx) error {
 	}
 
 	previewMediaIdStr := ctx.Query("mediaId")
+	previewPartIdStr := ctx.Query("partId")
 	var previewMediaId int64
 	if previewMediaIdStr != "" {
 		previewMediaId, err = strconv.ParseInt(previewMediaIdStr, 10, 64)
 		if err != nil || previewMediaId <= 0 {
 			return errors.New("could not parse media id")
+		}
+	}
+	var previewPartId int64
+	if previewPartIdStr != "" {
+		previewPartId, err = strconv.ParseInt(previewPartIdStr, 10, 64)
+		if err != nil || previewPartId <= 0 {
+			return errors.New("could not parse part id")
 		}
 	}
 	if subtitleIndex < -1 {
@@ -695,44 +945,56 @@ func (a *API) previewStream(ctx fiber.Ctx) error {
 		return errors.New("subtitleOffsetMs is invalid")
 	}
 
-	// Validate the caller-visible source before asking the configured Plex
-	// administrator token for metadata. This prevents a valid session from
-	// being used to probe arbitrary library items.
-	sessions, err := a.app.GetSessions(operationCtx)
-	if err != nil {
-		return newPreviewUpstreamFailure("could not validate caller-visible preview source", err)
-	}
-	selection, err := selectPreviewSessionSource(sessions, ratingKeyStr, previewMediaId, previewMediaIdStr != "")
-	if err != nil {
-		return err
+	var sessions []sessionMetadata
+	var selection previewSessionSelection
+	userScoped := previewPartIdStr != ""
+	var metadataItem *components.Metadata
+	if userScoped {
+		metadataItem, err = a.app.getMetadataItem(operationCtx, ratingKeyStr, true)
+		if err != nil {
+			return normalizeSourceError(err)
+		}
+		media, part, sourceErr := resolveLibraryMetadataSource(metadataItem, previewMediaId, previewPartId)
+		if sourceErr != nil {
+			return sourceErr
+		}
+		duration := mediaDurationFromSource(media, part)
+		if _, durationErr := selectedSourceDuration(media, part); durationErr != nil {
+			return durationErr
+		}
+		selection = previewSessionSelection{mediaID: media.ID, partID: part.ID, duration: duration, selected: part.ID}
+	} else {
+		// No partId is the legacy active-session path. Explicit library sources
+		// must never depend on /status/sessions being available.
+		sessions, err = a.app.GetSessions(operationCtx)
+		if err != nil {
+			return newPreviewUpstreamFailure("could not validate caller-visible preview source", err)
+		}
+		selection, err = selectPreviewSessionSource(sessions, ratingKeyStr, previewMediaId, previewMediaIdStr != "")
+		if err != nil {
+			return err
+		}
 	}
 	if selection.duration > 0 && toMs > selection.duration {
 		return errors.New("requested range exceeds the selected media duration")
 	}
 
-	libraryMetadata, err := a.app.plexAdmin.Content.GetMetadataItem(operationCtx, operations.GetMetadataItemRequest{
-		Ids: []string{ratingKeyStr},
-	})
+	if metadataItem == nil {
+		metadataItem, err = a.app.getMetadataItem(operationCtx, ratingKeyStr, userScoped)
+	}
 	if err != nil {
 		return newPreviewUpstreamFailure("could not get library metadata", err)
 	}
-
-	metadataList := libraryMetadata.MediaContainerWithMetadata.MediaContainer.Metadata
-	if len(metadataList) == 0 {
-		return errors.New("requested preview source is unavailable")
-	}
-	metadata := metadataList[0]
+	metadata := *metadataItem
 
 	previewMedia, previewPart, err := resolvePreviewMetadataSource(metadata.Media, selection)
 	if err != nil {
 		return err
 	}
-	visibleMediaID := selection.selected
-	mediaDuration := int64(0)
-	if previewMedia.Duration != nil && *previewMedia.Duration > 0 {
-		mediaDuration = int64(*previewMedia.Duration)
-	} else if previewPart.Duration != nil && *previewPart.Duration > 0 {
-		mediaDuration = int64(*previewPart.Duration)
+	visibleMediaID := previewMedia.ID
+	mediaDuration, durationErr := selectedSourceDuration(previewMedia, previewPart)
+	if durationErr != nil {
+		return durationErr
 	}
 	if mediaDuration > 0 && toMs > mediaDuration {
 		return errors.New("requested range exceeds the selected media duration")
@@ -741,7 +1003,7 @@ func (a *API) previewStream(ctx fiber.Ctx) error {
 	fileURL := fmt.Sprintf("%s%s?X-Plex-Token=%s",
 		a.config.Plex.Host,
 		previewPart.Key,
-		a.config.Plex.Token,
+		a.app.plexSourceToken(operationCtx, userScoped),
 	)
 
 	// Extract subtitle to temp file if requested. For text subtitles, either use
@@ -767,7 +1029,8 @@ func (a *API) previewStream(ctx fiber.Ctx) error {
 			subtitleIdxForFFmpeg = source.EmbeddedIndex
 		} else {
 			cacheMediaID := strconv.FormatInt(visibleMediaID, 10)
-			if entries, ok := a.app.GetCachedSubtitleEntries(ratingKeyStr, cacheMediaID, subtitleIndex); ok {
+			cachePartID := strconv.FormatInt(previewPart.ID, 10)
+			if entries, ok := a.app.GetCachedSubtitleEntries(operationCtx, ratingKeyStr, cacheMediaID, cachePartID, subtitleIndex); ok {
 				subtitleFile, err = WriteClipSRT(entries, fromMs, toMs, subtitleOffsetMs)
 				if err != nil {
 					return fmt.Errorf("could not write clip subtitle: %w", err)
@@ -776,7 +1039,7 @@ func (a *API) previewStream(ctx fiber.Ctx) error {
 				if !isSupportedTextSubtitle(source) {
 					return errors.New("subtitle codec is not supported")
 				}
-				subtitleFile, err = a.app.prepareExternalSubtitle(operationCtx, source, fromMs, toMs, subtitleOffsetMs)
+				subtitleFile, err = a.app.prepareExternalSubtitleWithToken(operationCtx, source, fromMs, toMs, []int64{subtitleOffsetMs}, a.app.plexSourceToken(operationCtx, userScoped))
 				if err != nil {
 					return newPreviewUpstreamFailure("preview subtitle source unavailable", err)
 				}

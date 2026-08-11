@@ -46,10 +46,17 @@ export function audioModeLabel(value) {
 // `subtitleOffsetMs` shifts subtitle timing in the rendered output — positive
 // delays subtitles (later), negative advances them (earlier). It is always
 // present in the payload so the backend can rely on the field.
+//
+// `partId` is included only for explicit library sources (session._sourceType
+// === 'library'). Active-session sources omit it entirely so the backend
+// follows the legacy session-resolution path. A library source with an invalid
+// partId throws here rather than silently omitting the field — the backend
+// requires partId to resolve an explicit library source, so a silent omission
+// would route the request through the wrong (session-based) path.
 export function buildRenderJobRequest(session, startPosition, endPosition, selectedSubtitle, audioMode, subtitleOffsetMs) {
   const mediaId = normalizeMediaId(session?.Media?.[0]?.Part?.[0]?.id)
   if (mediaId == null) throw new Error('The selected media part has an invalid media ID.')
-  return {
+  const body = {
     ratingKey: session.ratingKey,
     mediaId,
     fromMs: startPosition,
@@ -58,13 +65,19 @@ export function buildRenderJobRequest(session, startPosition, endPosition, selec
     audioMode: audioMode || AUDIO_MODES.STANDARD,
     subtitleOffsetMs: clampSubtitleOffsetMs(subtitleOffsetMs),
   }
+  if (session?._sourceType === 'library') {
+    const partId = normalizePartId(session._partId)
+    if (partId == null) throw new Error('The selected library source has an invalid part ID.')
+    body.partId = partId
+  }
+  return body
 }
 
 // Build a request body from an immutable submitted spec (for re-render).
 export function buildRenderJobRequestFromSpec(spec) {
   const mediaId = normalizeMediaId(spec?.mediaId)
   if (mediaId == null) throw new Error('The submitted render job has an invalid media ID.')
-  return {
+  const body = {
     ratingKey: spec.ratingKey,
     mediaId,
     fromMs: spec.fromMs,
@@ -73,6 +86,16 @@ export function buildRenderJobRequestFromSpec(spec) {
     audioMode: spec.audioMode || AUDIO_MODES.STANDARD,
     subtitleOffsetMs: clampSubtitleOffsetMs(spec?.subtitleOffsetMs),
   }
+  // A library-source spec carries its partId; re-render must preserve it.
+  // Reject (rather than silently omit) if the spec claims to be a library
+  // source but lacks a valid partId — the backend needs it to resolve the
+  // source without an active session.
+  if (spec?.sourceType === 'library' || spec?.partId != null) {
+    const partId = normalizePartId(spec?.partId)
+    if (partId == null) throw new Error('The submitted render job has an invalid part ID.')
+    body.partId = partId
+  }
+  return body
 }
 
 // Plex may return Part ids as strings. Keep the API payload numeric and reject
@@ -81,6 +104,40 @@ export function normalizeMediaId(value) {
   if (value == null || (typeof value === 'string' && value.trim() === '')) return null
   const numeric = Number(value)
   return Number.isFinite(numeric) && Number.isInteger(numeric) ? numeric : null
+}
+
+// Like normalizeMediaId, but for the explicit library-source part id. Returns
+// null for absent/invalid values so callers can omit the field entirely.
+export function normalizePartId(value) {
+  if (value == null || value === '') return null
+  const numeric = Number(value)
+  return Number.isFinite(numeric) && Number.isInteger(numeric) && numeric > 0 ? numeric : null
+}
+
+// Library sources tag the selected session with `_sourceType: 'library'` and a
+// numeric `_partId`. Active sessions carry neither field, so they resolve to
+// null and the legacy request shape (no partId) is preserved. For library
+// sources, an invalid partId returns null — callers that must include partId
+// (buildRenderJobRequest) throw instead of silently omitting it.
+export function getSourcePartId(session) {
+  if (!session || session._sourceType !== 'library') return null
+  return normalizePartId(session._partId)
+}
+
+// Validate a backend LibrarySearchResult before accepting it as a clip source.
+// Returns a descriptive error string when the result is malformed, or null when
+// it is acceptable. The workspace cannot function without a usable ratingKey,
+// mediaId, and partId — rejecting up front prevents a broken workspace that
+// can't fetch streams, preview, or render.
+export function validateLibraryResult(result) {
+  if (!result || typeof result !== 'object') return 'This library result is malformed.'
+  const ratingKey = result.ratingKey
+  if (typeof ratingKey !== 'string' || ratingKey.trim() === '') return 'This library result is missing a rating key.'
+  const mediaId = normalizeMediaId(result.mediaId)
+  if (mediaId == null || mediaId <= 0) return 'This library result has an invalid media ID.'
+  const partId = normalizePartId(result.partId)
+  if (partId == null) return 'This library result has an invalid part ID.'
+  return null
 }
 
 // Whether an error code is a transport/polling issue (not a render failure).
@@ -98,6 +155,8 @@ export function snapshotJobSpec(session, startPosition, endPosition, selectedSub
   return {
     ratingKey: session.ratingKey,
     mediaId: normalizeMediaId(session?.Media?.[0]?.Part?.[0]?.id),
+    partId: getSourcePartId(session),
+    sourceType: session?._sourceType === 'library' ? 'library' : 'session',
     title: session.title || session.grandparentTitle || '',
     fromMs: startPosition,
     toMs: endPosition,
