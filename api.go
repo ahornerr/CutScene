@@ -702,7 +702,7 @@ func resolvePreviewMetadataSource(metadata []components.Media, selection preview
 // selectLibraryMetadataSource applies the one source policy used by search,
 // preview, subtitles, and render: movie/episode metadata must resolve to a
 // real, accessible Part with a Plex stream key. Media are considered in PMS
-// order, with main-10 encodes skipped as they are by the existing renderer.
+// order; source codec/profile is left to the FFmpeg render pipeline.
 // A supplied ID may identify either the parent Media or one of its Parts.
 func selectLibraryMetadataSource(metadata *components.Metadata, requestedID int64, supplied bool) (*components.Media, *components.Part, error) {
 	if metadata == nil {
@@ -730,7 +730,7 @@ func selectLibraryMetadataSourceForDiscovery(metadata *components.Metadata) (*co
 	}
 	for i := range metadata.Media {
 		media := &metadata.Media[i]
-		if media.ID <= 0 || media.VideoProfile != nil && *media.VideoProfile == "main 10" {
+		if media.ID <= 0 {
 			continue
 		}
 		for j := range media.Part {
@@ -758,9 +758,6 @@ func resolveLibraryMetadataSource(metadata *components.Metadata, mediaID, partID
 	for i := range metadata.Media {
 		media := &metadata.Media[i]
 		if media.ID <= 0 || mediaID > 0 && media.ID != mediaID {
-			continue
-		}
-		if media.VideoProfile != nil && *media.VideoProfile == "main 10" {
 			continue
 		}
 		for j := range media.Part {

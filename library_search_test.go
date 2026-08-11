@@ -28,7 +28,7 @@ func TestSearchLibraryUsesCallerTokenFiltersAndRefetchesHubs(t *testing.T) {
 				t.Errorf("search query = %q", r.URL.Query().Get("query"))
 			}
 			_, _ = io.WriteString(w, `{"MediaContainer":{"Hub":[{"Metadata":[
-                {"ratingKey":"movie-1","type":"movie","title":"Space Movie","year":2024,"thumb":"/library/metadata/movie-1/thumb","Media":[{"id":10,"Part":[{"id":100,"key":"/library/parts/100/file"}]},{"id":11,"videoResolution":"1080","videoCodec":"h264","Part":[{"id":1011,"duration":60000,"key":"/library/parts/1011/file","size":1234}]}]},
+                {"ratingKey":"movie-1","type":"movie","title":"Space Movie","year":2024,"thumb":"/library/metadata/movie-1/thumb","Media":[{"id":10,"Part":[{"id":100,"key":"/library/parts/100/file"}]},{"id":11,"videoProfile":"main 10","videoResolution":"1080","videoCodec":"h264","Part":[{"id":1011,"duration":60000,"key":"/library/parts/1011/file","size":1234}]}]},
                 {"ratingKey":"show-1","type":"show","title":"Not clip-capable"},
                 {"ratingKey":"episode-1","type":"episode","title":"Pilot","grandparentTitle":"The Show","parentTitle":"Season 1","parentIndex":1,"index":1,"Media":[{"id":12,"Part":[{"id":102,"key":"/library/parts/102/file","duration":60000}]}]},
                 {"ratingKey":"movie-2","type":"movie","title":"Needs details"}
@@ -141,8 +141,9 @@ func TestLibrarySourceSelectionBindsPlayablePartForPreviewAndRender(t *testing.T
 	if spec.PartKey != "/library/parts/101/file" || spec.Title != "Library movie" {
 		t.Fatalf("render source snapshot = %+v", spec)
 	}
-	if _, _, err := selectLibraryMetadataSource(metadata, 100, true); err == nil {
-		t.Fatal("main-10 source was accepted")
+	main10Media, main10Part, err := selectLibraryMetadataSource(metadata, 100, true)
+	if err != nil || main10Media.ID != 10 || main10Part.ID != 100 {
+		t.Fatalf("main-10 explicit source was not accepted: media=%v part=%v err=%v", main10Media, main10Part, err)
 	}
 }
 
@@ -257,7 +258,7 @@ func newHierarchyFixture(t *testing.T) *Application {
 		case "/library/metadata/season-1/children":
 			_, _ = io.WriteString(w, `{"MediaContainer":{"Metadata":[{"ratingKey":"episode-1","type":"episode","title":"Pilot","index":2,"parentIndex":1,"parentRatingKey":"season-1","parentTitle":"Season 1","grandparentRatingKey":"show-1","grandparentTitle":"The Show"}]}}`)
 		case "/library/metadata/episode-1":
-			_, _ = io.WriteString(w, `{"MediaContainer":{"Metadata":[{"ratingKey":"episode-1","type":"episode","title":"Pilot","duration":180000,"index":2,"parentIndex":1,"parentRatingKey":"season-1","parentTitle":"Season 1","grandparentRatingKey":"show-1","grandparentTitle":"The Show","Media":[{"id":21,"Part":[{"id":31,"accessible":true,"exists":true,"key":"/library/parts/31/file"},{"id":32,"accessible":true,"exists":true,"key":"/library/parts/32/file"}]},{"id":22,"duration":120000,"Part":[{"id":33,"duration":60000,"accessible":true,"exists":true,"key":"/library/parts/33/file","size":42}]}]}]}}`)
+			_, _ = io.WriteString(w, `{"MediaContainer":{"Metadata":[{"ratingKey":"episode-1","type":"episode","title":"Pilot","duration":180000,"index":2,"parentIndex":1,"parentRatingKey":"season-1","parentTitle":"Season 1","grandparentRatingKey":"show-1","grandparentTitle":"The Show","Media":[{"id":21,"Part":[{"id":31,"accessible":true,"exists":true,"key":"/library/parts/31/file"},{"id":32,"accessible":true,"exists":true,"key":"/library/parts/32/file"}]},{"id":22,"duration":120000,"videoProfile":"main 10","Part":[{"id":33,"duration":60000,"accessible":true,"exists":true,"key":"/library/parts/33/file","size":42}]}]}]}}`)
 		default:
 			http.NotFound(w, r)
 		}
