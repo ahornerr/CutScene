@@ -60,6 +60,7 @@ type LibrarySearchResult struct {
 
 	VideoResolution string `json:"videoResolution,omitempty"`
 	VideoCodec      string `json:"videoCodec,omitempty"`
+	VideoProfile    string `json:"videoProfile,omitempty"`
 	AudioCodec      string `json:"audioCodec,omitempty"`
 	AudioChannels   int    `json:"audioChannels,omitempty"`
 	Container       string `json:"container,omitempty"`
@@ -243,6 +244,7 @@ func librarySearchResultFromMetadata(item *components.Metadata, media *component
 	}
 	result.VideoResolution = stringValue(media.VideoResolution)
 	result.VideoCodec = stringValue(media.VideoCodec)
+	result.VideoProfile = stringValue(media.VideoProfile)
 	result.AudioCodec = stringValue(media.AudioCodec)
 	if media.AudioChannels != nil {
 		result.AudioChannels = *media.AudioChannels

@@ -169,6 +169,7 @@ type sessionMedia struct {
 	AudioCodec      *string       `json:"audioCodec,omitempty"`
 	AudioChannels   *int          `json:"audioChannels,omitempty"`
 	VideoCodec      *string       `json:"videoCodec,omitempty"`
+	VideoProfile    *string       `json:"videoProfile,omitempty"`
 	VideoResolution *string       `json:"videoResolution,omitempty"`
 	Container       *string       `json:"container,omitempty"`
 	Part            []sessionPart `json:"Part,omitempty"`

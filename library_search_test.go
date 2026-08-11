@@ -51,8 +51,15 @@ func TestSearchLibraryUsesCallerTokenFiltersAndRefetchesHubs(t *testing.T) {
 	if len(results) != 4 {
 		t.Fatalf("got %d results, want 4: %+v", len(results), results)
 	}
-	if results[0].RatingKey != "movie-1" || results[0].MediaID != 11 || results[0].PartID != 1011 || results[0].Duration != 60000 || results[0].FileSize != 1234 {
+	if results[0].RatingKey != "movie-1" || results[0].MediaID != 11 || results[0].PartID != 1011 || results[0].Duration != 60000 || results[0].FileSize != 1234 || results[0].VideoProfile != "main 10" {
 		t.Fatalf("first result = %+v", results[0])
+	}
+	movieJSON, err := json.Marshal(results[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(movieJSON), `"videoProfile":"main 10"`) {
+		t.Fatalf("search result omitted video profile: %s", movieJSON)
 	}
 	if results[1].RatingKey != "show-1" || results[1].Type != "show" || results[1].MediaID != 0 || results[1].PartID != 0 {
 		t.Fatalf("show result = %+v", results[1])
