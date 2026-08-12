@@ -275,6 +275,7 @@ function App() {
   const sessionGenerationRef = useRef(0)
   const sessionAbortControllerRef = useRef(null)
   const playerReadyRef = useRef(false)
+  const skipInitialSubtitlePreviewRef = useRef(false)
   const pollControllerRef = useRef(null)
   const pollTimeoutRef = useRef(null)
   const networkRetryCountRef = useRef(0)
@@ -457,6 +458,7 @@ function App() {
     const controller = new AbortController()
     sessionAbortControllerRef.current = controller
     playerReadyRef.current = false
+    skipInitialSubtitlePreviewRef.current = false
 
     if (selectedSession) {
       const [initStart, initEnd] = clampToBounds(selectedSession, selectedSession.viewOffset, selectedSession.viewOffset + 60000)
@@ -477,6 +479,8 @@ function App() {
       resetRenderState()
 
       // Initial preview is independent of stream metadata and subtitle entries.
+      playerReadyRef.current = true
+      skipInitialSubtitlePreviewRef.current = true
       setPlayerPosition(initStart, initEnd, -1, AUDIO_MODES.STANDARD, 0)
 
       fetch(`/streams/${selectedSession.ratingKey}?mediaId=${encodeURIComponent(mediaId)}${partIdParam(selectedSession)}`, {signal: controller.signal})
@@ -495,6 +499,7 @@ function App() {
         .catch(err => {
           if (!controller.signal.aborted && !isAbortError(err) && sessionGenerationRef.current === generation) {
             console.log('Could not fetch subtitle streams:', err)
+            playerReadyRef.current = true
             setStreamsError(err)
             setStreamsLoading(false)
           }
@@ -554,9 +559,13 @@ function App() {
   // ---------------------------------------------------------------- subtitle track auto-preview
   useEffect(() => {
     if (!selectedSession) return
-    if (selectedSubtitle < 0) return
     if (startPosition == null || endPosition == null) return
     if (!playerReadyRef.current) return
+    if (selectedSubtitle < 0 && skipInitialSubtitlePreviewRef.current) {
+      skipInitialSubtitlePreviewRef.current = false
+      return
+    }
+    skipInitialSubtitlePreviewRef.current = false
     setPlayerPosition(startPosition, endPosition)
     setPreviewStale(false)
     setControlsChangedSinceJob(true)

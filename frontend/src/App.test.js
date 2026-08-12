@@ -367,6 +367,38 @@ test('initial preview resolves subtitle state once, then refreshes on intentiona
   expect(screen.getAllByText(/Enter applies · Esc restores/)[0]).toBeInTheDocument();
 });
 
+test('clearing a selected subtitle rebuilds the preview without a subtitle parameter', async () => {
+  const pending = installFetch();
+  render(<App/>);
+  await flush();
+  await selectSession('Alpha');
+  await resolveRequest(requestFor(pending, url => url === '/streams/A?mediaId=101'), textStreams());
+  await selectSubtitle('Y track');
+  expect(screen.getByTestId('react-player').getAttribute('data-url')).toContain('&subtitle=1');
+
+  const select = screen.getByRole('combobox', {name: 'Subtitle track'});
+  fireEvent.mouseDown(select);
+  await flush();
+  fireEvent.click(screen.getByRole('option', {name: 'None'}));
+  await flush();
+
+  expect(screen.getByTestId('react-player').getAttribute('data-url'))
+    .toBe('/preview/A/00:00:00/00:01:00?mediaId=101');
+});
+
+test('stream discovery failure leaves the subtitle-free preview ready for audio changes', async () => {
+  const pending = installFetch();
+  render(<App/>);
+  await flush();
+  await selectSession('Alpha');
+  const streams = requestFor(pending, url => url === '/streams/A?mediaId=101');
+  await rejectRequest(streams, new Error('stream discovery failed'));
+
+  await selectAudioMode('Dialogue boost');
+  expect(screen.getByTestId('react-player').getAttribute('data-url'))
+    .toBe('/preview/A/00:00:00/00:01:00?mediaId=101&audioMode=dialogue');
+});
+
 test('slider changes do not refresh until one committed change', async () => {
   const pending = installFetch();
   render(<App/>);
