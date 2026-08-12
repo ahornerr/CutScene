@@ -1,4 +1,4 @@
-import {Box, Button, Chip, CircularProgress, IconButton, Paper, Stack, Tooltip, Typography} from "@mui/material";
+import {Box, Button, Chip, CircularProgress, Paper, Stack, Tooltip, Typography} from "@mui/material";
 import {useCallback, useEffect, useRef, useState} from "react";
 import StateMessage from "./StateMessage";
 import {
@@ -106,8 +106,8 @@ export default function ClipLibrary({onOpenClip, onBack, hasActiveWorkspace}) {
   const loading = clips === null && !error && !needsAuth
 
   return (
-    <Box className="cs-rise" sx={{display: 'flex', flexDirection: 'column', gap: 2.5}}>
-      <Box sx={{display: 'flex', alignItems: 'flex-end', justifyContent: 'space-between', gap: 2, flexWrap: 'wrap'}}>
+    <Box className="cs-rise" sx={{display: 'flex', flexDirection: 'column', gap: {xs: 2, sm: 2.5}}}>
+      <Box sx={{display: 'flex', alignItems: {xs: 'stretch', sm: 'flex-end'}, justifyContent: 'space-between', gap: 2, flexWrap: 'wrap'}}>
         <Box sx={{minWidth: 0}}>
           <Typography variant="overline" className="cs-section-label" sx={{color: '#ff7300'}}>
             Library
@@ -128,7 +128,7 @@ export default function ClipLibrary({onOpenClip, onBack, hasActiveWorkspace}) {
             variant="outlined"
             color="primary"
             onClick={onBack}
-            sx={{borderColor: 'rgba(255,255,255,0.2)', px: 2, py: 0.75}}
+            sx={{borderColor: 'rgba(255,255,255,0.2)', px: 2, py: 0.75, alignSelf: {xs: 'flex-start', sm: 'auto'}}}
           >
             {hasActiveWorkspace ? 'Back to editing' : 'Back to sessions'}
           </Button>
@@ -277,11 +277,11 @@ function ClipRow({clip, admin, onOpen, onDelete}) {
           <ClipThumbnail artworkUrl={artworkUrl} />
 
           <Box sx={{flex: 1, minWidth: 0}}>
-            <Typography noWrap sx={{fontWeight: 700, fontSize: {xs: '0.95rem', sm: '1.02rem'}, lineHeight: 1.3}}>
+            <Typography sx={{fontWeight: 700, fontSize: {xs: '0.95rem', sm: '1.02rem'}, lineHeight: 1.3, display: '-webkit-box', WebkitLineClamp: {xs: 2, sm: 1}, WebkitBoxOrient: 'vertical', overflow: 'hidden', overflowWrap: 'anywhere'}}>
               {title}
             </Typography>
             {context && (
-              <Typography noWrap variant="body2" sx={{color: 'text.secondary', mt: -0.25}}>
+              <Typography variant="body2" sx={{color: 'text.secondary', mt: -0.25, display: '-webkit-box', WebkitLineClamp: {xs: 2, sm: 1}, WebkitBoxOrient: 'vertical', overflow: 'hidden', overflowWrap: 'anywhere'}}>
                 {context}
               </Typography>
             )}
@@ -337,30 +337,30 @@ function ClipRowActions({shareUrl, canDelete, clipTitle, onDelete}) {
         borderTop: '1px solid rgba(255,255,255,0.04)',
       }}
     >
-      <CopyShareLinkButton shareUrl={shareUrl} size="small" />
+      <CopyShareLinkButton shareUrl={shareUrl} label="Copy link" />
       <Box sx={{flex: 1}}/>
       {canDelete ? (
         <Tooltip title="Delete clip">
-          <IconButton
+          <Button
+            variant="outlined"
             aria-label={`Delete clip ${clipTitle}`}
             onClick={onDelete}
-            size="small"
-            sx={{color: 'text.secondary', '&:hover': {color: '#ffb4a8', backgroundColor: 'rgba(255,90,90,0.10)'}}}
+            sx={{minHeight: 40, color: '#ffb4a8', borderColor: 'rgba(255,90,90,0.35)', '&:hover': {color: '#ffb4a8', borderColor: 'rgba(255,90,90,0.7)', backgroundColor: 'rgba(255,90,90,0.10)'}}}
           >
-            <DeleteIcon/>
-          </IconButton>
+            Delete
+          </Button>
         </Tooltip>
       ) : (
         <Tooltip title="You don’t have permission to delete this clip." arrow>
           <span>
-            <IconButton
+            <Button
+              variant="outlined"
               disabled
               aria-label="Delete unavailable"
-              size="small"
-              sx={{color: 'text.disabled', opacity: 0.4}}
+              sx={{minHeight: 40, color: 'text.disabled', opacity: 0.5}}
             >
-              <DeleteIcon/>
-            </IconButton>
+              Delete
+            </Button>
           </span>
         </Tooltip>
       )}
@@ -410,15 +410,6 @@ function ClipThumbnail({artworkUrl}) {
         </svg>
       )}
     </Box>
-  )
-}
-
-function DeleteIcon() {
-  return (
-    <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor"
-      strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
-      <path d="M3 6h18M8 6V4h8v2M19 6l-1 14H6L5 6M10 11v6M14 11v6"/>
-    </svg>
   )
 }
 

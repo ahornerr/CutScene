@@ -13,7 +13,7 @@ import {
   getSourcePartId, validateLibraryResult,
 } from "./components/render-jobs";
 import {
-  isAbortError, isPgsSubtitleStream, millisToDuration, MIN_GAP_MS,
+  isAbortError, millisToDuration, MIN_GAP_MS,
 } from "./utils";
 
 // Normalize a backend LibrarySearchResult into the session-shaped object the
@@ -448,7 +448,7 @@ function App() {
     )
   }, [selectedSession, selectedSubtitle, audioMode, subtitleOffsetMs])
 
-  // ---------------------------------------------------------------- session change → streams + prewarm
+  // ---------------------------------------------------------------- session change → streams
   useEffect(() => {
     const generation = sessionGenerationRef.current + 1
     sessionGenerationRef.current = generation
@@ -476,6 +476,9 @@ function App() {
 
       resetRenderState()
 
+      // Initial preview is independent of stream metadata and subtitle entries.
+      setPlayerPosition(initStart, initEnd, -1, AUDIO_MODES.STANDARD, 0)
+
       fetch(`/streams/${selectedSession.ratingKey}?mediaId=${encodeURIComponent(mediaId)}${partIdParam(selectedSession)}`, {signal: controller.signal})
         .then(safeJsonArray)
         .then(streams => {
@@ -488,18 +491,6 @@ function App() {
           if (selectedStreamIndex >= 0) {
             setSelectedSubtitle(selectedStreamIndex)
           }
-          const unselectedTextStreams = availableStreams.filter(stream =>
-            stream.type === 'text' &&
-            !isPgsSubtitleStream(stream) &&
-            stream.index !== selectedStreamIndex
-          )
-          unselectedTextStreams.forEach(stream => {
-            fetch(`/subtitles/${selectedSession.ratingKey}?subtitle=${stream.index}&mediaId=${mediaId}${partIdParam(selectedSession)}`, {
-              signal: controller.signal,
-            })
-              .then(safeJsonArray)
-              .catch(() => {})
-          })
         })
         .catch(err => {
           if (!controller.signal.aborted && !isAbortError(err) && sessionGenerationRef.current === generation) {
@@ -563,13 +554,14 @@ function App() {
   // ---------------------------------------------------------------- subtitle track auto-preview
   useEffect(() => {
     if (!selectedSession) return
+    if (selectedSubtitle < 0) return
     if (startPosition == null || endPosition == null) return
     if (!playerReadyRef.current) return
     setPlayerPosition(startPosition, endPosition)
     setPreviewStale(false)
     setControlsChangedSinceJob(true)
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selectedSubtitle, streamsLoading])
+  }, [selectedSubtitle])
 
   // ---------------------------------------------------------------- audio mode auto-preview
   // Changing audio mode deliberately refreshes the preview so the user can
@@ -682,7 +674,7 @@ function App() {
   const setBoundedStartPosition = useCallback((newValue) => {
     const duration = selectedSession?.duration ?? Infinity
     const clamped = Math.max(0, Math.min(newValue, duration))
-    if (clamped < endPosition - MIN_GAP_MS) {
+    if (clamped <= endPosition - MIN_GAP_MS) {
       setStartPosition(clamped)
       setPlayerPosition(clamped, endPosition)
       setPreviewStale(false)
@@ -693,7 +685,7 @@ function App() {
   const setBoundedEndPosition = useCallback((newValue) => {
     const duration = selectedSession?.duration ?? Infinity
     const clamped = Math.max(0, Math.min(newValue, duration))
-    if (clamped > startPosition + MIN_GAP_MS) {
+    if (clamped >= startPosition + MIN_GAP_MS) {
       setEndPosition(clamped)
       setPlayerPosition(startPosition, clamped)
       setPreviewStale(false)
@@ -705,11 +697,13 @@ function App() {
     const duration = selectedSession?.duration ?? Infinity
     const cs = Math.max(0, Math.min(s, duration))
     const ce = Math.max(0, Math.min(e, duration))
+    if (ce - cs < MIN_GAP_MS) return
     setStartPosition(cs)
     setEndPosition(ce)
-    setPreviewStale(true)
+    setPlayerPosition(cs, ce)
+    setPreviewStale(false)
     setControlsChangedSinceJob(true)
-  }, [selectedSession])
+  }, [selectedSession, setPlayerPosition])
 
   // ---------------------------------------------------------------- subtitle pick (clamp to duration)
   // Subtitle timings are shifted by `subtitleOffsetMs` before deriving the clip
@@ -1041,6 +1035,10 @@ function App() {
       return
     }
     stopSessionRefresh()
+    setSelectedSubtitle(-1)
+    setSubtitleEntries([])
+    setSubtitlesLoading(false)
+    setSubtitlesError(null)
     setSelectedSession(session)
     navigateTo(workspaceView)
   }, [navigateTo, stopSessionRefresh])
@@ -1060,6 +1058,10 @@ const handleSelectLibraryResult = useCallback((result) => {
   }
   stopSessionRefresh()
   const session = libraryResultToSession(result)
+  setSelectedSubtitle(-1)
+  setSubtitleEntries([])
+  setSubtitlesLoading(false)
+  setSubtitlesError(null)
   setSelectedSession(session)
   navigateTo(workspaceViewForSession(session))
 }, [navigateTo, stopSessionRefresh])
@@ -1091,6 +1093,17 @@ const handleLibraryAuthRequired = useCallback(() => setNeedsAuth(true), [])
     }
     if (selectedSession && sessionMatchesWorkspace(selectedSession, view)) {
       stopSessionRefresh()
+      return undefined
+    }
+    if (selectedSession && !sessionMatchesWorkspace(selectedSession, view)) {
+      // Clear source-bound subtitle state before the hydrated source is
+      // installed. This prevents the subtitle effect from combining the new
+      // route with the previous session's selected track for one render.
+      setSelectedSubtitle(-1)
+      setSubtitleEntries([])
+      setSubtitlesLoading(false)
+      setSubtitlesError(null)
+      setSelectedSession(null)
       return undefined
     }
 
@@ -1138,6 +1151,10 @@ const handleLibraryAuthRequired = useCallback(() => setNeedsAuth(true), [])
 
         if (!current || controller.signal.aborted) return
         stopSessionRefresh()
+        setSelectedSubtitle(-1)
+        setSubtitleEntries([])
+        setSubtitlesLoading(false)
+        setSubtitlesError(null)
         setSelectedSession(session)
       } catch (error) {
         failToHome(error)

@@ -13,6 +13,8 @@ html, body, #root {
   height: 100%;
 }
 
+html { -webkit-text-size-adjust: 100%; }
+
 body {
   margin: 0;
   font-family: system-ui, "Segoe UI", "Helvetica Neue", Arial, sans-serif;
@@ -22,6 +24,12 @@ body {
   color: var(--cs-text);
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
+}
+
+button, input, select, textarea { font: inherit; }
+
+@media (max-width: 599px) {
+  input, select, textarea { font-size: 16px !important; }
 }
 
 code {

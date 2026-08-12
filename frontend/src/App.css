@@ -31,6 +31,12 @@
   backdrop-filter: blur(10px);
   background: linear-gradient(180deg, rgba(19,21,26,0.92), rgba(19,21,26,0.72));
   border-bottom: 1px solid rgba(255,255,255,0.06);
+  padding-top: env(safe-area-inset-top);
+}
+
+.cs-shell-toolbar {
+  padding-left: max(16px, env(safe-area-inset-left)) !important;
+  padding-right: max(16px, env(safe-area-inset-right)) !important;
 }
 
 /* Wordmark accent — warm gradient via background-clip. */
@@ -49,6 +55,11 @@
   display: grid;
   gap: 20px;
   grid-template-columns: 1fr;
+  grid-template-areas:
+    "preview"
+    "trim"
+    "subtitles"
+    "render";
   width: 100%;
   position: relative;
   z-index: 2;
@@ -63,9 +74,13 @@
   transition: max-width 320ms cubic-bezier(0.2, 0.7, 0.2, 1);
 }
 
-@media (min-width: 960px) {
+@media (min-width: 900px) {
   .cs-workspace {
     grid-template-columns: minmax(0, 1.45fr) minmax(360px, 1fr);
+    grid-template-areas:
+      "preview subtitles"
+      "trim subtitles"
+      "render subtitles";
     align-items: start;
   }
   /* Theater mode: collapse to a single full-width column so the preview rail
@@ -73,8 +88,18 @@
      it — a wider, more immersive preview like YouTube theater mode. */
   .cs-workspace--theater {
     grid-template-columns: minmax(0, 1fr);
+    grid-template-areas:
+      "preview"
+      "trim"
+      "subtitles"
+      "render";
   }
 }
+
+.cs-workspace-preview { grid-area: preview; }
+.cs-workspace-trim { grid-area: trim; }
+.cs-workspace-subtitles { grid-area: subtitles; }
+.cs-workspace-render { grid-area: render; }
 
 /* Subtitle reflow softening. When theater mode engages, the subtitle rail
    drops from the right column to beneath the preview. A short, translate-only
@@ -85,7 +110,7 @@
   from { transform: translateY(10px); }
   to   { transform: translateY(0); }
 }
-@media (min-width: 960px) {
+@media (min-width: 900px) {
   .cs-workspace--theater .cs-workspace-subtitles {
     animation: cs-theater-subtitle-settle 260ms cubic-bezier(0.2, 0.7, 0.2, 1) both;
   }
@@ -122,7 +147,7 @@
 
 /* Theater mode deepens the frame: a touch more rounding and a wider, darker
    shadow so the widened preview reads as more cinematic, not just larger. */
-@media (min-width: 960px) {
+@media (min-width: 900px) {
   .cs-workspace--theater .cs-player-frame {
     border-radius: 16px;
     box-shadow: 0 34px 84px -32px rgba(0,0,0,0.86),
@@ -194,6 +219,25 @@
   margin-bottom: 4px;
 }
 
+@media (max-width: 599px) {
+  .cs-session-context {
+    align-items: flex-start;
+    gap: 12px;
+    padding-bottom: 14px;
+  }
+  .cs-session-context .MuiButton-root {
+    min-height: 40px;
+    padding-inline: 12px;
+  }
+
+  .cs-workspace-subtitles { margin-top: 2px; }
+  .cs-session-title,
+  .cs-session-subtitle {
+    white-space: normal !important;
+    overflow-wrap: anywhere;
+  }
+}
+
 /* Section label with decorative marker */
 .cs-section-label {
   display: flex;
@@ -220,21 +264,28 @@
 }
 
 .cs-sticky-download {
-  position: sticky;
-  bottom: 0;
-  z-index: 20;
-  background: linear-gradient(0deg, rgba(19,21,26,0.96) 60%, rgba(19,21,26,0.6));
-  border-top: 1px solid rgba(255,255,255,0.07);
-  backdrop-filter: blur(8px);
+  position: relative;
 }
 
-@media (min-width: 960px) {
-  .cs-sticky-download {
-    position: static;
-    background: none;
-    border-top: none;
-    backdrop-filter: none;
+@media (max-width: 899px) {
+  /* The render grid item supplies the full scroll range; only its final
+     decision control sticks, so all context and feedback stay in document flow. */
+  .cs-workspace-render { min-height: 116px; }
+  .cs-render-primary {
+    position: sticky;
+    bottom: 0;
+    z-index: 20;
+    margin-inline: -12px;
+    padding: 12px 12px calc(12px + env(safe-area-inset-bottom));
+    background: linear-gradient(0deg, rgba(19,21,26,0.98) 65%, rgba(19,21,26,0.78));
+    border-top: 1px solid rgba(255,255,255,0.07);
+    backdrop-filter: blur(8px);
+    box-shadow: 0 -12px 30px -24px rgba(0,0,0,0.95);
   }
+}
+
+@media (min-width: 900px) {
+  .cs-render-primary { margin-top: 0; }
 }
 
 /* Range selection tint for the dual-thumb trim slider fill. */
@@ -243,3 +294,19 @@
   width: 20px;
 }
 .cs-trim .MuiSlider-rail { opacity: 0.3; }
+
+@media (max-width: 599px) {
+  .cs-trim-editor .MuiButton-root,
+  .cs-trim-nudge {
+    min-height: 44px;
+  }
+  .cs-trim-focus-controls .MuiButton-root,
+  .cs-trim-editor [aria-label="Trim adjustment step"] .MuiButton-root {
+    padding-inline: 10px;
+  }
+  .cs-trim-nudge {
+    min-width: 44px;
+    padding-inline: 0 !important;
+    font-size: 1.2rem;
+  }
+}

@@ -462,11 +462,11 @@ describe('ClipLibrary list states', () => {
 
     // The copy and delete controls are present and not children of the open
     // button — they live in their own sibling action row below the content.
-    expect(screen.getByRole('button', {name: 'Copy share link'})).toBeInTheDocument();
+    expect(screen.getByRole('button', {name: 'Copy link'})).toBeInTheDocument();
     expect(screen.getByRole('button', {name: /Delete clip Alpha scene/})).toBeInTheDocument();
     // The open button does not contain the action controls.
     const openBtn = screen.getByRole('button', {name: /Open clip Alpha scene/});
-    expect(openBtn).not.toContainElement(screen.getByRole('button', {name: 'Copy share link'}));
+    expect(openBtn).not.toContainElement(screen.getByRole('button', {name: 'Copy link'}));
     expect(openBtn).not.toContainElement(screen.getByRole('button', {name: /Delete clip Alpha scene/}));
   });
 
@@ -493,13 +493,13 @@ describe('copy share link', () => {
     render(<ClipLibrary onOpenClip={() => {}} onBack={() => {}}/>);
     await resolveReq(byUrl(requests, u => u === '/clips'), listResponse([sampleClip()]));
 
-    const copyBtn = screen.getByRole('button', {name: 'Copy share link'});
+    const copyBtn = screen.getByRole('button', {name: 'Copy link'});
     fireEvent.click(copyBtn);
 
     // The legacy copy path was invoked with the full share URL.
     await waitFor(() => expect(execStub).toHaveBeenCalledWith('copy'));
     // The button announces the copied state for screen readers.
-    await waitFor(() => expect(screen.getByRole('button', {name: 'Copy share link copied'})).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByRole('button', {name: 'Copy link copied'})).toBeInTheDocument());
   });
 
   test('a clip without a share token renders a disabled, unavailable share control', async () => {

@@ -139,7 +139,7 @@ export default function LibraryResultCard({result, active, onSelect, onNavigate}
           }}
           focusRipple
         >
-          <Box sx={{position: 'relative', width: '100%', aspectRatio: '16 / 9', background: '#11141a', flexShrink: 0}}>
+          <Box sx={{position: 'relative', width: '100%', aspectRatio: {xs: '2 / 1', sm: '16 / 9'}, background: '#11141a', flexShrink: 0}}>
             {thumbPath ? (
               <CardMedia
                 component="img"
@@ -179,8 +179,8 @@ export default function LibraryResultCard({result, active, onSelect, onNavigate}
             </Box>
           </Box>
 
-          <CardContent sx={{flex: 1, display: 'flex', flexDirection: 'column', gap: 1, p: 2, minWidth: 0}}>
-            <Typography noWrap sx={{fontWeight: 700, fontSize: '1.08rem', lineHeight: 1.25}}>
+          <CardContent sx={{flex: 1, display: 'flex', flexDirection: 'column', gap: 0.75, p: {xs: 1.5, sm: 2}, minWidth: 0}}>
+            <Typography noWrap sx={{fontWeight: 700, fontSize: {xs: '1rem', sm: '1.08rem'}, lineHeight: 1.25}}>
               {name.top}
             </Typography>
             {name.bottom && (

@@ -32,11 +32,11 @@ export default function SessionContext({session, onChangeSession, changeDisabled
         <Typography variant="overline" className="cs-section-label" sx={{color: '#ff7300'}}>
           Now clipping
         </Typography>
-        <Typography noWrap sx={{fontWeight: 600, fontSize: '1.15rem', mt: 0.25}}>
+        <Typography className="cs-session-title" noWrap sx={{fontWeight: 600, fontSize: '1.15rem', mt: 0.25}}>
           {name.top}
         </Typography>
         {name.bottom && (
-          <Typography noWrap variant="body2" sx={{color: 'text.secondary', mt: 0.15}}>
+          <Typography className="cs-session-subtitle" noWrap variant="body2" sx={{color: 'text.secondary', mt: 0.15}}>
             {name.bottom}
           </Typography>
         )}

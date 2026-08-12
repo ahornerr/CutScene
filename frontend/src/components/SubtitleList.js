@@ -54,7 +54,7 @@ export default function SubtitleList({
             </InputAdornment>
           ) : null,
         }}
-        sx={{mt: 1.5}}
+        sx={{mt: 1.25}}
       />
 
       <Box
@@ -63,7 +63,7 @@ export default function SubtitleList({
         className="cs-scroll"
         ref={listRef}
         sx={{
-          mt: 1, flex: 1, minHeight: 240, maxHeight: {xs: 320, md: '42vh'},
+          mt: 1, flex: 1, minHeight: {xs: 280, sm: 240}, maxHeight: {xs: '48vh', md: '42vh'},
           overflowY: 'auto',
           border: '1px solid rgba(255,255,255,0.08)',
           borderRadius: 1.5,
@@ -135,8 +135,8 @@ function SubtitleRow({entry, selected, isAnchor, fullIdx, onClick, onKeyDown}) {
         gap: 1.25,
         width: '100%',
         textAlign: 'left',
-        px: 1.5,
-        py: 0.85,
+        px: {xs: 1.25, sm: 1.5},
+        py: {xs: 1.1, sm: 0.85},
         cursor: 'pointer',
         backgroundColor: selected ? 'rgba(255,115,0,0.16)' : 'transparent',
         border: 0,
@@ -150,7 +150,7 @@ function SubtitleRow({entry, selected, isAnchor, fullIdx, onClick, onKeyDown}) {
     >
       <Typography
         variant="caption"
-        sx={{minWidth: 74, flexShrink: 0, fontFamily: 'var(--cs-mono-font)', color: selected ? '#ffd9b0' : 'text.secondary', pt: '1px'}}
+        sx={{minWidth: {xs: 68, sm: 74}, flexShrink: 0, fontFamily: 'var(--cs-mono-font)', color: selected ? '#ffd9b0' : 'text.secondary', pt: '1px'}}
       >
         {millisToDuration(entry.start)}
       </Typography>

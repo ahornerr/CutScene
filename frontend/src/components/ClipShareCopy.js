@@ -1,4 +1,4 @@
-import {Button, CircularProgress, IconButton, Tooltip, Typography} from "@mui/material";
+import {Button, CircularProgress, IconButton, Tooltip} from "@mui/material";
 import {useCallback, useEffect, useRef, useState} from "react";
 import {copyToClipboard} from "./clips";
 
@@ -68,7 +68,7 @@ export function CopyShareLinkButton({shareUrl, size = 'medium', label = 'Copy sh
       onClick={handleCopy}
       disabled={state === 'copying'}
       startIcon={state === 'copied' ? <CheckIcon/> : <ShareIcon/>}
-      sx={{borderColor: 'rgba(255,255,255,0.2)', px: 2, py: 0.75}}
+      sx={{borderColor: 'rgba(255,255,255,0.2)', px: 2, py: 0.75, minHeight: 40}}
       aria-label={ariaLabel}
       aria-live="polite"
     >

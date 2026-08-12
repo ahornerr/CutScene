@@ -34,7 +34,7 @@ export default function RenderJobBar({
   const isTransportFailure = status === JOB_STATES.FAILED && error && isTransportError(error)
 
   return (
-    <Box className="cs-sticky-download" sx={{px: {xs: 2, md: 0}, py: {xs: 1.5, md: 0}, mt: {md: 2}}}>
+    <Box className="cs-sticky-download" sx={{px: {xs: 1.5, sm: 2, md: 0}, py: {xs: 1.25, md: 0}, mt: {xs: 2.5, md: 2}}}>
       {/* Submitted spec summary — immutable, shown whenever a job exists */}
       {showSpec && (
         <Box sx={{
@@ -67,8 +67,8 @@ export default function RenderJobBar({
       )}
 
       {/* Audio mode control — always visible alongside the render controls */}
-      <Box sx={{display: 'flex', alignItems: 'flex-end', gap: 2, flexWrap: 'wrap', mb: 1.5}}>
-        <FormControl size="small" sx={{flex: '1 1 200px', minWidth: 200}}>
+      <Box sx={{display: 'flex', alignItems: 'flex-end', gap: {xs: 1, sm: 2}, flexWrap: 'wrap', mb: 1.25}}>
+        <FormControl size="small" sx={{flex: {xs: '1 1 100%', sm: '1 1 200px'}, minWidth: 0}}>
           <InputLabel id="audio-mode-select">Audio mode</InputLabel>
           <Select
             labelId="audio-mode-select"
@@ -92,7 +92,7 @@ export default function RenderJobBar({
         </FormControl>
       </Box>
 
-      <Box sx={{display: 'flex', alignItems: 'center', gap: 2, flexWrap: 'wrap'}}>
+      <Box sx={{display: 'flex', alignItems: 'center', gap: {xs: 1, sm: 2}, flexWrap: 'wrap', mb: {xs: 1.25, md: 0}}}>
         {/* Current clip length (live controls) */}
         <Box sx={{flex: '1 1 auto', minWidth: 0}}>
           <Typography variant="overline" sx={{color: 'text.secondary', display: 'block', lineHeight: 1}}>
@@ -132,52 +132,6 @@ export default function RenderJobBar({
           />
         )}
 
-        {/* Action button */}
-        {busy ? (
-          <Button variant="contained" color="primary" disabled sx={{px: 3, py: 1, gap: 1}}>
-            <CircularProgress size={16} thickness={3} sx={{color: 'currentColor'}}/>
-            {status === JOB_STATES.QUEUED ? 'Queued…' : 'Rendering…'}
-          </Button>
-        ) : status === JOB_STATES.SUCCEEDED && downloadUrl ? (
-          <Button
-            variant="contained"
-            color="primary"
-            href={downloadUrl}
-            download
-            onClick={onDownload}
-            sx={{px: 3, py: 1}}
-          >
-            Download clip
-          </Button>
-        ) : isRenderFailure ? (
-          error.retryable ? (
-            <Button variant="outlined" color="primary" onClick={onRetry} sx={{px: 3, py: 1}}>
-              Try again
-            </Button>
-          ) : (
-            <Button variant="outlined" color="primary" onClick={onCreateNew} sx={{px: 3, py: 1}}>
-              Start new render
-            </Button>
-          )
-        ) : isTransportFailure ? (
-          <Button variant="outlined" color="primary" onClick={onRetryPoll} sx={{px: 3, py: 1}}>
-            Retry now
-          </Button>
-        ) : status === JOB_STATES.EXPIRED ? (
-          <Button variant="outlined" color="primary" onClick={onRetry} sx={{px: 3, py: 1}}>
-            Render again
-          </Button>
-        ) : (
-          <Button
-            variant="contained"
-            color="primary"
-            onClick={onCreateJob}
-            disabled={!ready}
-            sx={{px: 3, py: 1}}
-          >
-            Render clip
-          </Button>
-        )}
       </Box>
 
       {/* Live job-state announcement for screen readers */}
@@ -270,6 +224,27 @@ export default function RenderJobBar({
           </Button>
         </Box>
       )}
+
+      {/* The sole sticky mobile affordance sits after its supporting status,
+          errors, and saved-clip information in both DOM and tab order. */}
+      <Box className="cs-render-primary">
+        {busy ? (
+          <Button variant="contained" color="primary" disabled sx={{px: 3, py: 1, gap: 1, width: {xs: '100%', sm: 'auto'}}}>
+            <CircularProgress size={16} thickness={3} sx={{color: 'currentColor'}}/>
+            {status === JOB_STATES.QUEUED ? 'Queued…' : 'Rendering…'}
+          </Button>
+        ) : status === JOB_STATES.SUCCEEDED && downloadUrl ? (
+          <Button variant="contained" color="primary" href={downloadUrl} download onClick={onDownload} sx={{px: 3, py: 1, width: {xs: '100%', sm: 'auto'}}}>Download clip</Button>
+        ) : isRenderFailure ? (
+          <Button variant="outlined" color="primary" onClick={error.retryable ? onRetry : onCreateNew} sx={{px: 3, py: 1, width: {xs: '100%', sm: 'auto'}}}>{error.retryable ? 'Try again' : 'Start new render'}</Button>
+        ) : isTransportFailure ? (
+          <Button variant="outlined" color="primary" onClick={onRetryPoll} sx={{px: 3, py: 1, width: {xs: '100%', sm: 'auto'}}}>Retry now</Button>
+        ) : status === JOB_STATES.EXPIRED ? (
+          <Button variant="outlined" color="primary" onClick={onRetry} sx={{px: 3, py: 1, width: {xs: '100%', sm: 'auto'}}}>Render again</Button>
+        ) : (
+          <Button variant="contained" color="primary" onClick={onCreateJob} disabled={!ready} sx={{px: 3, py: 1, width: {xs: '100%', sm: 'auto'}}}>Render clip</Button>
+        )}
+      </Box>
     </Box>
   )
 }
