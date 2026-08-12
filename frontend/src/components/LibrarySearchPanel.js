@@ -330,7 +330,7 @@ export default function LibrarySearchPanel({
   const sortedSessions = orderSessionsOwnedFirst(sessions)
 
   return (
-    <Box className="cs-rise-2" sx={{display: 'flex', flexDirection: 'column', gap: 1.5}}>
+    <Box className="cs-rise-2" sx={{display: 'flex', flexDirection: 'column', gap: {xs: 1, sm: 1.5}}}>
       <TextField
         fullWidth
         variant="outlined"
@@ -403,7 +403,7 @@ export default function LibrarySearchPanel({
           <StateMessage variant="empty" title="Nothing is available here." hint="Try another season or return to the search results."/>
         )}
         {hierarchyActive && !hierarchyLoading && !hierarchyError && children?.length > 0 && (
-          <Grid container spacing={3} sx={{mx: 'auto', px: {xs: 2, sm: 3}}}>
+          <Grid container spacing={{xs: 1.5, sm: 3}} sx={{mx: 'auto'}}>
             {children.map(result => <LibraryResultCard key={result.ratingKey} result={result}
               active={result.ratingKey === selectedKey} onSelect={onSelect} onNavigate={handleNavigate}/>) }
           </Grid>
@@ -449,7 +449,7 @@ export default function LibrarySearchPanel({
         )}
 
         {!hierarchyActive && showResults && results.length > 0 && (
-          <Grid container spacing={3} sx={{mx: 'auto', px: {xs: 2, sm: 3}}}>
+          <Grid container spacing={{xs: 1.5, sm: 3}} sx={{mx: 'auto'}}>
             {results.map(result => (
               <LibraryResultCard
                 key={result.ratingKey}
@@ -472,7 +472,7 @@ export default function LibrarySearchPanel({
             ) : !sessions || sessions.length === 0 ? (
               <SessionEmptyState/>
             ) : (
-              <Grid container spacing={3} sx={{mx: 'auto', px: {xs: 2, sm: 3}}}>
+              <Grid container spacing={{xs: 1.5, sm: 3}} sx={{mx: 'auto'}}>
                 {sortedSessions.map(session => (
                   <SessionCard
                     key={session.ratingKey}

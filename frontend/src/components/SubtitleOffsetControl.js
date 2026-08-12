@@ -99,7 +99,7 @@ export default function SubtitleOffsetControl({value, onChange, disabled}) {
           disabled={disabled}
           onClick={() => step(-1)}
           sx={{
-            p: 0.25,
+            p: {xs: 1, sm: 0.25},
             color: 'text.secondary',
             '&:hover': {color: '#ff7300', backgroundColor: 'rgba(255,115,0,0.12)'},
           }}
@@ -116,14 +116,15 @@ export default function SubtitleOffsetControl({value, onChange, disabled}) {
             border: 0,
             background: 'transparent',
             px: 0.75,
-            py: 0.25,
+            py: {xs: 1, sm: 0.25},
             borderRadius: 999,
             cursor: disabled || !isNonZero ? 'default' : 'pointer',
             font: 'inherit',
             fontFamily: 'var(--cs-mono-font)',
             fontSize: '0.78rem',
             fontWeight: 600,
-            minWidth: 58,
+            minWidth: {xs: 72, sm: 58},
+            minHeight: {xs: 40, sm: 0},
             textAlign: 'center',
             color: isNonZero && !disabled ? '#ffd9b0' : 'text.secondary',
             '&:hover': disabled || !isNonZero ? {} : {backgroundColor: 'rgba(255,115,0,0.14)'},
@@ -138,7 +139,7 @@ export default function SubtitleOffsetControl({value, onChange, disabled}) {
           disabled={disabled}
           onClick={() => step(1)}
           sx={{
-            p: 0.25,
+            p: {xs: 1, sm: 0.25},
             color: 'text.secondary',
             '&:hover': {color: '#ff7300', backgroundColor: 'rgba(255,115,0,0.12)'},
           }}

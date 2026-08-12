@@ -97,6 +97,7 @@ export default function PlayerPane({
             color="primary"
             onClick={onApplyPreview}
             className="cs-preview-btn"
+            sx={{minHeight: 40, px: 1.5}}
           >
             Preview selection
           </Button>

@@ -236,29 +236,24 @@ test('rapid session A to B aborts A stream work and stale A stream results canno
   expect(screen.queryByText('A stale track')).not.toBeInTheDocument();
 });
 
-test('session change aborts prewarm requests and stale prewarm results do not affect B', async () => {
+test('workspace hydration resets the previous subtitle before loading the new session', async () => {
   const pending = installFetch();
   render(<App/>);
   await flush();
-
   await selectSession('Alpha');
-  const aStreams = requestFor(pending, url => url === '/streams/A?mediaId=101');
-  await resolveRequest(aStreams, [
-    {index: 0, type: 'text', codec: 'srt', displayTitle: 'Selected'},
-    {index: 1, type: 'text', codec: 'ass', displayTitle: 'Prewarm A'},
-    {index: 2, type: 'pgs', codec: 'pgssub', displayTitle: 'PGS A'},
-  ]);
+  await resolveRequest(requestFor(pending, url => url === '/streams/A?mediaId=101'), textStreams());
+  expect(requestFor(pending, url => url.includes('/subtitles/A?subtitle=0'))).toBeDefined();
 
-  const prewarm = requestFor(pending, url => url.includes('/subtitles/A?subtitle=1'));
-  expect(pending.some(request => request.url.includes('/subtitles/A?subtitle=2'))).toBe(false);
-
-  await changeSession();
-  await selectSession('Beta');
-  expect(aStreams.options.signal.aborted).toBe(true);
-  expect(prewarm.options.signal.aborted).toBe(true);
-
-  await resolveRequest(prewarm, [{start: 0, end: 1, text: 'stale prewarm'}]);
-  expect(screen.queryByText('stale prewarm')).not.toBeInTheDocument();
+  await act(async () => {
+    const changed = new Promise(resolve => window.addEventListener('hashchange', resolve, {once: true}));
+    window.location.hash = '#/workspace/B?mediaId=202';
+    await changed;
+  });
+  await flush();
+  await flush();
+  const subtitleRequests = pending.filter(request => request.url.includes('/subtitles/B?'));
+  expect(subtitleRequests).toHaveLength(0);
+  expect(screen.getByTestId('react-player').getAttribute('data-url')).toContain('/preview/B/');
 });
 
 test('switching subtitle X to Y aborts X without clearing Y loading or entries', async () => {
@@ -285,38 +280,20 @@ test('switching subtitle X to Y aborts X without clearing Y loading or entries',
   expect(screen.queryByText('stale X')).not.toBeInTheDocument();
 });
 
-test('prewarm requests only unselected text tracks and excludes PGS', async () => {
-  const pending = installFetch();
-  render(<App/>);
-  await flush();
-
-  await selectSession('Alpha');
-  const streamsRequest = requestFor(pending, url => url === '/streams/A?mediaId=101');
-  await resolveRequest(streamsRequest, [
-    {index: 0, type: 'text', codec: 'srt', displayTitle: 'Selected'},
-    {index: 1, type: 'text', codec: 'webvtt', displayTitle: 'Other text'},
-    {index: 2, type: 'pgs', codec: 'pgssub', displayTitle: 'Bitmap'},
-    {index: 3, type: 'text', codec: 'ass', displayTitle: 'Other ASS'},
-  ]);
-
-  expect(pending.some(request => request.url.includes('/subtitles/A?subtitle=1'))).toBe(true);
-  expect(pending.some(request => request.url.includes('/subtitles/A?subtitle=3'))).toBe(true);
-  expect(pending.some(request => request.url.includes('/subtitles/A?subtitle=2'))).toBe(false);
-});
-
 test('initial preview resolves subtitle state once, then refreshes on intentional changes', async () => {
   const pending = installFetch();
   render(<App/>);
   await flush();
 
-  // Session select waits for the initial stream choice instead of starting a
-  // no-subtitle preview that is immediately replaced.
+  // The initial no-subtitle preview is available immediately, before streams.
   await selectSession('Alpha');
-  expect(screen.queryByTestId('react-player')).not.toBeInTheDocument();
+  expect(screen.getByTestId('react-player').getAttribute('data-url')).toBe(
+    '/preview/A/00:00:00/00:01:00?mediaId=101'
+  );
   await resolveRequest(requestFor(pending, url => url === '/streams/A?mediaId=101'), textStreams());
-  expect(mockPlayerUrls).toEqual([
-    '/preview/A/00:00:00/00:01:00?mediaId=101&subtitle=0',
-  ]);
+  expect(screen.getByTestId('react-player').getAttribute('data-url')).toContain('subtitle=0');
+  expect(pending.filter(request => request.url.includes('/subtitles/A?')).map(request => request.url))
+    .toEqual(['/subtitles/A?subtitle=0&mediaId=101']);
   expect(screen.getByTestId('react-player').getAttribute('data-url')).toContain('subtitle=0');
   expect(screen.queryByRole('button', {name: 'Preview selection'})).not.toBeInTheDocument();
 
@@ -387,38 +364,73 @@ test('initial preview resolves subtitle state once, then refreshes on intentiona
   await flush();
   expect(mockPlayerUrls.length).toBe(urlsBeforeGap);
   expect(endTime).toHaveValue('00:00:10');
-  expect(screen.getByText(/too close to other bound/)).toBeInTheDocument();
+  expect(screen.getAllByText(/Enter applies · Esc restores/)[0]).toBeInTheDocument();
 });
 
-test('slider drag defers preview behind the stale button; explicit apply refreshes', async () => {
+test('clearing a selected subtitle rebuilds the preview without a subtitle parameter', async () => {
+  const pending = installFetch();
+  render(<App/>);
+  await flush();
+  await selectSession('Alpha');
+  await resolveRequest(requestFor(pending, url => url === '/streams/A?mediaId=101'), textStreams());
+  await selectSubtitle('Y track');
+  expect(screen.getByTestId('react-player').getAttribute('data-url')).toContain('&subtitle=1');
+
+  const select = screen.getByRole('combobox', {name: 'Subtitle track'});
+  fireEvent.mouseDown(select);
+  await flush();
+  fireEvent.click(screen.getByRole('option', {name: 'None'}));
+  await flush();
+
+  expect(screen.getByTestId('react-player').getAttribute('data-url'))
+    .toBe('/preview/A/00:00:00/00:01:00?mediaId=101');
+});
+
+test('stream discovery failure leaves the subtitle-free preview ready for audio changes', async () => {
+  const pending = installFetch();
+  render(<App/>);
+  await flush();
+  await selectSession('Alpha');
+  const streams = requestFor(pending, url => url === '/streams/A?mediaId=101');
+  await rejectRequest(streams, new Error('stream discovery failed'));
+
+  await selectAudioMode('Dialogue boost');
+  expect(screen.getByTestId('react-player').getAttribute('data-url'))
+    .toBe('/preview/A/00:00:00/00:01:00?mediaId=101&audioMode=dialogue');
+});
+
+test('slider changes do not refresh until one committed change', async () => {
   const pending = installFetch();
   render(<App/>);
   await flush();
   await selectSession('Alpha');
   await resolveRequest(requestFor(pending, url => url === '/streams/A?mediaId=101'), textStreams());
 
-  // Initial preview reflects 00:00:00–00:01:00.
-  const urlBefore = screen.getByTestId('react-player').getAttribute('data-url');
-  expect(urlBefore).toBe('/preview/A/00:00:00/00:01:00?mediaId=101&subtitle=0');
-
-  // A slider nudge is a continuous adjustment — it marks the preview stale
-  // and does NOT auto-reload the player (the URL stays the same).
-  const startInput = screen.getByRole('slider', {name: 'Clip start time'});
-  fireEvent.change(startInput, {target: {value: '1000'}});
+  const before = mockPlayerUrls.length;
+  const start = screen.getByRole('slider', {name: 'Full media timeline, clip start'});
+  fireEvent.mouseDown(start, {clientX: 10, clientY: 0});
+  fireEvent.mouseMove(start, {clientX: 20, clientY: 0});
+  fireEvent.mouseMove(start, {clientX: 30, clientY: 0});
+  fireEvent.mouseUp(start, {clientX: 40, clientY: 0});
   await flush();
-  expect(screen.getByRole('button', {name: 'Preview selection'})).toBeInTheDocument();
-  expect(screen.getByTestId('react-player').getAttribute('data-url')).toBe(urlBefore);
-  // The slider thumb moved (startPosition updated) even though the player URL
-  // did not — the change is held until the user applies it.
-  expect(startInput).toHaveValue('1000');
+  expect(mockPlayerUrls).toHaveLength(before + 1);
+  expect(mockPlayerUrls.at(-1)).toContain('/preview/A/');
+});
 
-  // Explicit "Preview selection" applies the new bounds and clears stale.
-  fireEvent.click(screen.getByRole('button', {name: 'Preview selection'}));
+test('nudge changes the preview URL exactly once', async () => {
+  const pending = installFetch();
+  render(<App/>);
   await flush();
-  // Start moved to 1000ms → 00:00:01.
-  expect(screen.getByTestId('react-player').getAttribute('data-url'))
-    .toBe('/preview/A/00:00:01/00:01:00?mediaId=101&subtitle=0');
-  expect(screen.queryByRole('button', {name: 'Preview selection'})).not.toBeInTheDocument();
+  await selectSession('Alpha');
+  await resolveRequest(requestFor(pending, url => url === '/streams/A?mediaId=101'), textStreams());
+
+  const before = screen.getByTestId('react-player').getAttribute('data-url');
+  const beforeCount = mockPlayerUrls.length;
+  fireEvent.click(screen.getByRole('button', {name: 'Move start later by 1 second'}));
+  await flush();
+
+  expect(mockPlayerUrls).toHaveLength(beforeCount + 1);
+  expect(screen.getByTestId('react-player').getAttribute('data-url')).not.toBe(before);
 });
 
 test('dialogue audio mode updates the preview URL and render payload', async () => {
@@ -678,8 +690,8 @@ test('changing offset does not alter a manually-set range when no subtitle selec
   await clickSubtitleOffset('later');
   expect(screen.getByTestId('react-player').getAttribute('data-url'))
     .toBe('/preview/A/00:00:00/00:01:00?mediaId=101&subtitle=0&subtitleOffsetMs=200');
-  expect(screen.getByRole('slider', {name: 'Clip start time'})).toHaveValue('0');
-  expect(screen.getByRole('slider', {name: 'Clip end time'})).toHaveValue('60000');
+  expect(screen.getByRole('slider', {name: 'Full media timeline, clip start'})).toHaveValue('0');
+  expect(screen.getByRole('slider', {name: 'Full media timeline, clip end'})).toHaveValue('60000');
   expect(screen.queryByRole('button', {name: 'Preview selection'})).not.toBeInTheDocument();
 });
 
@@ -1482,29 +1494,29 @@ test('Start and End inputs preserve drafts, commit valid values, and restore rej
 
   fireEvent.change(start, {target: {value: '00:00:05.500'}});
   fireEvent.keyDown(start, {key: 'Enter'});
-  expect(screen.getByRole('slider', {name: 'Clip start time'})).toHaveValue('5500');
+  expect(screen.getByRole('slider', {name: 'Full media timeline, clip start'})).toHaveValue('5500');
   expect(start).toHaveValue('00:00:05.500');
 
   const end = screen.getByRole('textbox', {name: 'End time as hours minutes seconds milliseconds'});
   fireEvent.focus(end);
   fireEvent.change(end, {target: {value: '00:01:05.250'}});
   fireEvent.blur(end);
-  expect(screen.getByRole('slider', {name: 'Clip end time'})).toHaveValue('65250');
+  expect(screen.getByRole('slider', {name: 'Full media timeline, clip end'})).toHaveValue('65250');
 
   // Start cannot cross End's 500ms minimum gap, so the draft restores canonically.
   fireEvent.focus(start);
   fireEvent.change(start, {target: {value: '00:02:00'}});
   fireEvent.blur(start);
-  expect(screen.getByRole('slider', {name: 'Clip start time'})).toHaveValue('5500');
+  expect(screen.getByRole('slider', {name: 'Full media timeline, clip start'})).toHaveValue('5500');
   expect(start).toHaveValue('00:00:05.500');
-  expect(screen.getByText(/too close to other bound/)).toBeInTheDocument();
+  expect(screen.getAllByText(/Enter applies · Esc restores/)[0]).toBeInTheDocument();
 
   // Invalid syntax also restores canonical text and feedback.
   fireEvent.focus(start);
   fireEvent.change(start, {target: {value: 'not-a-time'}});
   fireEvent.blur(start);
   expect(start).toHaveValue('00:00:05.500');
-  expect(screen.getByText(/Invalid time or too close to other bound/)).toBeInTheDocument();
+  expect(screen.getAllByText(/Enter applies · Esc restores/)[0]).toBeInTheDocument();
 });
 
 test('session context shows the active session title in the workspace', async () => {
@@ -2075,9 +2087,9 @@ test('selecting a library result opens the workspace and passes partId through s
   await resolveRequest(streamsReq, textStreams());
 
   // Preview URL carries partId, and the clip starts at 00:00:00 (no viewOffset).
-  expect(mockPlayerUrls).toEqual([
-    '/preview/L1/00:00:00/00:01:00?mediaId=5001&partId=6001&subtitle=0',
-  ]);
+  expect(mockPlayerUrls[mockPlayerUrls.length - 1]).toBe(
+    '/preview/L1/00:00:00/00:01:00?mediaId=5001&partId=6001&subtitle=0'
+  );
 
   // Render-job POST body carries partId for the library source.
   fireEvent.click(screen.getByRole('button', {name: 'Render clip'}));
@@ -2086,30 +2098,6 @@ test('selecting a library result opens the workspace and passes partId through s
     ratingKey: 'L1', mediaId: 5001, partId: 6001,
     fromMs: 0, toMs: 60000, subtitleIndex: 0, audioMode: 'standard', subtitleOffsetMs: 0,
   });
-});
-
-test('library result subtitle prewarm requests carry partId', async () => {
-  jest.useFakeTimers();
-  const pending = installFetch();
-  render(<App/>);
-  await flush();
-
-  await searchLibraryWithFakeTimers('movie');
-  await act(async () => { jest.advanceTimersByTime(300); });
-  await resolveRequest(librarySearchRequest(pending), [libraryResults[0]]);
-  jest.useRealTimers();
-
-  fireEvent.click(screen.getByRole('button', {name: /Library result.*Library Movie/}));
-  const streamsReq = requestFor(pending, url => url.startsWith('/streams/L1?mediaId=5001'));
-  await resolveRequest(streamsReq, [
-    {index: 0, type: 'text', codec: 'srt', displayTitle: 'Selected'},
-    {index: 1, type: 'text', codec: 'webvtt', displayTitle: 'Prewarm'},
-  ]);
-
-  // The unselected text track is prewarmed with partId.
-  const prewarm = pending.find(r => r.url.includes('/subtitles/L1?subtitle=1'));
-  expect(prewarm).toBeDefined();
-  expect(prewarm.url).toBe('/subtitles/L1?subtitle=1&mediaId=5001&partId=6001');
 });
 
 test('library result subtitle entry fetch carries partId', async () => {

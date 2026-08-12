@@ -33,43 +33,18 @@ export default function ClipWorkspace({
         changeDisabledReason={changeSessionDisabledReason}
       />
       <Box className={`cs-workspace${theaterMode ? ' cs-workspace--theater' : ''}`}>
-        {/* Left: player + trim + render controls */}
-        <Box sx={{display: 'flex', flexDirection: 'column', minWidth: 0}}>
+        <Box className="cs-workspace-preview" sx={{minWidth: 0}}>
           <PlayerPane
-            playerUrl={playerUrl}
-            onError={onPlayerError}
-            onReady={onPlayerReady}
-            previewStale={previewStale}
-            onApplyPreview={onApplyPreview}
-            theaterMode={theaterMode}
-            onToggleTheater={onToggleTheater}
+            playerUrl={playerUrl} onError={onPlayerError} onReady={onPlayerReady}
+            previewStale={previewStale} onApplyPreview={onApplyPreview}
+            theaterMode={theaterMode} onToggleTheater={onToggleTheater}
           />
+        </Box>
+        <Box className="cs-workspace-trim" sx={{minWidth: 0}}>
           <TrimScrubber
-            duration={session.duration}
-            startPosition={startPosition}
-            endPosition={endPosition}
-            onRangeChange={onRangeChange}
-            onStartChange={onStartChange}
-            onEndChange={onEndChange}
-            trimFlashKey={trimFlashKey}
-          />
-          {/* Render job / status / controls live directly under the video and
-              trim times so the whole left rail reads as the "clip" workflow. */}
-          <RenderJobBar
-            startPosition={startPosition}
-            endPosition={endPosition}
-            selectedSubtitle={subtitle}
-            audioMode={audioMode}
-            onAudioModeChange={onAudioModeChange}
-            renderState={renderState}
-            jobSpec={jobSpec}
-            controlsChangedSinceJob={controlsChangedSinceJob}
-            onCreateJob={onCreateJob}
-            onDownload={onDownloadJob}
-            onRetry={onRetryJob}
-            onRetryPoll={onRetryPoll}
-            onCreateNew={onCreateNewJob}
-            onOpenClip={onOpenClip}
+            duration={session.duration} startPosition={startPosition} endPosition={endPosition}
+            onRangeChange={onRangeChange} onStartChange={onStartChange}
+            onEndChange={onEndChange} trimFlashKey={trimFlashKey}
           />
         </Box>
 
@@ -97,6 +72,15 @@ export default function ClipWorkspace({
               />
             </Box>
           </Paper>
+        </Box>
+        <Box className="cs-workspace-render" sx={{minWidth: 0}}>
+          <RenderJobBar
+            startPosition={startPosition} endPosition={endPosition} selectedSubtitle={subtitle}
+            audioMode={audioMode} onAudioModeChange={onAudioModeChange}
+            renderState={renderState} jobSpec={jobSpec} controlsChangedSinceJob={controlsChangedSinceJob}
+            onCreateJob={onCreateJob} onDownload={onDownloadJob} onRetry={onRetryJob}
+            onRetryPoll={onRetryPoll} onCreateNew={onCreateNewJob} onOpenClip={onOpenClip}
+          />
         </Box>
       </Box>
     </>

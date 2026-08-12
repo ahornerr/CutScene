@@ -24,7 +24,7 @@ export function ClipDeleteDialog({open, clip, deleting, error, onConfirm, onClos
       maxWidth="xs"
       fullWidth
     >
-      <DialogTitle id="clip-delete-title" sx={{fontWeight: 700}}>
+      <DialogTitle id="clip-delete-title" sx={{fontWeight: 700, overflowWrap: 'anywhere', lineHeight: 1.2}}>
         Delete {title}?
       </DialogTitle>
       <DialogContent>
@@ -40,7 +40,7 @@ export function ClipDeleteDialog({open, clip, deleting, error, onConfirm, onClos
           </Typography>
         )}
       </DialogContent>
-      <DialogActions sx={{px: 3, pb: 2.5, gap: 1}}>
+      <DialogActions sx={{px: {xs: 2, sm: 3}, pb: {xs: 2, sm: 2.5}, gap: 1, flexDirection: {xs: 'column', sm: 'row'}, alignItems: 'stretch'}}>
         {isAuthError ? (
           <>
             <Button
@@ -48,7 +48,7 @@ export function ClipDeleteDialog({open, clip, deleting, error, onConfirm, onClos
               disabled={deleting}
               variant="outlined"
               color="primary"
-              sx={{borderColor: 'rgba(255,255,255,0.2)'}}
+              sx={{borderColor: 'rgba(255,255,255,0.2)', width: {xs: '100%', sm: 'auto'}}}
             >
               Cancel
             </Button>
@@ -56,7 +56,7 @@ export function ClipDeleteDialog({open, clip, deleting, error, onConfirm, onClos
               variant="contained"
               color="primary"
               href="/authUrl"
-              sx={{px: 3, py: 1}}
+              sx={{px: 3, py: 1, width: {xs: '100%', sm: 'auto'}}}
             >
               Reload and sign in
             </Button>
@@ -68,7 +68,7 @@ export function ClipDeleteDialog({open, clip, deleting, error, onConfirm, onClos
               disabled={deleting}
               variant="outlined"
               color="primary"
-              sx={{borderColor: 'rgba(255,255,255,0.2)'}}
+              sx={{borderColor: 'rgba(255,255,255,0.2)', width: {xs: '100%', sm: 'auto'}}}
             >
               Cancel
             </Button>
@@ -79,7 +79,7 @@ export function ClipDeleteDialog({open, clip, deleting, error, onConfirm, onClos
               color="error"
               startIcon={deleting ? <CircularProgress size={16} thickness={3} sx={{color: 'currentColor'}}/> : null}
               sx={{
-                backgroundColor: '#c0392b', color: '#fff',
+                backgroundColor: '#c0392b', color: '#fff', width: {xs: '100%', sm: 'auto'},
                 '&:hover': {backgroundColor: '#a93226'},
               }}
             >

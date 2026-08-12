@@ -103,7 +103,7 @@ export default function ClipDetail({clipId, onBack, onDeleted}) {
   const artworkUrl = clip?.artworkUrl || ''
 
   return (
-    <Box className="cs-rise" sx={{display: 'flex', flexDirection: 'column', gap: 2.5}}>
+    <Box className="cs-rise" sx={{display: 'flex', flexDirection: 'column', gap: {xs: 2, sm: 2.5}}}>
       <Box sx={{display: 'flex', alignItems: 'center', gap: 1, flexWrap: 'wrap'}}>
         {onBack && (
           <Button
@@ -153,12 +153,12 @@ export default function ClipDetail({clipId, onBack, onDeleted}) {
       )}
 
       {clip && (
-        <Box sx={{display: 'flex', flexDirection: 'column', gap: 2.5}}>
+        <Box sx={{display: 'flex', flexDirection: 'column', gap: {xs: 2, sm: 2.5}}}>
           <Box sx={{minWidth: 0}}>
             <Typography variant="overline" className="cs-section-label" sx={{color: '#ff7300'}}>
               Clip
             </Typography>
-            <Typography variant="h4" sx={{mt: 0.5, wordBreak: 'break-word'}}>
+            <Typography variant="h4" sx={{mt: 0.5, overflowWrap: 'anywhere', fontSize: {xs: '1.55rem', sm: '2.125rem'}, lineHeight: 1.15}}>
               {displayTitle}
             </Typography>
             {(mediaPrimary || mediaSecondary) && (
@@ -215,7 +215,7 @@ export default function ClipDetail({clipId, onBack, onDeleted}) {
                 poster={artworkUrl || undefined}
                 aria-label={`Video player for ${displayTitle}`}
                 onError={() => setVideoError(true)}
-                sx={{width: '100%', maxHeight: '70vh', display: 'block', background: '#000'}}
+                sx={{width: '100%', aspectRatio: '16 / 9', maxHeight: {xs: '56vh', sm: '70vh'}, display: 'block', background: '#000', objectFit: 'contain'}}
               />
             ) : videoError ? (
               <Box sx={{p: 4, textAlign: 'center', display: 'flex', flexDirection: 'column', gap: 1.5, alignItems: 'center'}}>
@@ -250,27 +250,27 @@ export default function ClipDetail({clipId, onBack, onDeleted}) {
             )}
           </Paper>
 
-          <Box sx={{display: 'flex', flexWrap: 'wrap', gap: 1.5, alignItems: 'center'}}>
+          <Box sx={{display: 'flex', flexWrap: 'wrap', gap: 1, alignItems: 'center'}}>
             {downloadUrl && (
               <Button
                 variant="contained"
                 color="primary"
                 href={downloadUrl}
                 download
-                sx={{px: 3, py: 1}}
+                sx={{px: 3, py: 1, width: {xs: '100%', sm: 'auto'}}}
               >
                 Download clip
               </Button>
             )}
             <CopyShareLinkButton shareUrl={clip.shareUrl} />
-            <Box sx={{flex: 1}}/>
+            <Box sx={{display: {xs: 'none', sm: 'block'}, flex: 1}}/>
             {canDelete ? (
               <Tooltip title="Delete this clip permanently">
                 <Button
                   variant="outlined"
                   onClick={() => setDeleteOpen(true)}
                   sx={{
-                    px: 2.5, py: 1, color: '#ffb4a8',
+                    px: 2.5, py: 1, width: {xs: '100%', sm: 'auto'}, color: '#ffb4a8',
                     borderColor: 'rgba(255,90,90,0.4)',
                     '&:hover': {borderColor: 'rgba(255,90,90,0.7)', backgroundColor: 'rgba(255,90,90,0.08)'},
                   }}
@@ -299,11 +299,11 @@ export default function ClipDetail({clipId, onBack, onDeleted}) {
           </Box>
 
           {clip.shareUrl && (
-            <Paper variant="outlined" sx={{p: 1.5, borderColor: 'rgba(255,255,255,0.08)', backgroundColor: 'rgba(0,0,0,0.16)'}}>
+            <Paper variant="outlined" sx={{p: {xs: 1.25, sm: 1.5}, borderColor: 'rgba(255,255,255,0.08)', backgroundColor: 'rgba(0,0,0,0.16)'}}>
               <Typography variant="caption" sx={{color: 'text.secondary', display: 'block', mb: 0.5}}>
                 Public share link
               </Typography>
-              <Typography sx={{fontFamily: 'var(--cs-mono-font)', fontSize: '0.82rem', wordBreak: 'break-all', color: 'text.primary'}}>
+              <Typography sx={{fontFamily: 'var(--cs-mono-font)', fontSize: {xs: '0.75rem', sm: '0.82rem'}, overflowWrap: 'anywhere', wordBreak: 'break-word', color: 'text.primary', lineHeight: 1.55}}>
                 {clip.shareUrl}
               </Typography>
               <Typography variant="caption" sx={{color: 'text.disabled', display: 'block', mt: 0.5}}>

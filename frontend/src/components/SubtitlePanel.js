@@ -20,12 +20,12 @@ export default function SubtitlePanel({
   return (
     <Box className="cs-rise-3" sx={{display: 'flex', flexDirection: 'column', minHeight: 0, height: '100%'}}>
       <Box sx={{
-        display: 'flex', alignItems: 'center', gap: 1.5, flexWrap: 'wrap',
+        display: 'flex', alignItems: 'center', gap: {xs: 1, sm: 1.5}, flexWrap: 'wrap',
         // Slightly taller bar gives the track selector + offset stepper more
         // presence as a distinct subtitle control bar.
         py: 0.75, minHeight: 52,
       }}>
-        <FormControl fullWidth size="small" sx={{maxWidth: 280}}>
+        <FormControl fullWidth size="small" sx={{maxWidth: {xs: 'none', sm: 280}}}>
           <InputLabel id="subtitle-select">Subtitle track</InputLabel>
           <Select
             labelId="subtitle-select"
