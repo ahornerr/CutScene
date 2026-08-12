@@ -514,6 +514,49 @@ func (a *Application) getMetadataItem(ctx context.Context, ratingKey string, use
 	return &metadata, nil
 }
 
+// GetLibrarySource resolves one caller-visible library Media/Part pair and
+// reduces it to the stable LibrarySearchResult contract. The explicit IDs are
+// required to keep a deep link bound to exactly the source it names.
+func (a *Application) GetLibrarySource(ctx context.Context, ratingKey string, mediaID, partID int64) (LibrarySearchResult, error) {
+	ratingKey, err := validateLibraryRatingKey(ratingKey)
+	if err != nil {
+		return LibrarySearchResult{}, err
+	}
+	if mediaID <= 0 {
+		return LibrarySearchResult{}, errors.New("mediaId is invalid")
+	}
+	if partID <= 0 {
+		return LibrarySearchResult{}, errors.New("partId is invalid")
+	}
+	token := AuthTokenFromContext(ctx)
+	if token == nil || strings.TrimSpace(*token) == "" {
+		return LibrarySearchResult{}, errors.New("missing auth token")
+	}
+
+	sourceCtx, cancel := context.WithTimeout(ctx, librarySearchTimeout)
+	defer cancel()
+	metadata, err := a.getMetadataItem(sourceCtx, ratingKey, true)
+	if err != nil {
+		return LibrarySearchResult{}, err
+	}
+	media, part, err := resolveLibraryMetadataSource(metadata, mediaID, partID)
+	if err != nil {
+		return LibrarySearchResult{}, err
+	}
+	duration, err := selectedSourceDuration(media, part)
+	if err != nil {
+		return LibrarySearchResult{}, err
+	}
+	result := librarySearchResultFromMetadata(metadata, media, part)
+	// Keep the discovery formatter's title-duration fallback when the selected
+	// source does not carry its own duration. In particular, a single-part
+	// source may only expose duration on the top-level metadata item.
+	if duration > 0 {
+		result.Duration = duration
+	}
+	return result, nil
+}
+
 func (a *Application) plexSourceToken(ctx context.Context, userScoped bool) string {
 	if userScoped {
 		if token := AuthTokenFromContext(ctx); token != nil && strings.TrimSpace(*token) != "" {
