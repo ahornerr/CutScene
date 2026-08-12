@@ -171,6 +171,8 @@ function App() {
   // workspace state (selectedSession, render job, etc.) is retained across
   // navigation so the render workflow is never disrupted.
   const [view, setView] = useState(() => viewFromHash(window.location.hash))
+  const activeJobRef = useRef(false)
+  const selectedSessionRef = useRef(null)
 
   // Hash navigation is deliberately kept outside the workspace state. The
   // browser owns the history entries, while this listener makes back/forward
@@ -178,6 +180,24 @@ function App() {
   useEffect(() => {
     const syncViewToHash = () => {
       const nextView = viewFromHash(window.location.hash)
+
+      // An active render owns its source workspace. History navigation must
+      // not hydrate a different source over it or strand the running job.
+      const activeSession = selectedSessionRef.current
+      if (
+        activeJobRef.current &&
+        nextView.name === 'workspace' &&
+        activeSession &&
+        !sessionMatchesWorkspace(activeSession, nextView)
+      ) {
+        const canonicalView = workspaceViewForSession(activeSession)
+        if (canonicalView) {
+          setView(canonicalView)
+          window.history.replaceState(null, '', hashForView(canonicalView))
+          return
+        }
+      }
+
       setView(nextView)
 
       // Invalid routes resolve to the canonical home URL without adding a
@@ -204,6 +224,7 @@ function App() {
 
   // --- Active clip state ---
   const [selectedSession, setSelectedSession] = useState(null)
+  selectedSessionRef.current = selectedSession
   const [startPosition, setStartPosition] = useState(null)
   const [endPosition, setEndPosition] = useState(null)
   const [playerUrl, setPlayerUrl] = useState(null)
@@ -391,7 +412,7 @@ function App() {
     // Session polling is gated to the home view: the library and clip detail
     // views don't need live session data, and polling in the background
     // would compete for the network and surface stale workspace alerts.
-    const pickerVisible = view.name === 'home' && !selectedSession && !needsAuth && documentVisible
+    const pickerVisible = view.name === 'home' && !needsAuth && documentVisible
     if (!pickerVisible) {
       stopSessionRefresh()
       return undefined
@@ -966,6 +987,7 @@ function App() {
 
   // ---------------------------------------------------------------- session switching (blocked during active job)
   const jobIsActive = isActive(renderState.status)
+  activeJobRef.current = jobIsActive
 
   // ---------------------------------------------------------------- hash navigation
   const navigateTo = useCallback((nextView, replace = false) => {
@@ -1058,6 +1080,15 @@ const handleLibraryAuthRequired = useCallback(() => setNeedsAuth(true), [])
     workspaceHydrationControllerRef.current = null
 
     if (view.name !== 'workspace') return undefined
+    if (
+      activeJobRef.current &&
+      selectedSession &&
+      !sessionMatchesWorkspace(selectedSession, view)
+    ) {
+      const canonicalView = workspaceViewForSession(selectedSession)
+      if (canonicalView) navigateTo(canonicalView, true)
+      return undefined
+    }
     if (selectedSession && sessionMatchesWorkspace(selectedSession, view)) {
       stopSessionRefresh()
       return undefined

@@ -1683,6 +1683,32 @@ test('selecting an active session serializes its canonical workspace URL', async
   expect(screen.getByText('Now clipping')).toBeInTheDocument();
 });
 
+test('active render rejects a different workspace hash and keeps polling the active source', async () => {
+  const pending = installFetch();
+  render(<App/>);
+  await flush();
+  await selectSession('Alpha');
+
+  fireEvent.click(screen.getByRole('button', {name: 'Render clip'}));
+  const createRequest = requestFor(pending, url => url === '/render-jobs');
+  await resolveRequestWith(createRequest, {id: 'job-route-guard', status: 'queued'}, {status: 202});
+  const poll = requestFor(pending, url => url === '/render-jobs/job-route-guard');
+  await resolveRequest(poll, {id: 'job-route-guard', status: 'running'});
+
+  await act(async () => {
+    const changed = new Promise(resolve => window.addEventListener('hashchange', resolve, {once: true}));
+    window.location.hash = '#/workspace/B?mediaId=202';
+    await changed;
+  });
+  await flush();
+
+  expect(window.location.hash).toBe('#/workspace/A?mediaId=101');
+  expect(screen.getByText('Alpha')).toBeInTheDocument();
+  expect(screen.getByText('Rendering')).toBeInTheDocument();
+  expect(poll.options.signal.aborted).toBe(false);
+  expect(pending.some(request => request.url.startsWith('/streams/B'))).toBe(false);
+});
+
 test('workspace selection followed by browser back or home shows the picker at #/', async () => {
   const pending = installFetch(response(sessions));
   render(<App/>);
@@ -1871,6 +1897,26 @@ test('a library workspace deep link hydrates through the explicit source endpoin
   expect(window.location.hash).toBe('#/workspace/L1?mediaId=5001&partId=6001');
   expect(screen.getByText('From your Plex library')).toBeInTheDocument();
   expect(requestFor(pending, url => url === '/streams/L1?mediaId=5001&partId=6001')).toBeDefined();
+});
+
+test('returning home after library workspace hydration restarts session loading', async () => {
+  window.history.replaceState(null, '', '#/workspace/L1?mediaId=5001&partId=6001');
+  const {sessionRequests, pending} = installTrackedSessionsFetch();
+  render(<App/>);
+  await flush();
+
+  const sourceRequest = requestFor(pending, url => url === '/library/source/L1?mediaId=5001&partId=6001');
+  await resolveRequest(sourceRequest, libraryResults[0]);
+  expect(screen.getByText('From your Plex library')).toBeInTheDocument();
+
+  fireEvent.click(screen.getByRole('button', {name: 'CutScene home'}));
+  await flush();
+  expect(window.location.hash).toBe('#/');
+  expect(sessionRequests).toHaveLength(1);
+
+  await resolveRequest(sessionRequests[0], sessions);
+  expect(screen.getByText('Pick something to clip')).toBeInTheDocument();
+  expect(screen.queryByText('Loading sessions…')).not.toBeInTheDocument();
 });
 
 function librarySearchRequest(pending, occurrence = 0) {

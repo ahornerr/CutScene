@@ -548,7 +548,12 @@ func (a *Application) GetLibrarySource(ctx context.Context, ratingKey string, me
 		return LibrarySearchResult{}, err
 	}
 	result := librarySearchResultFromMetadata(metadata, media, part)
-	result.Duration = duration
+	// Keep the discovery formatter's title-duration fallback when the selected
+	// source does not carry its own duration. In particular, a single-part
+	// source may only expose duration on the top-level metadata item.
+	if duration > 0 {
+		result.Duration = duration
+	}
 	return result, nil
 }
 

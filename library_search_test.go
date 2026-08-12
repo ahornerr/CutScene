@@ -695,6 +695,29 @@ func TestGetLibrarySourceResolvesOneCallerSourceAndNormalizesIt(t *testing.T) {
 	}
 }
 
+func TestGetLibrarySourcePreservesTitleDurationFallback(t *testing.T) {
+	plex := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/library/metadata/movie-duration" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"MediaContainer":{"Metadata":[{"ratingKey":"movie-duration","type":"movie","title":"Title duration only","duration":75000,"Media":[{"id":21,"Part":[{"id":31,"key":"/library/parts/31/file"}]}]}]}}`)
+	}))
+	defer plex.Close()
+	config := Config{}
+	config.Plex.Host = plex.URL
+	app := &Application{config: config}
+
+	result, err := app.GetLibrarySource(ContextWithAuthToken(context.Background(), "caller-token"), "movie-duration", 21, 31)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Duration != 75000 {
+		t.Fatalf("duration = %d, want title-level duration 75000: %+v", result.Duration, result)
+	}
+}
+
 func TestLibrarySourceAPIUsesAuthValidationAndNotFoundConventions(t *testing.T) {
 	plex := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNotFound)
