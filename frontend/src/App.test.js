@@ -3,6 +3,7 @@ import {act, fireEvent, render, screen} from '@testing-library/react';
 import App from './App';
 import TrimScrubber from './components/TrimScrubber';
 import {renderSubtitleMarkup, stripSubtitleMarkup} from './components/subtitle-markup';
+import {getAvailableResolutionChoices} from './components/render-jobs';
 
 const mockPlayerUrls = [];
 
@@ -23,11 +24,11 @@ jest.mock('react-player', () => {
 const sessions = [
   {
     ratingKey: 'A', type: 'movie', title: 'Alpha', year: 2024, viewOffset: 0, duration: 120000,
-    User: {title: 'viewer'}, Media: [{Part: [{id: '101'}]}],
+    User: {title: 'viewer'}, Media: [{height: 1080, Part: [{id: '101'}]}],
   },
   {
     ratingKey: 'B', type: 'movie', title: 'Beta', year: 2024, viewOffset: 5000, duration: 120000,
-    User: {title: 'viewer'}, Media: [{Part: [{id: '202'}]}],
+    User: {title: 'viewer'}, Media: [{height: 720, Part: [{id: '202'}]}],
   },
 ];
 
@@ -187,6 +188,14 @@ function textStreams() {
     {index: 1, type: 'text', codec: 'webvtt', displayTitle: 'Y track'},
   ];
 }
+
+test('quality choices never offer an upscale and fall back to native safely', () => {
+  expect(getAvailableResolutionChoices(1080).map(choice => choice.value)).toEqual(['1080p', '720p', '480p']);
+  expect(getAvailableResolutionChoices(720).map(choice => choice.value)).toEqual(['720p', '480p']);
+  expect(getAvailableResolutionChoices(480).map(choice => choice.value)).toEqual(['480p']);
+  expect(getAvailableResolutionChoices(360).map(choice => choice.value)).toEqual(['native']);
+  expect(getAvailableResolutionChoices(null).map(choice => choice.value)).toEqual(['native']);
+});
 
 afterEach(() => {
   jest.useRealTimers();
@@ -448,6 +457,31 @@ test('dialogue audio mode updates the preview URL and render payload', async () 
   fireEvent.click(screen.getByRole('button', {name: 'Render clip'}));
   const createRequest = requestFor(pending, url => url === '/render-jobs');
   expect(JSON.parse(createRequest.options.body)).toMatchObject({audioMode: 'dialogue'});
+});
+
+test('selected resolution preset is sent in the render-job payload', async () => {
+  const pending = installFetch();
+  render(<App/>);
+  await flush();
+  await selectSession('Alpha');
+  fireEvent.click(screen.getByRole('button', {name: 'Medium quality'}));
+  fireEvent.click(screen.getByRole('button', {name: 'Render clip'}));
+  const createRequest = requestFor(pending, url => url === '/render-jobs');
+  expect(JSON.parse(createRequest.options.body)).toMatchObject({resolution: '720p'});
+});
+
+test('quality controls reflect the selected source height', async () => {
+  const pending = installFetch();
+  render(<App/>);
+  await flush();
+  await selectSession('Alpha');
+
+  expect(screen.getByRole('button', {name: 'High quality'})).toBeInTheDocument();
+  expect(screen.getByRole('button', {name: 'Medium quality'})).toBeInTheDocument();
+  expect(screen.getByRole('button', {name: 'Low quality'})).toBeInTheDocument();
+  expect(screen.queryByRole('button', {name: 'Extra high quality'})).not.toBeInTheDocument();
+  expect(screen.getByText('Choose the output quality for your clip without upscaling.')).toBeInTheDocument();
+  void pending;
 });
 
 test('changing sessions resets audio mode to standard', async () => {
@@ -1108,7 +1142,7 @@ test('render-job POST body and queued/running/succeeded polling produce a saniti
   expect(createRequest.options.headers['Content-Type']).toBe('application/json');
   expect(JSON.parse(createRequest.options.body)).toEqual({
     ratingKey: 'A', mediaId: 101, fromMs: 0, toMs: 60000, subtitleIndex: -1, audioMode: 'standard',
-    subtitleOffsetMs: 0,
+    subtitleOffsetMs: 0, resolution: '1080p',
   });
 
   await resolveRequestWith(createRequest, {id: 'job-1', status: 'queued'}, {status: 202});
@@ -1203,7 +1237,7 @@ test('retryable render failures resubmit the immutable full submitted payload', 
   const submittedBody = JSON.parse(firstCreate.options.body);
   expect(submittedBody).toEqual({
     ratingKey: 'A', mediaId: 101, fromMs: 0, toMs: 60000, subtitleIndex: 0, audioMode: 'dialogue',
-    subtitleOffsetMs: 0,
+    subtitleOffsetMs: 0, resolution: '1080p',
   });
 
   await resolveRequestWith(firstCreate, {id: 'job-retry', status: 'queued'}, {status: 202});
@@ -1886,13 +1920,13 @@ test('a successful render surfaces the saved clip via Open in library without lo
 const libraryResults = [
   {
     ratingKey: 'L1', mediaId: 5001, partId: 6001, type: 'movie',
-    title: 'Library Movie', year: 2023, duration: 5400000,
+    title: 'Library Movie', year: 2023, duration: 5400000, height: 1080,
     artwork: '/thumb/L1', videoResolution: '1080', audioChannels: 6,
   },
   {
     ratingKey: 'L2', mediaId: 5002, partId: 6002, type: 'episode',
     title: 'Pilot', grandparentTitle: 'Library Show', seasonNumber: 1, episodeNumber: 1,
-    duration: 2700000, artwork: '/thumb/L2', videoResolution: '720', audioChannels: 2,
+    duration: 2700000, artwork: '/thumb/L2', height: 720, videoResolution: '720', audioChannels: 2,
   },
 ];
 
@@ -2096,7 +2130,7 @@ test('selecting a library result opens the workspace and passes partId through s
   const createRequest = requestFor(pending, url => url === '/render-jobs');
   expect(JSON.parse(createRequest.options.body)).toMatchObject({
     ratingKey: 'L1', mediaId: 5001, partId: 6001,
-    fromMs: 0, toMs: 60000, subtitleIndex: 0, audioMode: 'standard', subtitleOffsetMs: 0,
+    fromMs: 0, toMs: 60000, subtitleIndex: 0, audioMode: 'standard', subtitleOffsetMs: 0, resolution: '1080p',
   });
 });
 
@@ -2141,7 +2175,7 @@ test('retry render from a library source resubmits the immutable spec with partI
   const submittedBody = JSON.parse(firstCreate.options.body);
   expect(submittedBody).toEqual({
     ratingKey: 'L1', mediaId: 5001, partId: 6001,
-    fromMs: 0, toMs: 60000, subtitleIndex: 0, audioMode: 'standard', subtitleOffsetMs: 0,
+    fromMs: 0, toMs: 60000, subtitleIndex: 0, audioMode: 'standard', subtitleOffsetMs: 0, resolution: '1080p',
   });
 
   await resolveRequestWith(firstCreate, {id: 'job-lib-retry', status: 'queued'}, {status: 202});
@@ -2186,7 +2220,7 @@ test('changing from a library source back to an active session omits partId (act
   const createRequest = requestFor(pending, url => url === '/render-jobs');
   expect(JSON.parse(createRequest.options.body)).toEqual({
     ratingKey: 'A', mediaId: 101, fromMs: 0, toMs: 60000,
-    subtitleIndex: 0, audioMode: 'standard', subtitleOffsetMs: 0,
+    subtitleIndex: 0, audioMode: 'standard', subtitleOffsetMs: 0, resolution: '1080p',
   });
   expect(JSON.parse(createRequest.options.body)).not.toHaveProperty('partId');
 });

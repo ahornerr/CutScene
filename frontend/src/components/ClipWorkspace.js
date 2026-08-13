@@ -4,6 +4,7 @@ import PlayerPane from "./PlayerPane";
 import TrimScrubber from "./TrimScrubber";
 import SubtitlePanel from "./SubtitlePanel";
 import RenderJobBar from "./RenderJobBar";
+import {getSourceMediaHeight} from "./render-jobs";
 
 // Two-pane workspace shell. CSS grid (.cs-workspace) reflows to one column
 // below 960px — no duplicate DOM trees per breakpoint. Theater mode collapses
@@ -19,7 +20,7 @@ export default function ClipWorkspace({
   renderState, jobSpec, controlsChangedSinceJob,
   onCreateJob, onDownloadJob, onRetryJob, onRetryPoll, onCreateNewJob,
   onOpenClip,
-  audioMode, onAudioModeChange,
+  audioMode, onAudioModeChange, resolution, onResolutionChange,
   theaterMode, onToggleTheater,
               subtitleOffsetMs, onSubtitleOffsetChange,
               subtitle, ...subProps
@@ -77,6 +78,8 @@ export default function ClipWorkspace({
           <RenderJobBar
             startPosition={startPosition} endPosition={endPosition} selectedSubtitle={subtitle}
             audioMode={audioMode} onAudioModeChange={onAudioModeChange}
+            sourceMediaHeight={getSourceMediaHeight(session)}
+            resolution={resolution} onResolutionChange={onResolutionChange}
             renderState={renderState} jobSpec={jobSpec} controlsChangedSinceJob={controlsChangedSinceJob}
             onCreateJob={onCreateJob} onDownload={onDownloadJob} onRetry={onRetryJob}
             onRetryPoll={onRetryPoll} onCreateNew={onCreateNewJob} onOpenClip={onOpenClip}

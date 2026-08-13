@@ -54,16 +54,19 @@ const (
 )
 
 type RenderJobCreateRequest struct {
-	RatingKey        string    `json:"ratingKey"`
-	MediaID          int64     `json:"mediaId"`
-	PartID           *int64    `json:"partId,omitempty"`
-	FromMs           int64     `json:"fromMs"`
-	ToMs             int64     `json:"toMs"`
-	SubtitleIndex    int       `json:"subtitleIndex"`
-	SubtitleOffsetMs int64     `json:"subtitleOffsetMs"`
-	Height           int       `json:"height"`
-	QP               int       `json:"qp"`
-	AudioMode        AudioMode `json:"audioMode"`
+	RatingKey        string `json:"ratingKey"`
+	MediaID          int64  `json:"mediaId"`
+	PartID           *int64 `json:"partId,omitempty"`
+	FromMs           int64  `json:"fromMs"`
+	ToMs             int64  `json:"toMs"`
+	SubtitleIndex    int    `json:"subtitleIndex"`
+	SubtitleOffsetMs int64  `json:"subtitleOffsetMs"`
+	Resolution       string `json:"resolution"`
+	// Height is retained for compatibility with older clients. New clients
+	// should use Resolution so the server can cap presets to the source tier.
+	Height    int       `json:"height"`
+	QP        int       `json:"qp"`
+	AudioMode AudioMode `json:"audioMode"`
 }
 
 type renderJobSpec struct {
@@ -84,6 +87,7 @@ type renderJobSpec struct {
 	SubtitleCodec         string
 	SubtitleFormat        string
 	SubtitleEmbeddedIndex int
+	Resolution            string
 	Height                int
 	QP                    int
 	AudioMode             AudioMode
@@ -96,6 +100,72 @@ type renderJobSpec struct {
 	EpisodeNumber         *int
 	EpisodeTitle          string
 	ThumbnailURL          string
+}
+
+const (
+	// RenderResolutionNative is the identifier used by existing clients for
+	// the highest quality tier. It is intentionally retained for wire
+	// compatibility; it means Extra high/4K, not an unconditional native
+	// output request.
+	RenderResolutionNative    = "native"
+	RenderResolution2160p     = "2160p"
+	RenderResolution1080p     = "1080p"
+	RenderResolution720p      = "720p"
+	RenderResolution480p      = "480p"
+	RenderResolutionExtraHigh = "extra-high"
+	RenderResolutionHigh      = "high"
+	RenderResolutionMedium    = "medium"
+	RenderResolutionLow       = "low"
+)
+
+func renderResolutionTarget(resolution string) (int, error) {
+	switch resolution {
+	case "":
+		return 0, nil
+	case RenderResolutionNative, RenderResolution2160p, "4k", "4K", RenderResolutionExtraHigh:
+		return 2160, nil
+	case RenderResolution1080p:
+		return 1080, nil
+	case RenderResolutionHigh:
+		return 1080, nil
+	case RenderResolution720p:
+		return 720, nil
+	case RenderResolutionMedium:
+		return 720, nil
+	case RenderResolution480p:
+		return 480, nil
+	case RenderResolutionLow:
+		return 480, nil
+	default:
+		return 0, fmt.Errorf("resolution is invalid")
+	}
+}
+
+// resolveRenderHeight applies a loose quality tier policy. A source whose
+// height is within 20% of the requested tier is left native to avoid an
+// unnecessary resize. Sources above that range are scaled down to the tier;
+// sources below it are left native so a request can never upscale media.
+// Returning zero is also the safe fallback when source dimensions are
+// unavailable.
+func resolveRenderHeight(resolution string, sourceHeight int) (int, error) {
+	target, err := renderResolutionTarget(resolution)
+	if err != nil || target == 0 {
+		return target, err
+	}
+	if sourceHeight <= 0 {
+		return 0, nil
+	}
+	// Compare without floating point or multiplication of untrusted source
+	// dimensions: [80%, 120%] is [target-target/5, target+target/5].
+	lower := target - target/5
+	upper := target + target/5
+	if sourceHeight >= lower && sourceHeight <= upper {
+		return 0, nil
+	}
+	if sourceHeight > target {
+		return target, nil
+	}
+	return 0, nil
 }
 
 type renderJobError struct {
@@ -1248,6 +1318,10 @@ func validateRenderJobRequestWithMetadataAndItem(request RenderJobCreateRequest,
 				return renderJobSpec{}, errors.New("subtitle codec is not supported")
 			}
 		}
+		height, err := resolveRequestRenderHeight(request, mediaHeight(previewMedia))
+		if err != nil {
+			return renderJobSpec{}, err
+		}
 		sourceMediaID := request.MediaID
 		if sourceMediaID <= 0 {
 			sourceMediaID = previewMedia.ID
@@ -1269,7 +1343,8 @@ func validateRenderJobRequestWithMetadataAndItem(request RenderJobCreateRequest,
 			SubtitleCodec:         subtitle.Codec,
 			SubtitleFormat:        subtitle.Format,
 			SubtitleEmbeddedIndex: subtitle.EmbeddedIndex,
-			Height:                request.Height,
+			Resolution:            normalizedRenderResolution(request),
+			Height:                height,
 			QP:                    request.QP,
 			AudioMode:             audioMode,
 		}
@@ -1323,6 +1398,10 @@ func validateRenderJobRequestWithMetadataAndItem(request RenderJobCreateRequest,
 				if request.SubtitleIndex >= 0 && subtitleEmbeddedIndex < 0 {
 					return renderJobSpec{}, errors.New("subtitle codec is not supported")
 				}
+				height, err := resolveRequestRenderHeight(request, sessionMediaHeight(media))
+				if err != nil {
+					return renderJobSpec{}, err
+				}
 				partID, _ := sessionIDAsInt64(part.ID)
 				spec := renderJobSpec{
 					OwnerUUID:             user.Uuid,
@@ -1337,7 +1416,8 @@ func validateRenderJobRequestWithMetadataAndItem(request RenderJobCreateRequest,
 					SubtitleOffsetMs:      request.SubtitleOffsetMs,
 					SubtitlePGS:           subtitlePGS,
 					SubtitleEmbeddedIndex: subtitleEmbeddedIndex,
-					Height:                request.Height,
+					Resolution:            normalizedRenderResolution(request),
+					Height:                height,
 					QP:                    request.QP,
 					AudioMode:             audioMode,
 				}
@@ -1371,6 +1451,12 @@ func validateRenderJobRequestFields(request RenderJobCreateRequest) error {
 	if err := validateSubtitleOffsetMs(request.SubtitleOffsetMs); err != nil {
 		return err
 	}
+	if _, err := renderResolutionTarget(request.Resolution); err != nil {
+		return err
+	}
+	if request.Resolution != "" && request.Height != 0 {
+		return errors.New("resolution and height cannot both be specified")
+	}
 	if request.Height < 0 || request.Height > 2160 || request.Height > 0 && (request.Height < 144 || request.Height%2 != 0) {
 		return errors.New("height is invalid")
 	}
@@ -1378,6 +1464,34 @@ func validateRenderJobRequestFields(request RenderJobCreateRequest) error {
 		return errors.New("qp is invalid")
 	}
 	return nil
+}
+
+func normalizedRenderResolution(request RenderJobCreateRequest) string {
+	if request.Resolution == "" {
+		return ""
+	}
+	return request.Resolution
+}
+
+func resolveRequestRenderHeight(request RenderJobCreateRequest, sourceHeight int) (int, error) {
+	if request.Resolution != "" {
+		return resolveRenderHeight(request.Resolution, sourceHeight)
+	}
+	return request.Height, nil
+}
+
+func mediaHeight(media *components.Media) int {
+	if media != nil && media.Height != nil && *media.Height > 0 {
+		return *media.Height
+	}
+	return 0
+}
+
+func sessionMediaHeight(media sessionMedia) int {
+	if media.Height != nil && *media.Height > 0 {
+		return *media.Height
+	}
+	return 0
 }
 
 func sourceTitle(sessions []sessionMetadata, ratingKey string, metadata *components.Metadata) string {

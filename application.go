@@ -165,6 +165,8 @@ func (u *sessionUser) UnmarshalJSON(data []byte) error {
 type sessionMedia struct {
 	ID              any           `json:"id"`
 	Duration        *int          `json:"duration,omitempty"`
+	Width           *int          `json:"width,omitempty"`
+	Height          *int          `json:"height,omitempty"`
 	Bitrate         *int          `json:"bitrate,omitempty"`
 	AudioCodec      *string       `json:"audioCodec,omitempty"`
 	AudioChannels   *int          `json:"audioChannels,omitempty"`

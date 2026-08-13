@@ -1,6 +1,6 @@
-import {Box, Button, Chip, CircularProgress, FormControl, InputLabel, MenuItem, Select, Typography} from "@mui/material";
+import {Box, Button, Chip, CircularProgress, FormControl, InputLabel, MenuItem, Select, ToggleButton, ToggleButtonGroup, Typography} from "@mui/material";
 import {millisToDuration} from "../utils";
-import {JOB_STATES, jobErrorMessage, jobStatusLabel, formatExpiry, formatJobSpec, isTransportError, AUDIO_MODE_CHOICES} from "./render-jobs";
+import {JOB_STATES, jobErrorMessage, jobStatusLabel, formatExpiry, formatJobSpec, isTransportError, AUDIO_MODE_CHOICES, getAvailableResolutionChoices} from "./render-jobs";
 
 // Render-job bar. Displays the immutable submitted spec so the user always
 // knows what the current output corresponds to. Separates transport/polling
@@ -12,7 +12,7 @@ import {JOB_STATES, jobErrorMessage, jobStatusLabel, formatExpiry, formatJobSpec
 // Sticky on mobile, inline on desktop (handled via .cs-sticky-download CSS).
 export default function RenderJobBar({
   startPosition, endPosition, selectedSubtitle,
-  audioMode, onAudioModeChange,
+  audioMode, onAudioModeChange, resolution, onResolutionChange, sourceMediaHeight,
   renderState, jobSpec, controlsChangedSinceJob,
   onCreateJob, onDownload, onRetry, onRetryPoll, onCreateNew,
   onOpenClip,
@@ -32,6 +32,8 @@ export default function RenderJobBar({
   const showNewRender = hasJob && !busy && controlsChangedSinceJob
   const isRenderFailure = status === JOB_STATES.FAILED && error && !isTransportError(error)
   const isTransportFailure = status === JOB_STATES.FAILED && error && isTransportError(error)
+  const resolutionChoices = getAvailableResolutionChoices(sourceMediaHeight)
+  const nativeOnly = sourceMediaHeight == null || sourceMediaHeight < 480
 
   return (
     <Box className="cs-sticky-download" sx={{px: {xs: 1.5, sm: 2, md: 0}, py: {xs: 1.25, md: 0}, mt: {xs: 2.5, md: 2}}}>
@@ -66,8 +68,45 @@ export default function RenderJobBar({
         </Box>
       )}
 
-      {/* Audio mode control — always visible alongside the render controls */}
+      {/* Output controls — always visible alongside the render controls */}
       <Box sx={{display: 'flex', alignItems: 'flex-end', gap: {xs: 1, sm: 2}, flexWrap: 'wrap', mb: 1.25}}>
+        <Box sx={{flex: {xs: '1 1 100%', md: '1 1 100%'}, minWidth: 0}}>
+          <Typography id="resolution-select-label" variant="overline" sx={{color: 'text.secondary', display: 'block', lineHeight: 1, mb: 0.8}}>
+            Quality
+          </Typography>
+          <ToggleButtonGroup
+            value={resolution}
+            exclusive
+            onChange={(_, value) => value && onResolutionChange(value)}
+            aria-labelledby="resolution-select-label"
+            size="small"
+            sx={{
+              // A two-up grid on phones gives the tier names enough room to
+              // remain scannable; larger screens retain the compact four-up rail.
+              display: 'grid', gridTemplateColumns: {xs: `repeat(${Math.min(2, resolutionChoices.length)}, minmax(0, 1fr))`, sm: `repeat(${resolutionChoices.length}, minmax(0, 1fr))`}, width: '100%',
+              border: '1px solid rgba(255,255,255,0.1)', borderRadius: 2, overflow: 'hidden',
+              '& .MuiToggleButtonGroup-grouped': {border: 0, borderRadius: '0 !important', minHeight: {xs: 48, sm: 54}},
+              '& .MuiToggleButtonGroup-grouped + .MuiToggleButtonGroup-grouped': {borderLeft: '1px solid rgba(255,255,255,0.08)'},
+              '& .MuiToggleButtonGroup-grouped:nth-of-type(odd)': {borderLeft: {xs: '0 !important', sm: undefined}},
+              '& .MuiToggleButtonGroup-grouped:nth-of-type(n + 3)': {borderTop: {xs: '1px solid rgba(255,255,255,0.08)', sm: 0}},
+              '& .Mui-selected': {backgroundColor: 'rgba(255,115,0,0.18) !important', color: '#ffd9b0', boxShadow: 'inset 0 -2px 0 #ff7300'},
+            }}
+          >
+            {resolutionChoices.map(choice => (
+              <ToggleButton key={choice.value} value={choice.value} aria-label={`${nativeOnly && choice.value === 'native' ? 'Native' : choice.label} quality`} sx={{textTransform: 'none', px: {xs: 1, sm: 0.5}}}>
+                <Box sx={{lineHeight: 1.05}}>
+                  <Typography component="span" sx={{display: 'block', fontSize: '0.82rem', fontWeight: 700}}>{nativeOnly && choice.value === 'native' ? 'Native' : choice.label}</Typography>
+                  <Typography component="span" variant="caption" sx={{display: {xs: 'none', sm: 'block'}, color: 'text.secondary', fontSize: '0.64rem'}}>{nativeOnly && choice.value === 'native' ? 'Source' : choice.detail}</Typography>
+                </Box>
+              </ToggleButton>
+            ))}
+          </ToggleButtonGroup>
+          <Typography variant="caption" sx={{color: 'text.disabled', display: 'block', mt: 0.6}}>
+            {nativeOnly
+              ? (sourceMediaHeight == null ? 'Source dimensions unavailable — native output only.' : 'Source is below 480p — native output only.')
+              : 'Choose the output quality for your clip without upscaling.'}
+          </Typography>
+        </Box>
         <FormControl size="small" sx={{flex: {xs: '1 1 100%', sm: '1 1 200px'}, minWidth: 0}}>
           <InputLabel id="audio-mode-select">Audio mode</InputLabel>
           <Select
