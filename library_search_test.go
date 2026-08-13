@@ -80,6 +80,104 @@ func TestSearchLibraryUsesCallerTokenFiltersAndRefetchesHubs(t *testing.T) {
 	}
 }
 
+func TestGetMetadataItemAdminUsesCompatibleDirectDecoder(t *testing.T) {
+	plex := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("X-Plex-Token"); got != "admin-token" {
+			t.Errorf("admin metadata token = %q, want admin-token", got)
+		}
+		if r.URL.Path != "/library/metadata/movie-1" {
+			t.Errorf("metadata path = %q", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"MediaContainer":{"Metadata":[{"ratingKey":"movie-1","type":"movie","title":"Admin movie","search":0}]}}`)
+	}))
+	defer plex.Close()
+	config := Config{}
+	config.Plex.Host = plex.URL
+	config.Plex.Token = "admin-token"
+	app := &Application{
+		config:    config,
+		plexAdmin: plexgo.New(plexgo.WithServerURL(plex.URL), plexgo.WithSecurity(config.Plex.Token)),
+	}
+
+	metadata, err := app.getMetadataItem(context.Background(), "movie-1", false)
+	if err != nil {
+		t.Fatalf("admin metadata lookup failed: %v", err)
+	}
+	if metadata == nil || metadata.RatingKey == nil || *metadata.RatingKey != "movie-1" || metadata.Title != "Admin movie" {
+		t.Fatalf("admin metadata = %+v", metadata)
+	}
+}
+
+func TestLibraryJSONCompatibilityAcceptsNumericBooleanFlagsInSearchAndMetadata(t *testing.T) {
+	var detailRequests int
+	plex := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/hubs/search":
+			_, _ = io.WriteString(w, `{"MediaContainer":{"Hub":[{"Metadata":[{"ratingKey":"movie-1","type":"movie","title":"Movie","search":0}]}]}}`)
+		case "/library/metadata/movie-1":
+			detailRequests++
+			_, _ = io.WriteString(w, `{"MediaContainer":{"Metadata":[{"ratingKey":"movie-1","type":"movie","title":"Movie","Media":[{"id":10,"has64bitOffsets":0,"Part":[{"id":20,"duration":1000,"accessible":1,"exists":"1","key":"/library/parts/20/file"}]}]}]}}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer plex.Close()
+	config := Config{}
+	config.Plex.Host = plex.URL
+	app := &Application{config: config}
+	ctx := ContextWithAuthToken(context.Background(), "caller-token")
+
+	results, err := app.SearchLibrary(ctx, "movie")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != 1 || results[0].RatingKey != "movie-1" || results[0].MediaID != 10 || results[0].PartID != 20 {
+		t.Fatalf("numeric-flag search results = %+v", results)
+	}
+
+	if _, err := app.GetLibrarySource(ctx, "movie-1", 10, 20); err != nil {
+		t.Fatalf("numeric-flag metadata retrieval failed: %v", err)
+	}
+	if detailRequests != 2 {
+		t.Fatalf("detail requests = %d, want search refetch plus metadata retrieval", detailRequests)
+	}
+}
+
+func TestUnmarshalPlexLibraryJSONRejectsMalformedBooleanFlags(t *testing.T) {
+	for _, body := range []string{
+		`{"MediaContainer":{"Metadata":[{"ratingKey":"movie-1","Media":[{"Part":[{"accessible":2}]}]}]}}`,
+		`{"MediaContainer":{"Metadata":[{"ratingKey":"movie-1","Media":[{"Part":[{"accessible":"yes"}]}]}]}}`,
+	} {
+		var response plexMetadataResponse
+		if err := unmarshalPlexLibraryJSON([]byte(body), &response); err == nil {
+			t.Fatalf("malformed boolean flag %s was accepted", body)
+		}
+	}
+}
+
+func TestUnmarshalPlexLibraryJSONAcceptsQuotedMetadataMediaAndPartNumbers(t *testing.T) {
+	body := []byte(`{"MediaContainer":{"Metadata":[{"ratingKey":"movie-1","year":"2024","duration":"90000","Media":[{"id":"10","bitrate":"8000","Part":[{"id":"20","duration":"60000","size":"1234","key":"/library/parts/20/file"}]}]}]}}`)
+	var response plexMetadataResponse
+	if err := unmarshalPlexLibraryJSON(body, &response); err != nil {
+		t.Fatal(err)
+	}
+	metadata := response.MediaContainer.Metadata[0]
+	if metadata.Year == nil || *metadata.Year != 2024 || metadata.Duration == nil || *metadata.Duration != 90000 || metadata.Media[0].ID != 10 || metadata.Media[0].Bitrate == nil || *metadata.Media[0].Bitrate != 8000 || metadata.Media[0].Part[0].ID != 20 || metadata.Media[0].Part[0].Duration == nil || *metadata.Media[0].Part[0].Duration != 60000 || metadata.Media[0].Part[0].Size == nil || *metadata.Media[0].Part[0].Size != 1234 {
+		t.Fatalf("quoted numeric metadata = %+v", metadata)
+	}
+}
+
+func TestUnmarshalPlexLibraryJSONReportsQuotedNumericPath(t *testing.T) {
+	body := []byte(`{"MediaContainer":{"Metadata":[{"ratingKey":"movie-1","Media":[{"Part":[{"duration":"not-a-number"}]}]}]}}`)
+	var response plexMetadataResponse
+	err := unmarshalPlexLibraryJSON(body, &response)
+	if err == nil || !strings.Contains(err.Error(), "MediaContainer.Metadata[0].Media[0].Part[0].duration") || !strings.Contains(err.Error(), "expected int") || !strings.Contains(err.Error(), `got "not-a-number"`) {
+		t.Fatalf("quoted numeric error = %v", err)
+	}
+}
+
 func TestSearchLibraryRequiresCallerTokenAndValidQuery(t *testing.T) {
 	app := &Application{}
 	if _, err := app.SearchLibrary(context.Background(), "movie"); err == nil {
