@@ -63,6 +63,8 @@ func TestRenderResolutionTiersPreserveNearbySourcesWithoutUpscaling(t *testing.T
 		{RenderResolution480p, 360, 0},
 		{RenderResolution480p, 480, 0},
 		{RenderResolution480p, 600, 480},
+		{RenderResolutionSourceNative, 360, 0},
+		{RenderResolutionSourceNative, 0, 0},
 	}
 	for _, test := range tests {
 		got, err := resolveRenderHeight(test.resolution, test.source)
@@ -73,7 +75,7 @@ func TestRenderResolutionTiersPreserveNearbySourcesWithoutUpscaling(t *testing.T
 }
 
 func TestRenderResolutionValidationAllowsCompatibleTierIdentifiers(t *testing.T) {
-	for _, resolution := range []string{"", RenderResolutionNative, RenderResolution2160p, "4k", RenderResolutionExtraHigh, RenderResolution1080p, RenderResolutionHigh, RenderResolution720p, RenderResolutionMedium, RenderResolution480p, RenderResolutionLow} {
+	for _, resolution := range []string{"", RenderResolutionNative, RenderResolutionSourceNative, RenderResolution2160p, "4k", RenderResolutionExtraHigh, RenderResolution1080p, RenderResolutionHigh, RenderResolution720p, RenderResolutionMedium, RenderResolution480p, RenderResolutionLow} {
 		if err := validateRenderJobRequestFields(RenderJobCreateRequest{RatingKey: "movie", MediaID: 1, FromMs: 0, ToMs: 1, SubtitleIndex: -1, Resolution: resolution}); err != nil {
 			t.Errorf("resolution %q rejected: %v", resolution, err)
 		}

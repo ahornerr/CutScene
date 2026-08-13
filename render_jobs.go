@@ -107,20 +107,25 @@ const (
 	// the highest quality tier. It is intentionally retained for wire
 	// compatibility; it means Extra high/4K, not an unconditional native
 	// output request.
-	RenderResolutionNative    = "native"
-	RenderResolution2160p     = "2160p"
-	RenderResolution1080p     = "1080p"
-	RenderResolution720p      = "720p"
-	RenderResolution480p      = "480p"
-	RenderResolutionExtraHigh = "extra-high"
-	RenderResolutionHigh      = "high"
-	RenderResolutionMedium    = "medium"
-	RenderResolutionLow       = "low"
+	RenderResolutionNative = "native"
+	// RenderResolutionSourceNative requests source dimensions. RenderResolutionNative
+	// remains the legacy Extra high/4K wire value for compatibility.
+	RenderResolutionSourceNative = "source-native"
+	RenderResolution2160p        = "2160p"
+	RenderResolution1080p        = "1080p"
+	RenderResolution720p         = "720p"
+	RenderResolution480p         = "480p"
+	RenderResolutionExtraHigh    = "extra-high"
+	RenderResolutionHigh         = "high"
+	RenderResolutionMedium       = "medium"
+	RenderResolutionLow          = "low"
 )
 
 func renderResolutionTarget(resolution string) (int, error) {
 	switch resolution {
 	case "":
+		return 0, nil
+	case RenderResolutionSourceNative:
 		return 0, nil
 	case RenderResolutionNative, RenderResolution2160p, "4k", "4K", RenderResolutionExtraHigh:
 		return 2160, nil

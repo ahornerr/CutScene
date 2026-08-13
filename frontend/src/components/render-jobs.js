@@ -21,6 +21,7 @@ export const AUDIO_MODES = {
 
 export const RENDER_RESOLUTIONS = {
   NATIVE: 'native',
+  SOURCE_NATIVE: 'source-native',
   P1080: '1080p',
   P720: '720p',
   P480: '480p',
@@ -36,6 +37,8 @@ export const RESOLUTION_CHOICES = [
   {value: RENDER_RESOLUTIONS.P480, label: 'Low', detail: '480', targetHeight: 480},
 ]
 
+const SOURCE_NATIVE_CHOICE = {value: RENDER_RESOLUTIONS.SOURCE_NATIVE, label: 'Native', detail: 'Source', targetHeight: 0}
+
 export function getSourceMediaHeight(session) {
   const height = Number(session?.Media?.[0]?.height)
   return Number.isFinite(height) && height > 0 ? height : null
@@ -43,7 +46,7 @@ export function getSourceMediaHeight(session) {
 
 export function getAvailableResolutionChoices(sourceHeight) {
   const height = Number(sourceHeight)
-  if (!Number.isFinite(height) || height <= 0 || height < 480) return [RESOLUTION_CHOICES[0]]
+  if (!Number.isFinite(height) || height <= 0 || height < 480) return [SOURCE_NATIVE_CHOICE]
   return RESOLUTION_CHOICES.filter(choice => (
     choice.value === RENDER_RESOLUTIONS.NATIVE
       ? height >= choice.targetHeight
@@ -54,6 +57,25 @@ export function getAvailableResolutionChoices(sourceHeight) {
 export function getSafeResolution(sourceHeight) {
   const choices = getAvailableResolutionChoices(sourceHeight)
   return choices[0].value
+}
+
+// `native` is the legacy Extra high wire value; only source-native is Native.
+export function resolutionLabel(value) {
+  switch (value) {
+    case RENDER_RESOLUTIONS.SOURCE_NATIVE: return 'Native'
+    case RENDER_RESOLUTIONS.NATIVE:
+    case '2160p':
+    case '4k':
+    case '4K':
+    case 'extra-high': return 'Extra high'
+    case RENDER_RESOLUTIONS.P1080:
+    case 'high': return 'High'
+    case RENDER_RESOLUTIONS.P720:
+    case 'medium': return 'Medium'
+    case RENDER_RESOLUTIONS.P480:
+    case 'low': return 'Low'
+    default: return 'Native'
+  }
 }
 
 // User-facing labels and descriptions for each audio mode.
@@ -263,6 +285,7 @@ export function formatJobSpec(spec) {
     duration: millisToDuration(spec.clipDuration),
     subtitle: spec.subtitleLabel,
     audioMode: audioModeLabel(spec.audioMode),
+    quality: resolutionLabel(spec.resolution),
     subtitleOffsetMs: clampSubtitleOffsetMs(spec?.subtitleOffsetMs),
     subtitleOffsetLabel: `Offset ${formatSubtitleOffsetMs(spec?.subtitleOffsetMs)}`,
   }

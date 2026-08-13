@@ -55,6 +55,8 @@ export default function RenderJobBar({
             sx={{borderColor: 'rgba(255,255,255,0.18)', color: 'text.secondary', fontFamily: 'var(--cs-mono-font)'}}/>
           <Chip size="small" label={spec.subtitle} variant="outlined"
             sx={{borderColor: 'rgba(255,255,255,0.18)', color: 'text.secondary'}}/>
+          <Chip size="small" label={spec.quality} variant="outlined"
+            sx={{borderColor: 'rgba(255,255,255,0.18)', color: 'text.secondary'}}/>
           <Chip size="small" label={spec.audioMode} variant="outlined"
             sx={{borderColor: 'rgba(255,255,255,0.18)', color: 'text.secondary'}}/>
           {spec.subtitleOffsetMs !== 0 && (

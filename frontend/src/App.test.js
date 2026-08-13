@@ -3,7 +3,7 @@ import {act, fireEvent, render, screen} from '@testing-library/react';
 import App from './App';
 import TrimScrubber from './components/TrimScrubber';
 import {renderSubtitleMarkup, stripSubtitleMarkup} from './components/subtitle-markup';
-import {getAvailableResolutionChoices} from './components/render-jobs';
+import {getAvailableResolutionChoices, getSafeResolution, formatJobSpec, RENDER_RESOLUTIONS} from './components/render-jobs';
 
 const mockPlayerUrls = [];
 
@@ -193,8 +193,16 @@ test('quality choices never offer an upscale and fall back to native safely', ()
   expect(getAvailableResolutionChoices(1080).map(choice => choice.value)).toEqual(['1080p', '720p', '480p']);
   expect(getAvailableResolutionChoices(720).map(choice => choice.value)).toEqual(['720p', '480p']);
   expect(getAvailableResolutionChoices(480).map(choice => choice.value)).toEqual(['480p']);
-  expect(getAvailableResolutionChoices(360).map(choice => choice.value)).toEqual(['native']);
-  expect(getAvailableResolutionChoices(null).map(choice => choice.value)).toEqual(['native']);
+  expect(getAvailableResolutionChoices(360).map(choice => choice.value)).toEqual(['source-native']);
+  expect(getAvailableResolutionChoices(null).map(choice => choice.value)).toEqual(['source-native']);
+  expect(getSafeResolution(360)).toBe(RENDER_RESOLUTIONS.SOURCE_NATIVE);
+  expect(getSafeResolution(null)).toBe(RENDER_RESOLUTIONS.SOURCE_NATIVE);
+});
+
+test('submitted quality formatting distinguishes Native from legacy Extra high', () => {
+  const base = {fromMs: 0, toMs: 1000, clipDuration: 1000, subtitleLabel: 'None', audioMode: 'standard'};
+  expect(formatJobSpec({...base, resolution: 'source-native'}).quality).toBe('Native');
+  expect(formatJobSpec({...base, resolution: 'native'}).quality).toBe('Extra high');
 });
 
 afterEach(() => {
@@ -1211,6 +1219,7 @@ test('render jobs keep an immutable submitted spec separate from edited controls
   });
   expect(screen.getByText('Submitted clip')).toBeInTheDocument();
   expect(screen.getByText('00:00:00 – 00:01:00')).toBeInTheDocument();
+  expect(screen.getAllByText('High').length).toBeGreaterThanOrEqual(2);
   expect(screen.getAllByText('X track')).toHaveLength(2);
 
   const end = screen.getByRole('textbox', {name: 'End time as hours minutes seconds milliseconds'});
