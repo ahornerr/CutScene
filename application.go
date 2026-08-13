@@ -488,9 +488,6 @@ func (a *Application) plexSecurityUserToken(ctx context.Context) (components.Sec
 // use the token belonging to the caller; the configured administrator client
 // is retained for the existing active-session path.
 func (a *Application) getMetadataItem(ctx context.Context, ratingKey string, userScoped bool) (*components.Metadata, error) {
-	var response *operations.GetMetadataItemResponse
-	var err error
-	request := operations.GetMetadataItemRequest{Ids: []string{ratingKey}}
 	if userScoped {
 		if token := AuthTokenFromContext(ctx); token == nil || strings.TrimSpace(*token) == "" {
 			return nil, errors.New("caller-scoped Plex client is unavailable")
@@ -501,15 +498,45 @@ func (a *Application) getMetadataItem(ctx context.Context, ratingKey string, use
 		if a.plexAdmin == nil {
 			return nil, errors.New("Plex client is unavailable")
 		}
-		response, err = a.plexAdmin.Content.GetMetadataItem(ctx, request)
+		return a.getAdminMetadataItem(ctx, ratingKey)
 	}
+}
+
+// getAdminMetadataItem keeps the historical admin behavior (a missing
+// ratingKey is tolerated) while using the bounded library decoder rather than
+// the generated Plex client decoder.
+func (a *Application) getAdminMetadataItem(ctx context.Context, ratingKey string) (*components.Metadata, error) {
+	base, err := url.Parse(a.config.Plex.Host)
+	if err != nil || (base.Scheme != "http" && base.Scheme != "https") || base.Host == "" || base.User != nil {
+		return nil, errors.New("configured Plex origin is invalid")
+	}
+	base.Path = strings.TrimRight(base.Path, "/") + "/library/metadata/" + url.PathEscape(ratingKey)
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, base.String(), nil)
 	if err != nil {
 		return nil, err
 	}
-	if response == nil || response.MediaContainerWithMetadata == nil || response.MediaContainerWithMetadata.MediaContainer == nil || len(response.MediaContainerWithMetadata.MediaContainer.Metadata) == 0 {
+	request.Header.Set("X-Plex-Token", a.config.Plex.Token)
+	request.Header.Set("Accept", "application/json")
+	response, err := callerPlexHTTPClient.Do(request)
+	if err != nil {
+		return nil, fmt.Errorf("could not get Plex metadata: %w", err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		return nil, &libraryHTTPError{status: response.StatusCode}
+	}
+	body, err := io.ReadAll(io.LimitReader(response.Body, maxLibraryResponseBytes))
+	if err != nil {
+		return nil, fmt.Errorf("could not read Plex metadata: %w", err)
+	}
+	var decoded plexMetadataResponse
+	if err := unmarshalPlexLibraryJSON(body, &decoded); err != nil {
+		return nil, fmt.Errorf("could not decode Plex metadata: %w", err)
+	}
+	if decoded.MediaContainer == nil || len(decoded.MediaContainer.Metadata) == 0 {
 		return nil, &sourceValidationError{message: "requested media is unavailable"}
 	}
-	metadata := response.MediaContainerWithMetadata.MediaContainer.Metadata[0]
+	metadata := decoded.MediaContainer.Metadata[0]
 	if metadata.RatingKey != nil && *metadata.RatingKey != "" && *metadata.RatingKey != ratingKey {
 		return nil, &sourceValidationError{message: "requested media is unavailable"}
 	}

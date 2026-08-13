@@ -1,13 +1,17 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"net/url"
+	"reflect"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -147,7 +151,7 @@ func (a *Application) SearchLibrary(ctx context.Context, query string) ([]Librar
 		return nil, err
 	}
 	var search plexSearchResponse
-	if err := json.Unmarshal(body, &search); err != nil {
+	if err := unmarshalPlexLibraryJSON(body, &search); err != nil {
 		return nil, fmt.Errorf("could not decode Plex library search: %w", err)
 	}
 	if search.MediaContainer == nil {
@@ -496,7 +500,7 @@ func (a *Application) getLibraryChildren(ctx context.Context, ratingKey, token s
 		return nil, fmt.Errorf("could not read Plex library children: %w", err)
 	}
 	var response plexMetadataResponse
-	if err := json.Unmarshal(body, &response); err != nil {
+	if err := unmarshalPlexLibraryJSON(body, &response); err != nil {
 		return nil, fmt.Errorf("could not decode Plex library children: %w", err)
 	}
 	if response.MediaContainer == nil {
@@ -552,7 +556,7 @@ func (a *Application) getCallerMetadataItem(ctx context.Context, ratingKey, toke
 		return nil, fmt.Errorf("could not read Plex metadata: %w", err)
 	}
 	var decoded plexMetadataResponse
-	if err := json.Unmarshal(body, &decoded); err != nil {
+	if err := unmarshalPlexLibraryJSON(body, &decoded); err != nil {
 		return nil, fmt.Errorf("could not decode Plex metadata: %w", err)
 	}
 	if decoded.MediaContainer == nil {
@@ -573,4 +577,210 @@ func minInt(a, b int) int {
 		return a
 	}
 	return b
+}
+
+// unmarshalPlexLibraryJSON is the compatibility boundary for PMS library
+// responses. The generated Plex models use *bool for several flags, while PMS
+// versions also emit those flags as 0/1 or "0"/"1" and occasionally quote
+// numeric fields. Normalize only values whose reflected destination supports
+// the compatibility conversion; unknown properties retain normal JSON
+// semantics.
+func unmarshalPlexLibraryJSON(data []byte, target any) error {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.UseNumber()
+
+	var value any
+	if err := decoder.Decode(&value); err != nil {
+		return err
+	}
+	var extra any
+	if err := decoder.Decode(&extra); err != io.EOF {
+		if err == nil {
+			return errors.New("invalid JSON: multiple values")
+		}
+		return err
+	}
+
+	value, err := normalizePlexLibraryJSONValue(value, reflect.TypeOf(target), "")
+	if err != nil {
+		return err
+	}
+	normalized, err := json.Marshal(value)
+	if err != nil {
+		return err
+	}
+	return json.Unmarshal(normalized, target)
+}
+
+func normalizePlexLibraryJSONValue(value any, targetType reflect.Type, path string) (any, error) {
+	if targetType == nil || value == nil {
+		return value, nil
+	}
+	for targetType.Kind() == reflect.Pointer {
+		targetType = targetType.Elem()
+	}
+
+	if targetType.Kind() == reflect.Bool {
+		switch typed := value.(type) {
+		case bool:
+			return typed, nil
+		case string:
+			switch typed {
+			case "0":
+				return false, nil
+			case "1":
+				return true, nil
+			}
+		case json.Number:
+			switch typed.String() {
+			case "0":
+				return false, nil
+			case "1":
+				return true, nil
+			}
+		}
+		return nil, invalidPlexValueError(path, targetType, "bool or 0/1", value)
+	}
+
+	// A few generated Plex union types (for example SkipChildren and
+	// HasVoiceActivity) accept a bool or a string 0/1. Numeric 0/1 should enter
+	// the same bool branch without changing unrelated numeric enum fields.
+	if isPlexBooleanUnion(targetType) {
+		if number, ok := value.(json.Number); ok {
+			switch number.String() {
+			case "0":
+				return false, nil
+			case "1":
+				return true, nil
+			default:
+				return nil, invalidPlexValueError(path, targetType, "Plex boolean 0/1", value)
+			}
+		}
+		return value, nil
+	}
+
+	if stringValue, ok := value.(string); ok {
+		if number, ok := normalizeQuotedPlexNumber(stringValue, targetType); ok {
+			return number, nil
+		}
+		if isPlexNumericType(targetType) {
+			return nil, invalidPlexValueError(path, targetType, targetType.String(), value)
+		}
+	}
+
+	switch targetType.Kind() {
+	case reflect.Struct:
+		object, ok := value.(map[string]any)
+		if !ok {
+			return value, nil
+		}
+		for i := 0; i < targetType.NumField(); i++ {
+			field := targetType.Field(i)
+			jsonName := strings.Split(field.Tag.Get("json"), ",")[0]
+			if jsonName == "-" {
+				continue
+			}
+			if jsonName == "" {
+				jsonName = field.Name
+			}
+			fieldValue, ok := object[jsonName]
+			if !ok {
+				continue
+			}
+			normalized, err := normalizePlexLibraryJSONValue(fieldValue, field.Type, plexJSONPath(path, jsonName))
+			if err != nil {
+				return nil, err
+			}
+			object[jsonName] = normalized
+		}
+	case reflect.Slice, reflect.Array:
+		items, ok := value.([]any)
+		if !ok {
+			return value, nil
+		}
+		for i := range items {
+			normalized, err := normalizePlexLibraryJSONValue(items[i], targetType.Elem(), fmt.Sprintf("%s[%d]", path, i))
+			if err != nil {
+				return nil, err
+			}
+			items[i] = normalized
+		}
+	case reflect.Map:
+		items, ok := value.(map[string]any)
+		if !ok {
+			return value, nil
+		}
+		for key, item := range items {
+			normalized, err := normalizePlexLibraryJSONValue(item, targetType.Elem(), plexJSONPath(path, key))
+			if err != nil {
+				return nil, err
+			}
+			items[key] = normalized
+		}
+	}
+	return value, nil
+}
+
+func isPlexBooleanUnion(targetType reflect.Type) bool {
+	if targetType.Kind() != reflect.Struct {
+		return false
+	}
+	booleanField, ok := targetType.FieldByName("Boolean")
+	return ok && booleanField.Type == reflect.TypeOf((*bool)(nil))
+}
+
+func isPlexNumericType(targetType reflect.Type) bool {
+	switch targetType.Kind() {
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
+		reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr,
+		reflect.Float32, reflect.Float64:
+		return true
+	default:
+		return false
+	}
+}
+
+func normalizeQuotedPlexNumber(value string, targetType reflect.Type) (json.Number, bool) {
+	if !isPlexNumericType(targetType) || value == "" {
+		return "", false
+	}
+	switch targetType.Kind() {
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		parsed, err := strconv.ParseInt(value, 10, targetType.Bits())
+		if err != nil {
+			return "", false
+		}
+		return json.Number(strconv.FormatInt(parsed, 10)), true
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
+		parsed, err := strconv.ParseUint(value, 10, targetType.Bits())
+		if err != nil {
+			return "", false
+		}
+		return json.Number(strconv.FormatUint(parsed, 10)), true
+	case reflect.Float32, reflect.Float64:
+		parsed, err := strconv.ParseFloat(value, targetType.Bits())
+		if err != nil || math.IsNaN(parsed) || math.IsInf(parsed, 0) {
+			return "", false
+		}
+		return json.Number(strconv.FormatFloat(parsed, 'g', -1, targetType.Bits())), true
+	}
+	return "", false
+}
+
+func invalidPlexValueError(path string, targetType reflect.Type, expected string, value any) error {
+	encoded, err := json.Marshal(value)
+	if err != nil {
+		encoded = []byte(fmt.Sprintf("%v", value))
+	}
+	if path == "" {
+		path = "$"
+	}
+	return fmt.Errorf("invalid Plex value at %s: expected %s, got %s", path, expected, encoded)
+}
+
+func plexJSONPath(parent, field string) string {
+	if parent == "" {
+		return field
+	}
+	return parent + "." + field
 }
