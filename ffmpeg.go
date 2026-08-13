@@ -182,6 +182,27 @@ func configureNVENCTextSubtitle(inputArgs, outputArgs ffmpeg.KwArgs, subtitleFil
 	outputArgs["vf"] = vf
 }
 
+func scaleSoftwareFilter(height int) string {
+	if height <= 0 {
+		return ""
+	}
+	return fmt.Sprintf("scale=-2:%d", height)
+}
+
+func scaleCUDAFilter(height int) string {
+	if height <= 0 {
+		return ""
+	}
+	return fmt.Sprintf("scale_cuda=-2:%d", height)
+}
+
+func scaleVAAPIFilter(height int) string {
+	if height <= 0 {
+		return "scale_vaapi=format=nv12"
+	}
+	return fmt.Sprintf("scale_vaapi=format=nv12,scale_vaapi=-2:%d", height)
+}
+
 func configureMP4Output(outputArgs ffmpeg.KwArgs) {
 	outputArgs["f"] = "mp4"
 }
@@ -261,15 +282,14 @@ func DoFfmpeg(params FfmpegParams) (string, error) {
 	switch params.Codec {
 	case CodecH264VAAPI:
 		if params.SubtitleIndex >= 0 {
-			outputArgs["filter_complex"] = subtitleOverlayFilter(params.SubtitleIndex, params.SubtitleOffsetMs, fmt.Sprintf(",format=nv12,hwupload,scale_vaapi=format=nv12,scale_vaapi=-2:%d[out]", params.Height))
+			outputArgs["filter_complex"] = subtitleOverlayFilter(params.SubtitleIndex, params.SubtitleOffsetMs, ",format=nv12,hwupload,"+scaleVAAPIFilter(params.Height)+"[out]")
 			outputArgs["map"] = []string{"[out]", "0:a:0?"}
 			delete(inputArgs, "hwaccel_output_format")
 		} else if params.SubtitleFile != "" {
 			delete(inputArgs, "hwaccel_output_format")
-			outputArgs["vf"] = fmt.Sprintf("subtitles=%s,format=nv12,hwupload,scale_vaapi=format=nv12,scale_vaapi=-2:%d",
-				params.SubtitleFile, params.Height)
+			outputArgs["vf"] = fmt.Sprintf("subtitles=%s,format=nv12,hwupload,%s", params.SubtitleFile, scaleVAAPIFilter(params.Height))
 		} else {
-			outputArgs["vf"] = "hwupload,scale_vaapi=format=nv12,scale_vaapi=-2:" + strconv.Itoa(params.Height)
+			outputArgs["vf"] = "hwupload," + scaleVAAPIFilter(params.Height)
 		}
 		outputArgs["compression_level"] = "0"
 	case CodecH264NVENC:
@@ -297,14 +317,23 @@ func DoFfmpeg(params FfmpegParams) (string, error) {
 		fallthrough
 	default:
 		if params.SubtitleIndex >= 0 {
-			outputArgs["filter_complex"] = subtitleOverlayFilter(params.SubtitleIndex, params.SubtitleOffsetMs, fmt.Sprintf(",scale=-2:%d[out]", params.Height))
+			suffix := "[out]"
+			if filter := scaleSoftwareFilter(params.Height); filter != "" {
+				suffix = "," + filter + suffix
+			}
+			outputArgs["filter_complex"] = subtitleOverlayFilter(params.SubtitleIndex, params.SubtitleOffsetMs, suffix)
 			outputArgs["map"] = []string{"[out]", "0:a:0?"}
 		} else {
-			vf := "scale=-2:" + strconv.Itoa(params.Height)
+			vf := scaleSoftwareFilter(params.Height)
 			if params.SubtitleFile != "" {
-				vf += ",subtitles=" + params.SubtitleFile
+				if vf != "" {
+					vf += ","
+				}
+				vf += "subtitles=" + params.SubtitleFile
 			}
-			outputArgs["vf"] = vf
+			if vf != "" {
+				outputArgs["vf"] = vf
+			}
 		}
 		outputArgs["pix_fmt"] = "yuv420p"
 		outputArgs["crf"] = 23
@@ -457,39 +486,53 @@ func doFfmpegPreviewContext(ctx context.Context, fileURL, from, to string, subti
 	switch codec {
 	case CodecH264VAAPI:
 		if subtitleIndex >= 0 {
-			outputArgs["filter_complex"] = subtitleOverlayFilter(subtitleIndex, subtitleOffsetMs, fmt.Sprintf(",format=nv12,hwupload,scale_vaapi=format=nv12,scale_vaapi=-2:%d[out]", height))
+			outputArgs["filter_complex"] = subtitleOverlayFilter(subtitleIndex, subtitleOffsetMs, ",format=nv12,hwupload,"+scaleVAAPIFilter(height)+"[out]")
 			outputArgs["map"] = []string{"[out]", "0:a:0?"}
 			delete(inputArgs, "hwaccel_output_format")
 		} else if subtitleFile != "" {
 			delete(inputArgs, "hwaccel_output_format")
-			outputArgs["vf"] = fmt.Sprintf("subtitles=%s,format=nv12,hwupload,scale_vaapi=format=nv12,scale_vaapi=-2:%d",
-				subtitleFile, height)
+			outputArgs["vf"] = fmt.Sprintf("subtitles=%s,format=nv12,hwupload,%s", subtitleFile, scaleVAAPIFilter(height))
 		} else {
-			outputArgs["vf"] = "hwupload,scale_vaapi=format=nv12,scale_vaapi=-2:" + strconv.Itoa(height)
+			outputArgs["vf"] = "hwupload," + scaleVAAPIFilter(height)
 		}
 		outputArgs["compression_level"] = "0"
 	case CodecH264NVENC:
 		if subtitleIndex >= 0 {
-			outputArgs["filter_complex"] = subtitleOverlayFilter(subtitleIndex, subtitleOffsetMs, fmt.Sprintf(",hwupload_cuda,scale_cuda=-2:%d[out]", height))
+			if height > 0 {
+				outputArgs["filter_complex"] = subtitleOverlayFilter(subtitleIndex, subtitleOffsetMs, ",hwupload_cuda,"+scaleCUDAFilter(height)+"[out]")
+			} else {
+				outputArgs["filter_complex"] = subtitleOverlayFilter(subtitleIndex, subtitleOffsetMs, ",hwupload_cuda[out]")
+			}
 			outputArgs["map"] = []string{"[out]", "0:a:0?"}
 		} else if subtitleFile != "" {
 			configureNVENCTextSubtitle(inputArgs, outputArgs, subtitleFile, height)
 		} else {
 			inputArgs["hwaccel_output_format"] = "cuda"
-			outputArgs["vf"] = "scale_cuda=-2:" + strconv.Itoa(height)
+			if filter := scaleCUDAFilter(height); filter != "" {
+				outputArgs["vf"] = filter
+			}
 		}
 	case CodecLibx264:
 		fallthrough
 	default:
 		if subtitleIndex >= 0 {
-			outputArgs["filter_complex"] = subtitleOverlayFilter(subtitleIndex, subtitleOffsetMs, fmt.Sprintf(",scale=-2:%d[out]", height))
+			suffix := "[out]"
+			if filter := scaleSoftwareFilter(height); filter != "" {
+				suffix = "," + filter + suffix
+			}
+			outputArgs["filter_complex"] = subtitleOverlayFilter(subtitleIndex, subtitleOffsetMs, suffix)
 			outputArgs["map"] = []string{"[out]", "0:a:0?"}
 		} else {
-			vf := "scale=-2:" + strconv.Itoa(height)
+			vf := scaleSoftwareFilter(height)
 			if subtitleFile != "" {
-				vf += ",subtitles=" + subtitleFile
+				if vf != "" {
+					vf += ","
+				}
+				vf += "subtitles=" + subtitleFile
 			}
-			outputArgs["vf"] = vf
+			if vf != "" {
+				outputArgs["vf"] = vf
+			}
 		}
 		outputArgs["pix_fmt"] = "yuv420p"
 		outputArgs["crf"] = 23

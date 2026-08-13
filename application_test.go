@@ -1037,6 +1037,18 @@ func TestNVENCTextSubtitleArgs(t *testing.T) {
 	}
 }
 
+func TestNativeFFmpegFiltersDoNotContainZeroScale(t *testing.T) {
+	if got := scaleSoftwareFilter(0); got != "" {
+		t.Fatalf("native software filter = %q, want empty", got)
+	}
+	if got := scaleCUDAFilter(0); got != "" {
+		t.Fatalf("native CUDA filter = %q, want empty", got)
+	}
+	if got := scaleVAAPIFilter(0); strings.Contains(got, "scale_vaapi=-2:0") {
+		t.Fatalf("native VAAPI filter contains zero scale: %q", got)
+	}
+}
+
 func containsArg(args []string, want string) bool {
 	for _, arg := range args {
 		if arg == want {

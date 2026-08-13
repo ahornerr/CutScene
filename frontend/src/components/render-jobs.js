@@ -19,6 +19,65 @@ export const AUDIO_MODES = {
   DIALOGUE_NORMALIZED: 'dialogue_normalized',
 }
 
+export const RENDER_RESOLUTIONS = {
+  NATIVE: 'native',
+  SOURCE_NATIVE: 'source-native',
+  P1080: '1080p',
+  P720: '720p',
+  P480: '480p',
+}
+
+// Quality tiers are ordered from highest to lowest. Native is the safe
+// fallback when the source is below the lowest tier or its dimensions are
+// unavailable; it does not request an upscale.
+export const RESOLUTION_CHOICES = [
+  {value: RENDER_RESOLUTIONS.NATIVE, label: 'Extra high', detail: '4K', targetHeight: 2160},
+  {value: RENDER_RESOLUTIONS.P1080, label: 'High', detail: '1080', targetHeight: 1080},
+  {value: RENDER_RESOLUTIONS.P720, label: 'Medium', detail: '720', targetHeight: 720},
+  {value: RENDER_RESOLUTIONS.P480, label: 'Low', detail: '480', targetHeight: 480},
+]
+
+const SOURCE_NATIVE_CHOICE = {value: RENDER_RESOLUTIONS.SOURCE_NATIVE, label: 'Native', detail: 'Source', targetHeight: 0}
+
+export function getSourceMediaHeight(session) {
+  const height = Number(session?.Media?.[0]?.height)
+  return Number.isFinite(height) && height > 0 ? height : null
+}
+
+export function getAvailableResolutionChoices(sourceHeight) {
+  const height = Number(sourceHeight)
+  if (!Number.isFinite(height) || height <= 0 || height < 480) return [SOURCE_NATIVE_CHOICE]
+  return RESOLUTION_CHOICES.filter(choice => (
+    choice.value === RENDER_RESOLUTIONS.NATIVE
+      ? height >= choice.targetHeight
+      : choice.targetHeight <= height
+  ))
+}
+
+export function getSafeResolution(sourceHeight) {
+  const choices = getAvailableResolutionChoices(sourceHeight)
+  return choices[0].value
+}
+
+// `native` is the legacy Extra high wire value; only source-native is Native.
+export function resolutionLabel(value) {
+  switch (value) {
+    case RENDER_RESOLUTIONS.SOURCE_NATIVE: return 'Native'
+    case RENDER_RESOLUTIONS.NATIVE:
+    case '2160p':
+    case '4k':
+    case '4K':
+    case 'extra-high': return 'Extra high'
+    case RENDER_RESOLUTIONS.P1080:
+    case 'high': return 'High'
+    case RENDER_RESOLUTIONS.P720:
+    case 'medium': return 'Medium'
+    case RENDER_RESOLUTIONS.P480:
+    case 'low': return 'Low'
+    default: return 'Native'
+  }
+}
+
 // User-facing labels and descriptions for each audio mode.
 export const AUDIO_MODE_CHOICES = [
   {
@@ -53,7 +112,7 @@ export function audioModeLabel(value) {
 // partId throws here rather than silently omitting the field — the backend
 // requires partId to resolve an explicit library source, so a silent omission
 // would route the request through the wrong (session-based) path.
-export function buildRenderJobRequest(session, startPosition, endPosition, selectedSubtitle, audioMode, subtitleOffsetMs) {
+export function buildRenderJobRequest(session, startPosition, endPosition, selectedSubtitle, audioMode, subtitleOffsetMs, resolution) {
   const mediaId = normalizeMediaId(session?.Media?.[0]?.Part?.[0]?.id)
   if (mediaId == null) throw new Error('The selected media part has an invalid media ID.')
   const body = {
@@ -64,6 +123,7 @@ export function buildRenderJobRequest(session, startPosition, endPosition, selec
     subtitleIndex: selectedSubtitle,
     audioMode: audioMode || AUDIO_MODES.STANDARD,
     subtitleOffsetMs: clampSubtitleOffsetMs(subtitleOffsetMs),
+    resolution: resolution || RENDER_RESOLUTIONS.NATIVE,
   }
   if (session?._sourceType === 'library') {
     const partId = normalizePartId(session._partId)
@@ -85,6 +145,7 @@ export function buildRenderJobRequestFromSpec(spec) {
     subtitleIndex: spec.subtitleIndex,
     audioMode: spec.audioMode || AUDIO_MODES.STANDARD,
     subtitleOffsetMs: clampSubtitleOffsetMs(spec?.subtitleOffsetMs),
+    resolution: spec?.resolution || RENDER_RESOLUTIONS.NATIVE,
   }
   // A library-source spec carries its partId; re-render must preserve it.
   // Reject (rather than silently omit) if the spec claims to be a library
@@ -149,7 +210,7 @@ export function isTransportError(error) {
 // Snapshot an immutable submitted spec for display. This is captured at job
 // creation time and never mutated — it represents what was actually submitted,
 // not the current (possibly edited) controls.
-export function snapshotJobSpec(session, startPosition, endPosition, selectedSubtitle, streams, audioMode, subtitleOffsetMs) {
+export function snapshotJobSpec(session, startPosition, endPosition, selectedSubtitle, streams, audioMode, subtitleOffsetMs, resolution) {
   const stream = selectedSubtitle >= 0 ? streams.find(s => s.index === selectedSubtitle) : null
   const offsetMs = clampSubtitleOffsetMs(subtitleOffsetMs)
   return {
@@ -170,6 +231,7 @@ export function snapshotJobSpec(session, startPosition, endPosition, selectedSub
     audioMode: audioMode || AUDIO_MODES.STANDARD,
     subtitleOffsetMs: offsetMs,
     subtitleOffsetLabel: `Offset ${formatSubtitleOffsetMs(offsetMs)}`,
+    resolution: resolution || RENDER_RESOLUTIONS.NATIVE,
   }
 }
 
@@ -223,6 +285,7 @@ export function formatJobSpec(spec) {
     duration: millisToDuration(spec.clipDuration),
     subtitle: spec.subtitleLabel,
     audioMode: audioModeLabel(spec.audioMode),
+    quality: resolutionLabel(spec.resolution),
     subtitleOffsetMs: clampSubtitleOffsetMs(spec?.subtitleOffsetMs),
     subtitleOffsetLabel: `Offset ${formatSubtitleOffsetMs(spec?.subtitleOffsetMs)}`,
   }

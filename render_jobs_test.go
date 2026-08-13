@@ -42,6 +42,51 @@ func TestRenderJobValidationRejectsSubtitleOffsetOutsideRange(t *testing.T) {
 	}
 }
 
+func TestRenderResolutionTiersPreserveNearbySourcesWithoutUpscaling(t *testing.T) {
+	tests := []struct {
+		resolution string
+		source     int
+		want       int
+	}{
+		{RenderResolutionNative, 2160, 0},
+		{RenderResolutionNative, 2500, 0},
+		{RenderResolutionNative, 2600, 2160},
+		{RenderResolution2160p, 1080, 0},
+		{RenderResolution1080p, 2160, 1080},
+		{RenderResolution1080p, 1280, 0},
+		{RenderResolution1080p, 1300, 1080},
+		{RenderResolution1080p, 720, 0},
+		{RenderResolution720p, 1080, 720},
+		{RenderResolution720p, 850, 0},
+		{RenderResolution720p, 900, 720},
+		{RenderResolution720p, 480, 0},
+		{RenderResolution480p, 360, 0},
+		{RenderResolution480p, 480, 0},
+		{RenderResolution480p, 600, 480},
+		{RenderResolutionSourceNative, 360, 0},
+		{RenderResolutionSourceNative, 0, 0},
+	}
+	for _, test := range tests {
+		got, err := resolveRenderHeight(test.resolution, test.source)
+		if err != nil || got != test.want {
+			t.Errorf("resolveRenderHeight(%q, %d) = %d, %v; want %d", test.resolution, test.source, got, err, test.want)
+		}
+	}
+}
+
+func TestRenderResolutionValidationAllowsCompatibleTierIdentifiers(t *testing.T) {
+	for _, resolution := range []string{"", RenderResolutionNative, RenderResolutionSourceNative, RenderResolution2160p, "4k", RenderResolutionExtraHigh, RenderResolution1080p, RenderResolutionHigh, RenderResolution720p, RenderResolutionMedium, RenderResolution480p, RenderResolutionLow} {
+		if err := validateRenderJobRequestFields(RenderJobCreateRequest{RatingKey: "movie", MediaID: 1, FromMs: 0, ToMs: 1, SubtitleIndex: -1, Resolution: resolution}); err != nil {
+			t.Errorf("resolution %q rejected: %v", resolution, err)
+		}
+	}
+	for _, resolution := range []string{"2160", "720", "native-ish"} {
+		if err := validateRenderJobRequestFields(RenderJobCreateRequest{RatingKey: "movie", MediaID: 1, FromMs: 0, ToMs: 1, SubtitleIndex: -1, Resolution: resolution}); err == nil {
+			t.Errorf("resolution %q was accepted", resolution)
+		}
+	}
+}
+
 func TestFfmpegRenderOutputForcesMP4Muxer(t *testing.T) {
 	args := ffmpeg.KwArgs{}
 	configureMP4Output(args)

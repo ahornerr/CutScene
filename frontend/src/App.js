@@ -9,8 +9,8 @@ import ClipLibrary from "./components/ClipLibrary";
 import ClipDetail from "./components/ClipDetail";
 import {stripSubtitleMarkup} from "./components/subtitle-markup";
 import {
-  buildRenderJobRequest, buildRenderJobRequestFromSpec, isTerminal, isActive, JOB_STATES, snapshotJobSpec, AUDIO_MODES,
-  getSourcePartId, validateLibraryResult,
+  buildRenderJobRequest, buildRenderJobRequestFromSpec, isTerminal, isActive, JOB_STATES, snapshotJobSpec, AUDIO_MODES, RENDER_RESOLUTIONS,
+  getSourcePartId, validateLibraryResult, getSafeResolution,
 } from "./components/render-jobs";
 import {
   isAbortError, millisToDuration, MIN_GAP_MS,
@@ -38,7 +38,7 @@ function libraryResultToSession(result) {
     // Library items have no live view offset — clips start at the beginning.
     viewOffset: 0,
     thumb: result.artwork || '',
-    Media: [{Part: [{id: String(result.mediaId)}], videoResolution: result.videoResolution || '', videoCodec: result.videoCodec || '', videoProfile: result.videoProfile || '', audioChannels: result.audioChannels || 0, audioCodec: result.audioCodec || ''}],
+    Media: [{Part: [{id: String(result.mediaId)}], height: result.height, videoResolution: result.videoResolution || '', videoCodec: result.videoCodec || '', videoProfile: result.videoProfile || '', audioChannels: result.audioChannels || 0, audioCodec: result.audioCodec || ''}],
     _sourceType: 'library',
     _partId: result.partId,
   }
@@ -231,6 +231,7 @@ function App() {
   const [playerError, setPlayerError] = useState(false)
   const [previewStale, setPreviewStale] = useState(false)
   const [audioMode, setAudioMode] = useState(AUDIO_MODES.STANDARD)
+  const [resolution, setResolution] = useState(RENDER_RESOLUTIONS.NATIVE)
 
   // --- Theater mode ---
   // Desktop-only view toggle: widens the preview rail (Container lg → xl) and
@@ -469,6 +470,7 @@ function App() {
       setStartPosition(initStart)
       setEndPosition(initEnd)
       setAudioMode(AUDIO_MODES.STANDARD)
+      setResolution(getSafeResolution(selectedSession?.Media?.[0]?.height))
       setSubtitleOffsetMs(0)
       setSubtitleStreams([])
       setSelectedSubtitle(-1)
@@ -772,12 +774,12 @@ function App() {
     setDownloadCompleted(false)
     networkRetryCountRef.current = 0
 
-    const spec = retrySpec || snapshotJobSpec(selectedSession, startPosition, endPosition, selectedSubtitle, subtitleStreams, audioMode, subtitleOffsetMs)
+    const spec = retrySpec || snapshotJobSpec(selectedSession, startPosition, endPosition, selectedSubtitle, subtitleStreams, audioMode, subtitleOffsetMs, resolution)
     let body
     try {
       body = JSON.stringify(retrySpec
         ? buildRenderJobRequestFromSpec(retrySpec)
-        : buildRenderJobRequest(selectedSession, startPosition, endPosition, selectedSubtitle, audioMode, subtitleOffsetMs))
+        : buildRenderJobRequest(selectedSession, startPosition, endPosition, selectedSubtitle, audioMode, subtitleOffsetMs, resolution))
     } catch (error) {
       setRenderState({
         status: JOB_STATES.FAILED,
@@ -836,7 +838,7 @@ function App() {
           downloadUrl: null, expiresAt: null, retryAfter: err?.retryAfter || null, clipId: null, shareUrl: null,
         })
       })
-  }, [selectedSession, startPosition, endPosition, selectedSubtitle, subtitleStreams, audioMode, subtitleOffsetMs, stopPolling])
+  }, [selectedSession, startPosition, endPosition, selectedSubtitle, subtitleStreams, audioMode, subtitleOffsetMs, resolution, stopPolling])
 
   // ---------------------------------------------------------------- render-job polling (ref-bound)
   const pollForJobRef = useRef(null)
@@ -1031,6 +1033,7 @@ function App() {
     setStartPosition(null)
     setEndPosition(null)
     setAudioMode(AUDIO_MODES.STANDARD)
+    setResolution(RENDER_RESOLUTIONS.NATIVE)
     setSubtitleOffsetMs(0)
     setTheaterMode(false)
     setTrimFlashKey(0)
@@ -1329,6 +1332,11 @@ const handleLibraryAuthRequired = useCallback(() => setNeedsAuth(true), [])
               onOpenClip={openClip}
               audioMode={audioMode}
               onAudioModeChange={setAudioMode}
+              resolution={resolution}
+              onResolutionChange={value => {
+                setResolution(value)
+                setControlsChangedSinceJob(true)
+              }}
               theaterMode={theaterMode}
               onToggleTheater={() => setTheaterMode(mode => !mode)}
               subtitleOffsetMs={subtitleOffsetMs}
