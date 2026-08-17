@@ -81,6 +81,11 @@ func NewAPI(config Config, app *Application) (*API, error) {
 	api.http.Get("/thumb", api.thumb, api.authMiddleware)
 	api.http.Get("/streams/:ratingKey", api.getStreams, api.authMiddleware)
 	api.http.Get("/subtitles/:ratingKey", api.getSubtitleEntries, api.authMiddleware)
+	api.http.Post("/subtitle-search/index", api.indexSubtitleSearch, api.authMiddlewareJSON)
+	api.http.Post("/subtitle-search/index-all", api.indexAllSubtitleSearch, api.authMiddlewareJSON)
+	api.http.Get("/subtitle-search/index-jobs/current", api.getCurrentSubtitleIndexJob, api.authMiddlewareJSON)
+	api.http.Get("/subtitle-search/index-jobs/:id", api.getSubtitleIndexJob, api.authMiddlewareJSON)
+	api.http.Get("/subtitle-search", api.searchSubtitleSearch, api.authMiddlewareJSON)
 	api.http.Post("/render-jobs", api.createRenderJob, api.authMiddlewareJSON)
 	api.http.Get("/render-jobs/:id", api.getRenderJob, api.authMiddlewareJSON)
 	api.http.Get("/render-jobs/:id/download", api.downloadRenderJob, api.authMiddlewareJSON)
@@ -98,6 +103,113 @@ func NewAPI(config Config, app *Application) (*API, error) {
 	api.http.Get("/*", static.New("./frontend/build"))
 
 	return api, nil
+}
+
+func (a *API) indexSubtitleSearch(ctx fiber.Ctx) error {
+	if a.app != nil && a.app.sharedCorpus {
+		return renderAPIErrorCode(ctx, http.StatusForbidden, "shared_index_owner_only", "manual subtitle indexing is disabled for the shared corpus")
+	}
+	var request subtitleSearchIndexRequest
+	if err := json.Unmarshal(ctx.Body(), &request); err != nil {
+		return renderAPIErrorCode(ctx, http.StatusUnprocessableEntity, "validation_error", "request body is invalid JSON")
+	}
+	if _, err := validateLibraryRatingKey(request.RatingKey); err != nil || request.MediaID <= 0 || request.PartID <= 0 {
+		return renderAPIErrorCode(ctx, http.StatusUnprocessableEntity, "validation_error", "ratingKey, mediaId, and partId are required and valid")
+	}
+	result, err := a.app.indexSubtitleSource(ctx.UserContext(), request)
+	if err != nil {
+		if errors.Is(err, errSubtitleSearchDisabled) {
+			return renderAPIErrorCode(ctx, http.StatusNotImplemented, "search_disabled", "semantic subtitle search is disabled")
+		}
+		log.Printf("subtitle index failed: %s", redactedDiagnostic(err))
+		return renderAPIErrorCode(ctx, http.StatusServiceUnavailable, "search_unavailable", "could not index subtitles")
+	}
+	return ctx.JSON(result)
+}
+
+func (a *API) searchSubtitleSearch(ctx fiber.Ctx) error {
+	query, err := validateLibrarySearchQuery(ctx.Query("q"))
+	if err != nil {
+		return renderAPIErrorCode(ctx, http.StatusUnprocessableEntity, "validation_error", err.Error())
+	}
+	hits, err := a.app.searchSubtitleIndex(ctx.UserContext(), query)
+	if err != nil {
+		if errors.Is(err, errSubtitleSearchDisabled) {
+			return renderAPIErrorCode(ctx, http.StatusNotImplemented, "search_disabled", "semantic subtitle search is disabled")
+		}
+		log.Printf("subtitle search failed: %s", redactedDiagnostic(err))
+		return renderAPIErrorCode(ctx, http.StatusServiceUnavailable, "search_unavailable", "could not search subtitles")
+	}
+	return ctx.JSON(hits)
+}
+
+func (a *API) indexAllSubtitleSearch(ctx fiber.Ctx) error {
+	if a.app.subtitleSearch == nil {
+		return renderAPIErrorCode(ctx, http.StatusNotImplemented, "search_disabled", "semantic subtitle search is disabled")
+	}
+	user := UserFromContext(ctx.UserContext())
+	token := AuthTokenFromContext(ctx.UserContext())
+	if user == nil || strings.TrimSpace(user.Uuid) == "" || token == nil || strings.TrimSpace(*token) == "" {
+		return renderAPIError(ctx, http.StatusUnauthorized, "authentication required")
+	}
+	if a.app.sharedCorpus && !a.app.isServerOwner(user) {
+		return renderAPIErrorCode(ctx, http.StatusForbidden, "forbidden", "only the server owner can index the shared subtitle corpus")
+	}
+	jobCtx := ContextWithUser(ContextWithAuthToken(context.Background(), *token), *user)
+	job, err := a.app.subtitleJobs.start(jobCtx, user.Uuid)
+	if err != nil {
+		if errors.Is(err, errSubtitleIndexActive) {
+			return renderAPIError(ctx, http.StatusConflict, "whole-library indexing is already running")
+		}
+		return renderAPIError(ctx, http.StatusServiceUnavailable, "could not start subtitle indexing")
+	}
+	ctx.Status(http.StatusAccepted)
+	ctx.Set("Cache-Control", "no-store")
+	ctx.Set("Location", "/subtitle-search/index-jobs/"+job.id)
+	return ctx.JSON(job.status())
+}
+
+func (a *API) getSubtitleIndexJob(ctx fiber.Ctx) error {
+	if a.app.subtitleSearch == nil {
+		return renderAPIErrorCode(ctx, http.StatusNotImplemented, "search_disabled", "semantic subtitle search is disabled")
+	}
+	user := UserFromContext(ctx.UserContext())
+	if user == nil || strings.TrimSpace(user.Uuid) == "" {
+		return renderAPIError(ctx, http.StatusUnauthorized, "authentication required")
+	}
+	job, ok := a.app.subtitleJobs.get(ctx.Params("id"), user.Uuid)
+	if !ok {
+		return renderAPIErrorCode(ctx, http.StatusNotFound, "not_found", "subtitle index job is unavailable")
+	}
+	ctx.Set("Cache-Control", "no-store")
+	return ctx.JSON(job.status())
+}
+
+func canViewCurrentSubtitleIndexJob(app *Application, user *User) bool {
+	return app != nil && (!app.sharedCorpus || app.isServerOwner(user))
+}
+
+func (a *API) getCurrentSubtitleIndexJob(ctx fiber.Ctx) error {
+	if a.app.subtitleSearch == nil {
+		return renderAPIErrorCode(ctx, http.StatusNotImplemented, "search_disabled", "semantic subtitle search is disabled")
+	}
+	user := UserFromContext(ctx.UserContext())
+	if user == nil || strings.TrimSpace(user.Uuid) == "" {
+		return renderAPIError(ctx, http.StatusUnauthorized, "authentication required")
+	}
+	if !canViewCurrentSubtitleIndexJob(a.app, user) {
+		return renderAPIErrorCode(ctx, http.StatusForbidden, "forbidden", "only the server owner can view shared subtitle indexing")
+	}
+	job, ok, err := a.app.subtitleJobs.current(user.Uuid)
+	if err != nil {
+		log.Printf("current subtitle index job lookup failed: %s", redactedDiagnostic(err))
+		return renderAPIError(ctx, http.StatusServiceUnavailable, "could not load subtitle index job")
+	}
+	if !ok {
+		return renderAPIErrorCode(ctx, http.StatusNotFound, "not_found", "no subtitle index job exists")
+	}
+	ctx.Set("Cache-Control", "no-store")
+	return ctx.JSON(job.status())
 }
 
 func (a *API) validateAuthToken(ctx fiber.Ctx, sess *session.Session, authToken string) error {
@@ -1060,11 +1172,21 @@ func (a *API) previewStream(ctx fiber.Ctx) error {
 		return errors.New("requested range exceeds the selected media duration")
 	}
 
-	fileURL := fmt.Sprintf("%s%s?X-Plex-Token=%s",
-		a.config.Plex.Host,
-		previewPart.Key,
-		a.app.plexSourceToken(operationCtx, userScoped),
-	)
+	fileURL := ""
+	var callerAccess *PlexAccess
+	if userScoped {
+		var accessErr error
+		callerAccess, _, accessErr = a.app.callerPlexAccess(operationCtx, "")
+		if accessErr != nil {
+			return newPreviewUpstreamFailure("caller Plex access is unavailable", accessErr)
+		}
+	} else {
+		fileURL = fmt.Sprintf("%s%s?X-Plex-Token=%s",
+			a.config.Plex.Host,
+			previewPart.Key,
+			a.app.plexSourceToken(operationCtx, false),
+		)
+	}
 
 	// Extract subtitle to temp file if requested. For text subtitles, either use
 	// cached entries via WriteClipSRT or extract via FFmpeg. For PGS, pass
@@ -1093,7 +1215,10 @@ func (a *API) previewStream(ctx fiber.Ctx) error {
 			if entries, ok := a.app.GetCachedSubtitleEntries(operationCtx, ratingKeyStr, cacheMediaID, cachePartID, subtitleIndex); ok {
 				subtitleFile, err = WriteClipSRT(entries, fromMs, toMs, subtitleOffsetMs)
 				if err != nil {
-					return fmt.Errorf("could not write clip subtitle: %w", err)
+					if !errors.Is(err, ErrNoUsableSubtitleCues) {
+						return fmt.Errorf("could not write clip subtitle: %w", err)
+					}
+					subtitleFile = ""
 				}
 			} else if source.External {
 				if !isSupportedTextSubtitle(source) {
@@ -1101,7 +1226,11 @@ func (a *API) previewStream(ctx fiber.Ctx) error {
 				}
 				subtitleFile, err = a.app.prepareExternalSubtitleWithToken(operationCtx, source, fromMs, toMs, []int64{subtitleOffsetMs}, a.app.plexSourceToken(operationCtx, userScoped))
 				if err != nil {
-					return newPreviewUpstreamFailure("preview subtitle source unavailable", err)
+					if errors.Is(err, ErrNoUsableSubtitleCues) {
+						subtitleFile = ""
+					} else {
+						return newPreviewUpstreamFailure("preview subtitle source unavailable", err)
+					}
 				}
 			} else {
 				acquireCtx, cancelAcquire := context.WithTimeout(operationCtx, renderFFmpegAcquireTimeout)
@@ -1113,11 +1242,29 @@ func (a *API) previewStream(ctx fiber.Ctx) error {
 				subtitleCtx, cancelSubtitle := context.WithTimeout(operationCtx, renderPreviewTimeout)
 				subtitleFile, err = func() (string, error) {
 					defer release()
-					return ExtractSubtitleContext(subtitleCtx, fileURL, from, to, source.EmbeddedIndex, subtitleOffsetMs)
+					inputURL := fileURL
+					var releaseCapability func()
+					if userScoped {
+						proxy, proxyErr := a.app.ensureMediaProxy()
+						if proxyErr != nil {
+							return "", proxyErr
+						}
+						var issueErr error
+						inputURL, releaseCapability, issueErr = proxy.IssueWithTTL(subtitleCtx, callerAccess, previewPart.Key, renderPreviewTimeout)
+						if issueErr != nil {
+							return "", issueErr
+						}
+						defer releaseCapability()
+					}
+					return ExtractSubtitleContext(subtitleCtx, inputURL, from, to, source.EmbeddedIndex, subtitleOffsetMs)
 				}()
 				cancelSubtitle()
 				if err != nil {
-					return newPreviewUpstreamFailure("preview subtitle preparation failed", err)
+					if errors.Is(err, ErrNoUsableSubtitleCues) {
+						subtitleFile = ""
+					} else {
+						return newPreviewUpstreamFailure("preview subtitle preparation failed", err)
+					}
 				}
 			}
 		}
@@ -1127,6 +1274,20 @@ func (a *API) previewStream(ctx fiber.Ctx) error {
 	// handler returns. The stream writer therefore owns a standalone context
 	// with an explicit bound instead of capturing ctx or ctx.UserContext().
 	streamCtx, streamCancel := context.WithTimeout(operationCtx, renderPreviewTimeout)
+	var capabilityRelease func()
+	if userScoped {
+		proxy, proxyErr := a.app.ensureMediaProxy()
+		if proxyErr != nil {
+			streamCancel()
+			return newPreviewUpstreamFailure("Plex capability proxy is unavailable", proxyErr)
+		}
+		var issueErr error
+		fileURL, capabilityRelease, issueErr = proxy.IssueWithTTL(streamCtx, callerAccess, previewPart.Key, renderPreviewTimeout)
+		if issueErr != nil {
+			streamCancel()
+			return newPreviewUpstreamFailure("Plex capability is unavailable", issueErr)
+		}
+	}
 	acquireCtx, cancelAcquire := context.WithTimeout(streamCtx, renderFFmpegAcquireTimeout)
 	release, err := a.app.acquireFFmpeg(acquireCtx)
 	cancelAcquire()
@@ -1135,6 +1296,13 @@ func (a *API) previewStream(ctx fiber.Ctx) error {
 		return newPreviewUpstreamFailure("preview encoder capacity is unavailable", err)
 	}
 	codec := a.config.Ffmpeg.Codec
+	if capabilityRelease != nil {
+		encoderRelease := release
+		release = func() {
+			encoderRelease()
+			capabilityRelease()
+		}
+	}
 	streamSubtitleFile := subtitleFile
 	subtitleFile = ""
 	ctx.Set("Cache-Control", "no-store")

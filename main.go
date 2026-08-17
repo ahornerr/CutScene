@@ -30,6 +30,16 @@ type Config struct {
 		Root     string `mapstructure:"root"`
 		Database string `mapstructure:"database"`
 	} `mapstructure:"storage"`
+	SemanticSearch SemanticSearchConfig `mapstructure:"semantic_search"`
+}
+
+type SemanticSearchConfig struct {
+	PostgresDSN        string `mapstructure:"postgres_dsn"`
+	EmbeddingsURL      string `mapstructure:"embeddings_url"`
+	EmbeddingsProvider string `mapstructure:"embeddings_provider"`
+	EmbeddingsAPIKey   string `mapstructure:"embeddings_api_key"`
+	Enabled            bool   `mapstructure:"enabled"`
+	SharedCorpus       bool   `mapstructure:"shared_corpus"`
 }
 
 func loadConfig() (*Config, error) {
@@ -45,6 +55,10 @@ func loadConfig() (*Config, error) {
 		return nil, fmt.Errorf("unmarshal config file: %w", err)
 	}
 	cfg.Ffmpeg.Concurrency = normalizeFFmpegConcurrency(cfg.Ffmpeg.Concurrency)
+	cfg.SemanticSearch.EmbeddingsProvider, err = normalizeEmbeddingsProvider(cfg.SemanticSearch.EmbeddingsProvider)
+	if err != nil {
+		return nil, fmt.Errorf("semantic_search.embeddings_provider: %w", err)
+	}
 
 	return &cfg, nil
 }

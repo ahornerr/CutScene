@@ -1,5 +1,5 @@
 import React from 'react';
-import {act, fireEvent, render, screen} from '@testing-library/react';
+import {act, fireEvent, render, screen, waitFor} from '@testing-library/react';
 import App from './App';
 import TrimScrubber from './components/TrimScrubber';
 import {renderSubtitleMarkup, stripSubtitleMarkup} from './components/subtitle-markup';
@@ -11,9 +11,9 @@ jest.mock('react-player', () => {
   const React = require('react');
   return {
     __esModule: true,
-    default: ({url, onError, onReady}) => {
+    default: ({url, onError, onReady, playing, muted}) => {
       mockPlayerUrls.push(url);
-      return React.createElement('div', { 'data-testid': 'react-player', 'data-url': url },
+      return React.createElement('div', {'data-testid': 'react-player', 'data-url': url, 'data-playing': String(playing), 'data-muted': String(muted)},
         React.createElement('button', {type: 'button', onClick: onError}, 'Mock player error'),
         React.createElement('button', {type: 'button', onClick: onReady}, 'Mock player ready'),
       );
@@ -230,6 +230,38 @@ test('subtitle stream discovery sends the selected media part ID URL-encoded', a
   await selectSession('Alpha');
   const streamsRequest = requestFor(pending, url => url.startsWith('/streams/A?mediaId='));
   expect(streamsRequest.url).toBe(`/streams/A?mediaId=${encodeURIComponent(mediaId)}`);
+});
+
+test('opening a subtitle search hit hydrates its source and applies the hit range', async () => {
+  const pending = installFetch();
+  render(<App/>);
+  await flush();
+
+  fireEvent.click(screen.getByRole('button', {name: 'Subtitle search'}));
+  fireEvent.change(screen.getByRole('textbox', {name: 'Search subtitles'}), {target: {value: 'need a plan'}});
+  fireEvent.click(screen.getByRole('button', {name: 'Search'}));
+  const searchRequest = requestFor(pending, url => url === '/subtitle-search?q=need%20a%20plan');
+  await resolveRequest(searchRequest, [{
+    ratingKey: 'C', mediaId: 303, partId: 404, title: 'Plan', startMs: 12000, endMs: 18000, subtitleIndex: 2,
+    text: 'We need a plan.', similarity: 0.9,
+  }]);
+
+  fireEvent.click(screen.getByRole('button', {name: 'Open in workspace →'}));
+  expect(window.location.hash).toBe('#/workspace/C?mediaId=303&partId=404');
+  const sourceRequest = requestFor(pending, url => url === '/library/source/C?mediaId=303&partId=404');
+  await resolveRequest(sourceRequest, {
+    ratingKey: 'C', mediaId: 303, partId: 404, type: 'movie', title: 'Plan', duration: 120000,
+  });
+  await resolveRequest(requestFor(pending, url => url === '/streams/C?mediaId=303&partId=404'), [
+    {index: 0, type: 'pgs', codec: 'pgs', displayTitle: 'Bitmap'},
+    {index: 2, type: 'text', codec: 'srt', displayTitle: 'Matched track'},
+  ]);
+
+  await waitFor(() => expect(screen.getByTestId('react-player').getAttribute('data-url'))
+    .toContain('/preview/C/00:00:12/00:00:18?mediaId=303&partId=404&subtitle=2'));
+  expect(screen.getByTestId('react-player')).toHaveAttribute('data-playing', 'true');
+  expect(screen.getByTestId('react-player')).toHaveAttribute('data-muted', 'true');
+  expect(screen.getByRole('button', {name: 'Theater mode'})).toHaveAttribute('aria-pressed', 'true');
 });
 
 test('rapid session A to B aborts A stream work and stale A stream results cannot commit', async () => {

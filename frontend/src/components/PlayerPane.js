@@ -29,7 +29,7 @@ function TheaterIcon({active, ...props}) {
 // assistive tech while the visible label flips between Theater/Default.
 export default function PlayerPane({
   playerUrl, onError, onReady, previewStale, onApplyPreview,
-  theaterMode, onToggleTheater,
+  theaterMode, onToggleTheater, autoPlay,
 }) {
   const theaterOn = !!theaterMode
   return (
@@ -78,7 +78,11 @@ export default function PlayerPane({
           <ReactPlayer
             url={playerUrl}
             controls
-            playing
+            // Search-result playback starts after async source hydration, so it
+            // is muted to satisfy browser autoplay policy. Native controls let
+            // the viewer turn sound on without a second, competing UI.
+            playing={!!autoPlay}
+            muted={!!autoPlay}
             width="100%"
             height="100%"
             onError={onError}

@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -22,6 +23,138 @@ import (
 	"github.com/valyala/fasthttp"
 	"github.com/valyala/fasthttp/fasthttputil"
 )
+
+func TestCallerPreviewUsesAndRevokesLoopbackCapability(t *testing.T) {
+	const (
+		accountToken  = "caller-account-secret"
+		resourceToken = "caller-resource-secret"
+		machineID     = "caller-preview-machine"
+		configuredURL = "https://configured.test"
+		resourceURL   = "https://resource.test"
+	)
+
+	for _, testCase := range []struct {
+		name      string
+		runnerErr error
+	}{
+		{name: "success"},
+		{name: "failure", runnerErr: errors.New("injected ffmpeg failure")},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			pms := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if got := r.Header.Get("X-Plex-Token"); got != resourceToken {
+					t.Errorf("PMS token = %q, want resource token", got)
+				}
+				w.Header().Set("Content-Type", "application/json")
+				switch r.URL.Path {
+				case "/identity":
+					_, _ = io.WriteString(w, `{"MediaContainer":{"machineIdentifier":"`+machineID+`"}}`)
+				case "/library/metadata/movie-1":
+					_, _ = io.WriteString(w, `{"MediaContainer":{"Metadata":[{"ratingKey":"movie-1","type":"movie","title":"Movie","Media":[{"id":10,"Part":[{"id":20,"key":"/library/parts/20/file.mp4"}]}]}]}}`)
+				default:
+					http.NotFound(w, r)
+				}
+			}))
+			defer pms.Close()
+
+			resources := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if got := r.Header.Get("X-Plex-Token"); got != accountToken {
+					t.Errorf("resource discovery token = %q, want account token", got)
+				}
+				_ = json.NewEncoder(w).Encode([]PlexResource{{
+					ClientIdentifier: machineID,
+					Provides:         "server",
+					AccessToken:      resourceToken,
+					Connections:      []PlexConnection{{URI: resourceURL, Protocol: "https"}},
+				}})
+			}))
+			defer resources.Close()
+
+			resolver, err := NewPlexResourceResolver(configuredURL)
+			if err != nil {
+				t.Fatal(err)
+			}
+			resolver.resourcesURL = resources.URL
+			if err := resolver.SetTrustedOrigins(machineID, []string{resourceURL}); err != nil {
+				t.Fatal(err)
+			}
+			baseTransport := &http.Transport{
+				Proxy:           nil,
+				TLSClientConfig: &tls.Config{InsecureSkipVerify: true}, // test-only TLS server
+			}
+			baseDial := (&net.Dialer{}).DialContext
+			baseTransport.DialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
+				switch {
+				case strings.HasPrefix(address, "resource.test:"):
+					return net.Dial("tcp", pms.Listener.Addr().String())
+				case strings.HasPrefix(address, "configured.test:"):
+					return nil, errors.New("configured preview candidate unavailable")
+				default:
+					return baseDial(ctx, network, address)
+				}
+			}
+			resolver.client.Transport = baseTransport
+
+			config := Config{}
+			config.Plex.Host = configuredURL
+			application := &Application{
+				config:            config,
+				plexResources:     resolver,
+				machineIdentifier: machineID,
+				ffmpegLimiter:     newFFmpegLimiter(1),
+			}
+			var ffmpegURL string
+			api := &API{
+				config: config,
+				app:    application,
+				previewRunner: func(_ context.Context, sourceURL, _, _, _ string, _ int, _ Codec, writer io.Writer, _ AudioMode) error {
+					ffmpegURL = sourceURL
+					if testCase.runnerErr != nil {
+						return testCase.runnerErr
+					}
+					_, err := writer.Write([]byte("preview"))
+					return err
+				},
+			}
+			httpApp := fiber.New()
+			httpApp.Get("/preview/:ratingKey/:from/:to", func(ctx fiber.Ctx) error {
+				ctx.SetUserContext(ContextWithUser(ContextWithAuthToken(context.Background(), accountToken), User{Uuid: "caller-preview-user"}))
+				return api.preview(ctx)
+			})
+
+			response, err := httpApp.Test(httptest.NewRequest(http.MethodGet, "/preview/movie-1/00:00:00/00:00:01?partId=20", nil))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer response.Body.Close()
+			_, _ = io.ReadAll(response.Body)
+			if ffmpegURL == "" || !strings.HasPrefix(ffmpegURL, "http://127.0.0.1:") || !strings.Contains(ffmpegURL, "/plex-media/") {
+				t.Fatalf("FFmpeg source URL = %q, want loopback capability", ffmpegURL)
+			}
+			for _, secret := range []string{accountToken, resourceToken, configuredURL, resourceURL} {
+				if strings.Contains(ffmpegURL, secret) {
+					t.Fatalf("FFmpeg source URL leaked %q: %q", secret, ffmpegURL)
+				}
+			}
+			deadline := time.Now().Add(time.Second)
+			for {
+				application.mediaProxy.mu.Lock()
+				remaining := len(application.mediaProxy.items)
+				application.mediaProxy.mu.Unlock()
+				if remaining == 0 {
+					break
+				}
+				if time.Now().After(deadline) {
+					t.Fatalf("preview capability was not revoked after %s", testCase.name)
+				}
+				time.Sleep(time.Millisecond)
+			}
+			if testCase.runnerErr == nil && response.StatusCode != http.StatusOK {
+				t.Fatalf("successful preview status = %d", response.StatusCode)
+			}
+		})
+	}
+}
 
 func TestProtectedRoutesRunAuthBeforeHandlers(t *testing.T) {
 	api, err := NewAPI(Config{}, &Application{})
@@ -63,6 +196,29 @@ func TestProtectedRoutesRunAuthBeforeHandlers(t *testing.T) {
 			}
 			if resp.StatusCode < 300 || resp.StatusCode >= 400 {
 				t.Fatalf("status = %d, want redirect", resp.StatusCode)
+			}
+		})
+	}
+}
+
+func TestCurrentSubtitleIndexJobOwnerPolicy(t *testing.T) {
+	owner := &User{Uuid: "owner-uuid", Email: "owner@example.test"}
+	nonOwner := &User{Uuid: "other-uuid", Email: "other@example.test"}
+	for _, test := range []struct {
+		name   string
+		shared bool
+		user   *User
+		want   bool
+	}{
+		{name: "shared owner", shared: true, user: owner, want: true},
+		{name: "shared nonowner", shared: true, user: nonOwner, want: false},
+		{name: "private owner", shared: false, user: owner, want: true},
+		{name: "private nonowner", shared: false, user: nonOwner, want: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			app := &Application{sharedCorpus: test.shared, ownerUUID: owner.Uuid}
+			if got := canViewCurrentSubtitleIndexJob(app, test.user); got != test.want {
+				t.Fatalf("canViewCurrentSubtitleIndexJob = %v, want %v", got, test.want)
 			}
 		})
 	}

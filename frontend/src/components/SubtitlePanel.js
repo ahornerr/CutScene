@@ -1,6 +1,7 @@
 import {Box, FormControl, InputLabel, MenuItem, Select, Typography} from "@mui/material";
 import SubtitleList from "./SubtitleList";
 import SubtitleOffsetControl from "./SubtitleOffsetControl";
+import {orderSubtitleStreams, subtitleFormat} from "./subtitle-formats";
 
 // Right-rail subtitle control room: track selector on top, searchable list below.
 // The subtitle offset stepper lives beside the track selector so all subtitle
@@ -14,7 +15,9 @@ export default function SubtitlePanel({
   loading, error, listRef,
 }) {
   const hasStreams = streams.length > 0
-  const currentCodec = streams.find(s => s.index === selectedSubtitle)?.codec
+  const orderedStreams = orderSubtitleStreams(streams)
+  const currentStream = streams.find(s => s.index === selectedSubtitle)
+  const currentFormat = currentStream ? subtitleFormat(currentStream).label : null
   const offsetDisabled = selectedSubtitle < 0
 
   return (
@@ -34,18 +37,25 @@ export default function SubtitlePanel({
             onChange={e => onSubtitleChange(e.target.value)}
           >
             <MenuItem value={-1}>None</MenuItem>
-            {streams.map((stream, idx) => (
-              <MenuItem key={idx} value={stream.index}>
-                {stream.language
-                  ? `${stream.language} (${stream.displayTitle || 'Track ' + (stream.index + 1)})`
-                  : stream.displayTitle || 'Track ' + (stream.index + 1)}
+            {orderedStreams.map((stream, idx) => {
+              const format = subtitleFormat(stream).label
+              const title = stream.language
+                ? `${stream.language} (${stream.displayTitle || 'Track ' + (stream.index + 1)})`
+                : stream.displayTitle || 'Track ' + (stream.index + 1)
+              const formatId = `subtitle-format-${stream.index}`
+              return <MenuItem key={idx} value={stream.index} aria-label={title} aria-describedby={formatId}>
+                <Box sx={{display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 1.5, width: '100%'}}>
+                  <span>{title}</span>
+                  <Box component="span" aria-hidden="true" sx={{flexShrink: 0, px: .75, py: .1, borderRadius: 99, fontSize: '.68rem', fontWeight: 700, letterSpacing: '.04em', color: '#ffd9b0', backgroundColor: 'rgba(255,115,0,.12)', border: '1px solid rgba(255,115,0,.25)'}}>{format}</Box>
+                  <Box id={formatId} component="span" sx={{position: 'absolute', width: 1, height: 1, p: 0, m: -1, overflow: 'hidden', clip: 'rect(0 0 0 0)', whiteSpace: 'nowrap', border: 0}}>Format: {format}</Box>
+                </Box>
               </MenuItem>
-            ))}
+            })}
           </Select>
         </FormControl>
-        {currentCodec && (
+        {currentFormat && (
           <Typography variant="caption" sx={{fontFamily: 'var(--cs-mono-font)', color: 'text.secondary'}}>
-            {currentCodec}
+            {currentFormat}
           </Typography>
         )}
         <SubtitleOffsetControl

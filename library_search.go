@@ -72,6 +72,7 @@ type LibrarySearchResult struct {
 	Width           int    `json:"width,omitempty"`
 	Height          int    `json:"height,omitempty"`
 	FileSize        int64  `json:"fileSize,omitempty"`
+	sectionKey      string `json:"-"`
 }
 
 type plexSearchResponse struct {
@@ -115,30 +116,21 @@ func (a *Application) SearchLibrary(ctx context.Context, query string) ([]Librar
 	if err != nil {
 		return nil, err
 	}
-	token := AuthTokenFromContext(ctx)
-	if token == nil || strings.TrimSpace(*token) == "" {
-		return nil, errors.New("missing auth token")
-	}
 	searchCtx, cancel := context.WithTimeout(ctx, librarySearchTimeout)
 	defer cancel()
-
-	base, err := url.Parse(a.config.Plex.Host)
-	if err != nil || (base.Scheme != "http" && base.Scheme != "https") || base.Host == "" || base.User != nil {
-		return nil, errors.New("configured Plex origin is invalid")
+	access, resolver, err := a.callerPlexAccess(searchCtx, "")
+	if err != nil {
+		return nil, errors.New("caller Plex access is unavailable")
 	}
-	base.Path = strings.TrimRight(base.Path, "/") + "/hubs/search"
-	values := base.Query()
+	values := url.Values{}
 	values.Set("query", query)
 	values.Set("X-Plex-Container-Size", fmt.Sprintf("%d", maxLibrarySearchResults))
-	base.RawQuery = values.Encode()
-
-	req, err := http.NewRequestWithContext(searchCtx, http.MethodGet, base.String(), nil)
+	req, err := newPlexRequest(searchCtx, access, http.MethodGet, "/hubs/search?"+values.Encode())
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("X-Plex-Token", *token)
 	req.Header.Set("Accept", "application/json")
-	resp, err := callerPlexHTTPClient.Do(req)
+	resp, err := resolver.DoPlexRequest(searchCtx, access, req)
 	if err != nil {
 		return nil, fmt.Errorf("could not search Plex library: %w", err)
 	}
@@ -471,23 +463,20 @@ func stringPointerValue(value *string) *string {
 }
 
 func (a *Application) getLibraryChildren(ctx context.Context, ratingKey, token string) ([]components.Metadata, error) {
-	base, err := url.Parse(a.config.Plex.Host)
-	if err != nil || (base.Scheme != "http" && base.Scheme != "https") || base.Host == "" || base.User != nil {
-		return nil, errors.New("configured Plex origin is invalid")
+	access, resolver, err := a.callerPlexAccess(ctx, token)
+	if err != nil {
+		return nil, errors.New("caller Plex access is unavailable")
 	}
-	base.Path = strings.TrimRight(base.Path, "/") + "/library/metadata/" + url.PathEscape(ratingKey) + "/children"
-	values := base.Query()
+	values := url.Values{}
 	values.Set("X-Plex-Container-Size", fmt.Sprintf("%d", maxLibraryChildren))
 	values.Set("X-Plex-Container-Start", "0")
-	base.RawQuery = values.Encode()
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, base.String(), nil)
+	path := "/library/metadata/" + url.PathEscape(ratingKey) + "/children?" + values.Encode()
+	req, err := newPlexRequest(ctx, access, http.MethodGet, path)
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("X-Plex-Token", token)
 	req.Header.Set("Accept", "application/json")
-	resp, err := callerPlexHTTPClient.Do(req)
+	resp, err := resolver.DoPlexRequest(ctx, access, req)
 	if err != nil {
 		return nil, fmt.Errorf("could not get Plex library children: %w", err)
 	}
@@ -532,18 +521,17 @@ func (e *libraryHTTPError) Error() string {
 // the no-redirect credential rule is enforced even for tests or callers that
 // construct an Application with a custom PlexGo client.
 func (a *Application) getCallerMetadataItem(ctx context.Context, ratingKey, token string) (*components.Metadata, error) {
-	base, err := url.Parse(a.config.Plex.Host)
-	if err != nil || (base.Scheme != "http" && base.Scheme != "https") || base.Host == "" || base.User != nil {
-		return nil, errors.New("configured Plex origin is invalid")
+	access, resolver, err := a.callerPlexAccess(ctx, token)
+	if err != nil {
+		return nil, errors.New("caller Plex access is unavailable")
 	}
-	base.Path = strings.TrimRight(base.Path, "/") + "/library/metadata/" + url.PathEscape(ratingKey)
-	request, err := http.NewRequestWithContext(ctx, http.MethodGet, base.String(), nil)
+	path := "/library/metadata/" + url.PathEscape(ratingKey)
+	request, err := newPlexRequest(ctx, access, http.MethodGet, path)
 	if err != nil {
 		return nil, err
 	}
-	request.Header.Set("X-Plex-Token", token)
 	request.Header.Set("Accept", "application/json")
-	response, err := callerPlexHTTPClient.Do(request)
+	response, err := resolver.DoPlexRequest(ctx, access, request)
 	if err != nil {
 		return nil, fmt.Errorf("could not get Plex metadata: %w", err)
 	}

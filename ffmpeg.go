@@ -9,6 +9,7 @@ import (
 	ffmpeg "github.com/u2takey/ffmpeg-go"
 	"io"
 	"math"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -35,6 +36,44 @@ const (
 )
 
 const dialogueAudioFilter = "pan=stereo|FL<FL+0.85*FC+0.50*BL+0.50*SL|FR<FR+0.85*FC+0.50*BR+0.50*SR,alimiter=limit=0.95:attack=5:release=50:latency=1:level=0"
+
+var ErrNoUsableSubtitleCues = errors.New("no usable subtitle cues")
+
+type subtitleSRTWriteError struct {
+	operation string
+	err       error
+}
+
+func (e *subtitleSRTWriteError) Error() string {
+	return fmt.Sprintf("subtitle SRT %s failed: %v", e.operation, e.err)
+}
+
+func (e *subtitleSRTWriteError) Unwrap() error { return e.err }
+
+func subtitleSRTIOError(operation string, err error) error {
+	if err == nil {
+		return nil
+	}
+	return &subtitleSRTWriteError{operation: operation, err: err}
+}
+
+func escapeFFmpegFilterFilename(path string) string {
+	var escaped strings.Builder
+	escaped.WriteByte('\'')
+	for _, r := range path {
+		switch r {
+		case '\\', '\'', ':', ',', ';', '[', ']', '=':
+			escaped.WriteByte('\\')
+		}
+		escaped.WriteRune(r)
+	}
+	escaped.WriteByte('\'')
+	return escaped.String()
+}
+
+func subtitlesFilter(filename string) string {
+	return "subtitles=filename=" + escapeFFmpegFilterFilename(filename)
+}
 
 // Subtitle offsets are deliberately bounded to keep timestamp arithmetic
 // predictable and to match the maximum supported clip duration.
@@ -159,6 +198,19 @@ func subtitleOverlayFilter(index int, offsetMs int64, suffix string) string {
 	return fmt.Sprintf("[0:s:%d]setpts=PTS%+d/1000/TB[sub];[0:v][sub]overlay%s", index, offsetMs, suffix)
 }
 
+func configureFFmpegHTTPRecovery(inputArgs ffmpeg.KwArgs, rawURL string) {
+	parsed, err := url.Parse(strings.TrimSpace(rawURL))
+	if err != nil || parsed.Host == "" || (parsed.Scheme != "http" && parsed.Scheme != "https") {
+		return
+	}
+	inputArgs["reconnect"] = "1"
+	inputArgs["reconnect_streamed"] = "1"
+	inputArgs["reconnect_on_network_error"] = "1"
+	inputArgs["reconnect_on_http_error"] = "502,503,504"
+	inputArgs["reconnect_delay_max"] = "2"
+	inputArgs["rw_timeout"] = "15000000"
+}
+
 type FfmpegParamsMetadata struct {
 	Title        string
 	Show         string
@@ -175,7 +227,7 @@ func configureNVENCTextSubtitle(inputArgs, outputArgs ffmpeg.KwArgs, subtitleFil
 	delete(inputArgs, "hwaccel_output_format")
 	delete(inputArgs, "extra_hw_frames")
 
-	vf := fmt.Sprintf("subtitles=%s,format=yuv420p,hwupload_cuda", subtitleFile)
+	vf := fmt.Sprintf("%s,format=yuv420p,hwupload_cuda", subtitlesFilter(subtitleFile))
 	if height > 0 {
 		vf += fmt.Sprintf(",scale_cuda=-2:%d", height)
 	}
@@ -210,6 +262,15 @@ func configureMP4Output(outputArgs ffmpeg.KwArgs) {
 func DoFfmpeg(params FfmpegParams) (string, error) {
 	if err := validateSubtitleOffsetMs(params.SubtitleOffsetMs); err != nil {
 		return params.OutputPath, err
+	}
+	if params.SubtitleFile != "" {
+		if err := validateSubtitleFileForBurn(params.SubtitleFile); err != nil {
+			if errors.Is(err, ErrNoUsableSubtitleCues) {
+				params.SubtitleFile = ""
+			} else {
+				return params.OutputPath, errors.New("subtitle file preflight failed")
+			}
+		}
 	}
 	outputMetadata := map[string]string{
 		"title":   params.Metadata.Title,
@@ -287,7 +348,7 @@ func DoFfmpeg(params FfmpegParams) (string, error) {
 			delete(inputArgs, "hwaccel_output_format")
 		} else if params.SubtitleFile != "" {
 			delete(inputArgs, "hwaccel_output_format")
-			outputArgs["vf"] = fmt.Sprintf("subtitles=%s,format=nv12,hwupload,%s", params.SubtitleFile, scaleVAAPIFilter(params.Height))
+			outputArgs["vf"] = fmt.Sprintf("%s,format=nv12,hwupload,%s", subtitlesFilter(params.SubtitleFile), scaleVAAPIFilter(params.Height))
 		} else {
 			outputArgs["vf"] = "hwupload," + scaleVAAPIFilter(params.Height)
 		}
@@ -329,7 +390,7 @@ func DoFfmpeg(params FfmpegParams) (string, error) {
 				if vf != "" {
 					vf += ","
 				}
-				vf += "subtitles=" + params.SubtitleFile
+				vf += subtitlesFilter(params.SubtitleFile)
 			}
 			if vf != "" {
 				outputArgs["vf"] = vf
@@ -341,6 +402,7 @@ func DoFfmpeg(params FfmpegParams) (string, error) {
 		outputArgs["tune"] = "film"
 	}
 
+	configureFFmpegHTTPRecovery(inputArgs, params.URL)
 	errBuff := &boundedBuffer{max: 64 << 10}
 	input := ffmpeg.Input(params.URL, inputArgs)
 	var output *ffmpeg.Stream
@@ -442,6 +504,15 @@ func doFfmpegPreviewContext(ctx context.Context, fileURL, from, to string, subti
 	if err := validateSubtitleOffsetMs(subtitleOffsetMs); err != nil {
 		return err
 	}
+	if subtitleFile != "" {
+		if err := validateSubtitleFileForBurn(subtitleFile); err != nil {
+			if errors.Is(err, ErrNoUsableSubtitleCues) {
+				subtitleFile = ""
+			} else {
+				return errors.New("subtitle file preflight failed")
+			}
+		}
+	}
 	inputArgs := ffmpeg.KwArgs{
 		"ss":          from,
 		"to":          to,
@@ -491,7 +562,7 @@ func doFfmpegPreviewContext(ctx context.Context, fileURL, from, to string, subti
 			delete(inputArgs, "hwaccel_output_format")
 		} else if subtitleFile != "" {
 			delete(inputArgs, "hwaccel_output_format")
-			outputArgs["vf"] = fmt.Sprintf("subtitles=%s,format=nv12,hwupload,%s", subtitleFile, scaleVAAPIFilter(height))
+			outputArgs["vf"] = fmt.Sprintf("%s,format=nv12,hwupload,%s", subtitlesFilter(subtitleFile), scaleVAAPIFilter(height))
 		} else {
 			outputArgs["vf"] = "hwupload," + scaleVAAPIFilter(height)
 		}
@@ -528,7 +599,7 @@ func doFfmpegPreviewContext(ctx context.Context, fileURL, from, to string, subti
 				if vf != "" {
 					vf += ","
 				}
-				vf += "subtitles=" + subtitleFile
+				vf += subtitlesFilter(subtitleFile)
 			}
 			if vf != "" {
 				outputArgs["vf"] = vf
@@ -540,6 +611,7 @@ func doFfmpegPreviewContext(ctx context.Context, fileURL, from, to string, subti
 		outputArgs["tune"] = "film"
 	}
 
+	configureFFmpegHTTPRecovery(inputArgs, fileURL)
 	errBuff := &boundedBuffer{max: 64 << 10}
 	input := ffmpeg.Input(fileURL, inputArgs)
 	output := ffmpeg.OutputContext(ctx, []*ffmpeg.Stream{input}, "pipe:", outputArgs)
@@ -583,6 +655,7 @@ func ExtractSubtitleFullContext(ctx context.Context, url string, subtitleIndex i
 		"c:s": "srt",
 	}
 
+	configureFFmpegHTTPRecovery(inputArgs, url)
 	errBuff := &boundedBuffer{max: 64 << 10}
 	input := ffmpeg.Input(url, inputArgs)
 	output := ffmpeg.OutputContext(ctx, []*ffmpeg.Stream{input}, tmpFile, outputArgs)
@@ -603,6 +676,10 @@ func ExtractSubtitleFullContext(ctx context.Context, url string, subtitleIndex i
 		_ = os.Remove(tmpFile)
 		return "", err
 	}
+	if err := validateSubtitleFileForBurn(tmpFile); err != nil {
+		_ = os.Remove(tmpFile)
+		return "", err
+	}
 	if diagnostic := redactedDiagnostic(errors.New(errBuff.String())); diagnostic != "" {
 		fmt.Fprintln(os.Stderr, diagnostic)
 	}
@@ -615,7 +692,7 @@ func ExtractSubtitleFullContext(ctx context.Context, url string, subtitleIndex i
 func ParseSRT(filename string) ([]SubtitleEntry, error) {
 	f, err := os.Open(filename)
 	if err != nil {
-		return nil, fmt.Errorf("could not open SRT file: %w", err)
+		return nil, subtitleSRTIOError("open", err)
 	}
 	defer f.Close()
 
@@ -638,8 +715,12 @@ func ParseSRT(filename string) ([]SubtitleEntry, error) {
 		case 1: // awaiting timestamp line
 			parts := strings.SplitN(line, " --> ", 2)
 			if len(parts) == 2 {
-				start, _ = parseSRTTimestamp(strings.TrimSpace(parts[0]))
-				end, _ = parseSRTTimestamp(strings.TrimSpace(parts[1]))
+				var startErr, endErr error
+				start, startErr = parseSRTTimestamp(strings.TrimSpace(parts[0]))
+				end, endErr = parseSRTTimestamp(strings.TrimSpace(parts[1]))
+				if startErr != nil || endErr != nil || end <= start {
+					return entries, errors.New("invalid SRT cue timestamp")
+				}
 				textLines = textLines[:0]
 				state = 2
 			}
@@ -668,7 +749,34 @@ func ParseSRT(filename string) ([]SubtitleEntry, error) {
 		})
 	}
 
-	return entries, scanner.Err()
+	if err := scanner.Err(); err != nil {
+		return entries, subtitleSRTIOError("read", err)
+	}
+	return entries, nil
+}
+
+func validateSubtitleFileForBurn(filename string) error {
+	info, err := os.Stat(filename)
+	if err != nil {
+		return errors.New("subtitle file is unavailable")
+	}
+	if !info.Mode().IsRegular() || info.Size() == 0 {
+		return ErrNoUsableSubtitleCues
+	}
+	entries, err := ParseSRT(filename)
+	if err != nil {
+		var ioErr *subtitleSRTWriteError
+		if errors.As(err, &ioErr) {
+			return errors.New("subtitle file is unavailable")
+		}
+		return ErrNoUsableSubtitleCues
+	}
+	for _, entry := range entries {
+		if entry.End > entry.Start && strings.TrimSpace(entry.Text) != "" {
+			return nil
+		}
+	}
+	return ErrNoUsableSubtitleCues
 }
 
 // parseSRTTimestamp converts an SRT timestamp string "HH:MM:SS,mmm" to milliseconds.
@@ -753,6 +861,62 @@ func ExtractSubtitleContext(ctx context.Context, url, from, to string, subtitleI
 	return WriteClipSRT(entries, fromMs, toMs, offset)
 }
 
+func ExtractSubtitleTracksBatchContext(ctx context.Context, mediaURL string, embeddedIndices []int) (map[int][]SubtitleEntry, error) {
+	result := make(map[int][]SubtitleEntry, len(embeddedIndices))
+	if len(embeddedIndices) == 0 {
+		return result, nil
+	}
+	outputDir, err := os.MkdirTemp("", "cutscene_subtitle_batch_")
+	if err != nil {
+		return nil, err
+	}
+	defer os.RemoveAll(outputDir)
+	args := []string{"-hide_banner", "-loglevel", "error"}
+	inputArgs := ffmpeg.KwArgs{}
+	configureFFmpegHTTPRecovery(inputArgs, mediaURL)
+	for _, key := range []string{"reconnect", "reconnect_streamed", "reconnect_on_network_error", "reconnect_on_http_error", "reconnect_delay_max", "rw_timeout"} {
+		if value, ok := inputArgs[key]; ok {
+			args = append(args, "-"+key, fmt.Sprint(value))
+		}
+	}
+	args = append(args, "-i", mediaURL)
+	paths := make(map[int]string, len(embeddedIndices))
+	for index, embeddedIndex := range embeddedIndices {
+		path := filepath.Join(outputDir, fmt.Sprintf("track_%03d.srt", index))
+		paths[embeddedIndex] = path
+		args = append(args, "-map", fmt.Sprintf("0:s:%d", embeddedIndex), "-c:s", "srt", path)
+	}
+	errOutput := &boundedBuffer{max: 64 << 10}
+	command := subtitleBatchFFmpegCommand(ctx, args...)
+	command.Stderr = errOutput
+	command.Stdout = io.Discard
+	err = command.Run()
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
+	if err != nil {
+		return nil, fmt.Errorf("batch subtitle extraction failed: %s", errOutput.String())
+	}
+	const maxBatchSubtitleBytes int64 = 16 << 20
+	const maxBatchSubtitleCues = 100000
+	for embeddedIndex, path := range paths {
+		info, statErr := os.Stat(path)
+		if statErr != nil || !info.Mode().IsRegular() || info.Size() == 0 || info.Size() > maxBatchSubtitleBytes {
+			return nil, errors.New("batch subtitle output is invalid")
+		}
+		entries, parseErr := ParseSRT(path)
+		if parseErr != nil || len(entries) > maxBatchSubtitleCues {
+			return nil, errors.New("batch subtitle output is invalid")
+		}
+		result[embeddedIndex] = entries
+	}
+	return result, nil
+}
+
+var subtitleBatchFFmpegCommand = func(ctx context.Context, args ...string) *exec.Cmd {
+	return exec.CommandContext(ctx, "ffmpeg", args...)
+}
+
 func subtitleOffsetArgument(offsets []int64) (int64, error) {
 	if len(offsets) > 1 {
 		return 0, errors.New("multiple subtitle offsets specified")
@@ -781,6 +945,7 @@ func extractSubtitleContextRaw(ctx context.Context, url, from, to string, subtit
 		"c:s": "srt",
 	}
 
+	configureFFmpegHTTPRecovery(inputArgs, url)
 	errBuff := &boundedBuffer{max: 64 << 10}
 	input := ffmpeg.Input(url, inputArgs)
 	output := ffmpeg.OutputContext(ctx, []*ffmpeg.Stream{input}, tmpFile, outputArgs)
@@ -798,6 +963,10 @@ func extractSubtitleContextRaw(ctx context.Context, url, from, to string, subtit
 		return "", fmt.Errorf("subtitle extraction failed:\n%s", errBuff.String())
 	}
 	if err != nil {
+		_ = os.Remove(tmpFile)
+		return "", err
+	}
+	if err := validateSubtitleFileForBurn(tmpFile); err != nil {
 		_ = os.Remove(tmpFile)
 		return "", err
 	}
@@ -880,23 +1049,18 @@ func WriteClipSRT(entries []SubtitleEntry, fromMs, toMs int64, subtitleOffsets .
 	if fromMs < 0 || toMs <= fromMs {
 		return "", errors.New("invalid subtitle clip range")
 	}
-	tmpFile, err := os.CreateTemp("", "cutscene_clip_*.srt")
-	if err != nil {
-		return "", err
+	type clippedCue struct {
+		start int64
+		end   int64
+		text  string
 	}
-	tmpFilePath := tmpFile.Name()
-	defer tmpFile.Close()
-
-	seq := 1
+	cues := make([]clippedCue, 0, len(entries))
 	for _, entry := range entries {
-		// Work on local values only. Cached entries are source data and must not
-		// be changed when one preview/render requests an offset.
 		startMs := saturatingAddInt64(entry.Start, offset)
 		endMs := saturatingAddInt64(entry.End, offset)
-		if endMs <= fromMs || startMs >= toMs {
+		if endMs <= fromMs || startMs >= toMs || endMs <= startMs || strings.TrimSpace(entry.Text) == "" {
 			continue
 		}
-
 		start := startMs - fromMs
 		if start < 0 {
 			start = 0
@@ -905,15 +1069,41 @@ func WriteClipSRT(entries []SubtitleEntry, fromMs, toMs int64, subtitleOffsets .
 		if end > toMs-fromMs {
 			end = toMs - fromMs
 		}
-
-		fmt.Fprintf(tmpFile, "%d\n%s --> %s\n%s\n\n",
-			seq,
-			formatSRTTimestamp(start),
-			formatSRTTimestamp(end),
-			entry.Text,
-		)
-		seq++
+		if end <= start {
+			continue
+		}
+		cues = append(cues, clippedCue{start: start, end: end, text: entry.Text})
 	}
-
+	if len(cues) == 0 {
+		return "", ErrNoUsableSubtitleCues
+	}
+	tmpFile, err := os.CreateTemp("", "cutscene_clip_*.srt")
+	if err != nil {
+		return "", err
+	}
+	tmpFilePath := tmpFile.Name()
+	cleanup := true
+	defer func() {
+		if cleanup {
+			_ = tmpFile.Close()
+			_ = os.Remove(tmpFilePath)
+		}
+	}()
+	for seq, cue := range cues {
+		if _, err := fmt.Fprintf(tmpFile, "%d\n%s --> %s\n%s\n\n", seq+1, formatSRTTimestamp(cue.start), formatSRTTimestamp(cue.end), cue.text); err != nil {
+			return "", subtitleSRTIOError("write", err)
+		}
+	}
+	if err := tmpFile.Sync(); err != nil {
+		return "", subtitleSRTIOError("sync", err)
+	}
+	if err := tmpFile.Close(); err != nil {
+		return "", subtitleSRTIOError("close", err)
+	}
+	cleanup = false
+	if err := validateSubtitleFileForBurn(tmpFilePath); err != nil {
+		_ = os.Remove(tmpFilePath)
+		return "", err
+	}
 	return tmpFilePath, nil
 }
