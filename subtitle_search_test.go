@@ -307,6 +307,22 @@ func TestOpenAIEmbeddingClientRejectsWrongDimension(t *testing.T) {
 	}
 }
 
+func TestOpenAIEmbeddingClientRejectsResponseModelMismatch(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		vector := make([]float32, subtitleEmbeddingDimensions)
+		vector[0] = 1
+		_ = json.NewEncoder(w).Encode(openAIEmbeddingResponse{Model: "wrong/model", Data: []openAIEmbeddingItem{{Index: 0, Embedding: vector}}})
+	}))
+	defer server.Close()
+	client, err := newEmbeddingClient(server.URL, embeddingsProviderOpenAI, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.embed(context.Background(), []string{"model check"}); err == nil || !strings.Contains(err.Error(), "does not match configured model") {
+		t.Fatalf("model mismatch error = %v", err)
+	}
+}
+
 func TestEmbeddingsProviderDefaultsToTEIAndRejectsUnsupported(t *testing.T) {
 	provider, err := normalizeEmbeddingsProvider("")
 	if err != nil || provider != embeddingsProviderTEI {
@@ -314,6 +330,182 @@ func TestEmbeddingsProviderDefaultsToTEIAndRejectsUnsupported(t *testing.T) {
 	}
 	if _, err := normalizeEmbeddingsProvider("local"); err == nil {
 		t.Fatal("unsupported provider accepted")
+	}
+}
+
+func TestEmbeddingContractDefaultsToBGECompatibility(t *testing.T) {
+	contract, err := newEmbeddingContract(SemanticSearchConfig{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if contract.Model != openAIEmbeddingModel || contract.Dimensions != subtitleEmbeddingDimensions || contract.Profile != embeddingProfileBGE {
+		t.Fatalf("default embedding contract = %+v", contract)
+	}
+	if got := contract.queryInput("hello"); got != bgeQueryInstruction+"hello" {
+		t.Fatalf("default query format = %q", got)
+	}
+}
+
+func TestNonLegacySameDimensionContractRequiresRebuildBeforeCorpusUse(t *testing.T) {
+	_, err := newSubtitleSearchStore(context.Background(), SemanticSearchConfig{
+		EmbeddingsModel:      "custom/bge-compatible",
+		EmbeddingsDimensions: subtitleEmbeddingDimensions,
+		EmbeddingsProfile:    embeddingProfileBGE,
+	})
+	if err == nil || !strings.Contains(err.Error(), "corpus rebuild required") {
+		t.Fatalf("same-dimension nonlegacy error = %v", err)
+	}
+	_, err = newSubtitleSearchStore(context.Background(), SemanticSearchConfig{
+		EmbeddingsModelRevision: "checkpoint-2",
+	})
+	if err == nil || !strings.Contains(err.Error(), "corpus rebuild required") {
+		t.Fatalf("revision-only nonlegacy error = %v", err)
+	}
+}
+
+func TestOpenAIBGEContractRemainsLegacyCompatible(t *testing.T) {
+	contract, err := newEmbeddingContract(SemanticSearchConfig{
+		EmbeddingsProvider:   embeddingsProviderOpenAI,
+		EmbeddingsModel:      openAIEmbeddingModel,
+		EmbeddingsDimensions: subtitleEmbeddingDimensions,
+		EmbeddingsProfile:    embeddingProfileBGE,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !isLegacyEmbeddingContract(contract) {
+		t.Fatalf("exact OpenAI BGE contract was rejected as legacy: %+v", contract)
+	}
+	for _, nonlegacy := range []embeddingContract{
+		{Provider: embeddingsProviderOpenAI, Model: "custom/model", Dimensions: subtitleEmbeddingDimensions, Profile: embeddingProfileBGE},
+		{Provider: embeddingsProviderOpenAI, Model: openAIEmbeddingModel, Dimensions: subtitleEmbeddingDimensions, Profile: embeddingProfileQwen},
+		{Provider: embeddingsProviderOpenAI, Model: openAIEmbeddingModel, Dimensions: subtitleEmbeddingDimensions, Profile: embeddingProfileBGE, Revision: "rev-1"},
+	} {
+		if isLegacyEmbeddingContract(nonlegacy) {
+			t.Fatalf("nonlegacy contract was accepted: %+v", nonlegacy)
+		}
+	}
+}
+
+func TestSubtitleVectorTypmodsRejectAlteredExistingColumnsAndAllowAbsentTables(t *testing.T) {
+	if err := validateSubtitleVectorColumns(nil); err != nil {
+		t.Fatalf("absent tables rejected: %v", err)
+	}
+	if err := validateSubtitleVectorColumns([]subtitleVectorColumn{{Table: "subtitle_chunks", TableExists: true, HasEmbedding: true, Typmod: currentSubtitleSchemaDimensions, DataType: "vector"}, {Table: "subtitle_shared_chunks", TableExists: true, HasEmbedding: true, Typmod: currentSubtitleSchemaDimensions, DataType: "vector"}}); err != nil {
+		t.Fatalf("legacy typmods rejected: %v", err)
+	}
+	for _, altered := range []subtitleVectorColumn{
+		{Table: "subtitle_chunks", TableExists: true, HasEmbedding: true, Typmod: 1024, DataType: "vector"},
+		{Table: "subtitle_shared_chunks", TableExists: true, HasEmbedding: true, Typmod: -1, DataType: "vector"},
+		{Table: "subtitle_chunks", TableExists: true, HasEmbedding: false, Typmod: -1},
+	} {
+		if err := validateSubtitleVectorColumns([]subtitleVectorColumn{altered}); err == nil || !strings.Contains(err.Error(), "corpus rebuild required") {
+			t.Fatalf("altered column %+v was accepted: %v", altered, err)
+		}
+	}
+}
+
+func TestQwenRebuildDDLIsBoundedAndTargetsBothVectorColumns(t *testing.T) {
+	statements, err := embeddingVectorAlterStatements(1024)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(statements) != 2 || !strings.Contains(statements[0], "subtitle_chunks") || !strings.Contains(statements[0], "vector(1024)") || !strings.Contains(statements[1], "subtitle_shared_chunks") || !strings.Contains(statements[1], "vector(1024)") {
+		t.Fatalf("unexpected Qwen rebuild DDL: %v", statements)
+	}
+	if _, err := embeddingVectorAlterStatements(maxEmbeddingDimensions + 1); err == nil {
+		t.Fatal("unbounded embedding DDL dimension accepted")
+	}
+}
+
+func TestQwenOpenAIEmbeddingContractUsesConfiguredModelAndRetrievalProfile(t *testing.T) {
+	contract, err := newEmbeddingContract(SemanticSearchConfig{
+		EmbeddingsProvider:   embeddingsProviderOpenAI,
+		EmbeddingsModel:      "Qwen/Qwen3-Embedding-0.6B",
+		EmbeddingsDimensions: 1024,
+		EmbeddingsProfile:    embeddingProfileQwen,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	query := contract.queryInput("find the scene")
+	if query != "Instruct: Given a query, retrieve relevant passages\nQuery: find the scene" || strings.Contains(query, bgeQueryInstruction) {
+		t.Fatalf("unexpected Qwen query format: %q", query)
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var request struct {
+			Model string `json:"model"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Fatal(err)
+		}
+		if request.Model != contract.Model {
+			t.Errorf("model = %q, want %q", request.Model, contract.Model)
+		}
+		vector := make([]float32, contract.Dimensions)
+		vector[0] = 1
+		_ = json.NewEncoder(w).Encode(openAIEmbeddingResponse{Data: []openAIEmbeddingItem{{Index: 0, Embedding: vector}}})
+	}))
+	defer server.Close()
+	client, err := newEmbeddingClientWithContract(server.URL, contract, "secret-key")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.embed(context.Background(), []string{query}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestEmbeddingContractProbeRejectsObservedDimensionMismatch(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		vector := make([]float32, subtitleEmbeddingDimensions)
+		vector[0] = 1
+		_ = json.NewEncoder(w).Encode(openAIEmbeddingResponse{Data: []openAIEmbeddingItem{{Index: 0, Embedding: vector}}})
+	}))
+	defer server.Close()
+	contract := embeddingContract{Provider: embeddingsProviderOpenAI, Model: qwenEmbeddingModel, Dimensions: 1024, Profile: embeddingProfileQwen, TemplateVersion: embeddingTemplateVersion, IndexVersion: subtitleSearchIndexVersion}
+	client, err := newEmbeddingClientWithContract(server.URL, contract, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := client.probe(context.Background()); err == nil || !strings.Contains(err.Error(), "want 1024") {
+		t.Fatalf("dimension mismatch probe error = %v", err)
+	}
+	if _, err := newSubtitleSearchStore(context.Background(), SemanticSearchConfig{EmbeddingsURL: server.URL, EmbeddingsProvider: embeddingsProviderOpenAI, EmbeddingsModel: qwenEmbeddingModel, EmbeddingsDimensions: 1024, EmbeddingsProfile: embeddingProfileQwen}); err == nil || !strings.Contains(err.Error(), "corpus rebuild required") {
+		t.Fatalf("dimension rebuild error = %v", err)
+	}
+}
+
+func TestEmbeddingContractProbeRejectsAllZeroVector(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(openAIEmbeddingResponse{Data: []openAIEmbeddingItem{{Index: 0, Embedding: make([]float32, subtitleEmbeddingDimensions)}}})
+	}))
+	defer server.Close()
+	client, err := newEmbeddingClient(server.URL, embeddingsProviderOpenAI, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := client.probe(context.Background()); err == nil || !strings.Contains(err.Error(), "all-zero") {
+		t.Fatalf("zero-vector probe error = %v", err)
+	}
+}
+
+func TestEmbeddingContractHashExcludesEndpointAndSecret(t *testing.T) {
+	first, err := newEmbeddingContract(SemanticSearchConfig{EmbeddingsProvider: embeddingsProviderOpenAI, EmbeddingsURL: "http://one", EmbeddingsAPIKey: "secret-a", EmbeddingsModel: "model", EmbeddingsDimensions: 768, EmbeddingsProfile: embeddingProfileBGE})
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := newEmbeddingContract(SemanticSearchConfig{EmbeddingsProvider: embeddingsProviderOpenAI, EmbeddingsURL: "http://two", EmbeddingsAPIKey: "secret-b", EmbeddingsModel: "model", EmbeddingsDimensions: 768, EmbeddingsProfile: embeddingProfileBGE})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.Hash != second.Hash || first.Hash == "" {
+		t.Fatalf("contract hash changed with endpoint/key: %q vs %q", first.Hash, second.Hash)
+	}
+	second.Revision = "different"
+	second.Hash = embeddingContractHash(second)
+	if first.Hash == second.Hash {
+		t.Fatal("contract hash ignored model revision")
 	}
 }
 

@@ -142,8 +142,9 @@ CutScene includes an optional semantic-search proof of concept with shared pgvec
 
 - NVIDIA: Hugging Face Text Embeddings Inference (TEI), `BAAI/bge-base-en-v1.5`, service `tei`.
 - AMD: vLLM ROCm, `BAAI/bge-base-en-v1.5`, service `embeddings`.
+- Qwen/NVIDIA: vLLM OpenAI-compatible pooling endpoint, `Qwen/Qwen3-Embedding-0.6B`, service `embeddings`.
 
-Neither PostgreSQL nor the embedding service publishes a host port; CutScene reaches both over Compose's private network. The shared [docker-compose.semantic-search.yaml](docker-compose.semantic-search.yaml) contains PostgreSQL only. Do not combine the NVIDIA and AMD overlays.
+Neither PostgreSQL nor the embedding service publishes a host port; CutScene reaches both over Compose's private network. The shared [docker-compose.semantic-search.yaml](docker-compose.semantic-search.yaml) contains PostgreSQL only. Do not combine the NVIDIA, AMD, and Qwen overlays.
 
 #### NVIDIA prerequisites and startup
 
@@ -187,6 +188,44 @@ docker compose -f docker-compose.yaml -f docker-compose.semantic-search.yaml -f 
 ```
 
 Wait for `postgres` and the selected embedding service (`tei` for NVIDIA or `embeddings` for AMD) to report `healthy` before indexing. The model loads during startup, so the embedding healthcheck can take a while. For example, inspect the shared database health with `pg_isready -U cutscene -d cutscene` in the `postgres` container and inspect the selected service with its `/health` endpoint. The sample `semantic_search.postgres_dsn` uses the internal POC service name and a non-production password; keep it synchronized with `POSTGRES_PASSWORD` and do not reuse it outside this local setup.
+
+#### Intentional Qwen corpus rebuild
+
+Changing from the legacy BGE corpus to Qwen is an explicit destructive rebuild of derived subtitle search data. It clears private/shared chunks, source fingerprints, shared sections, and index-job state, then changes both pgvector columns and records the new contract. It does not delete Plex media or clips. There is no silent reindex: omit the flag and startup fails closed when the configured contract or vector schema does not match.
+
+Use [docker-compose.semantic-search.qwen.yaml](docker-compose.semantic-search.qwen.yaml), not either BGE overlay. It starts the current vLLM OpenAI image with the pooling runner and `embed` pooler task required for Qwen embeddings.
+
+1. Stop the current CutScene/BGE stack without removing volumes. This stops active indexing and removes the prior BGE embedding container so it cannot retain the GPU:
+
+   ```sh
+   docker compose -f docker-compose.yaml -f docker-compose.semantic-search.yaml -f docker-compose.semantic-search.nvidia.yaml down
+   # Use the AMD overlay instead if that is your current BGE setup.
+   ```
+
+2. Change `config.yaml` to use the OpenAI-compatible Qwen service and enable the one-time rebuild (keep the PostgreSQL DSN and URL appropriate for your deployment):
+
+```yaml
+semantic_search:
+  enabled: true
+  postgres_dsn: postgresql://cutscene:cutscene-poc@postgres:5432/cutscene?sslmode=disable
+  embeddings_provider: openai
+  embeddings_url: http://embeddings:8000
+  embeddings_model: Qwen/Qwen3-Embedding-0.6B
+  embeddings_dimensions: 1024
+  embeddings_profile: qwen
+  embeddings_rebuild: true
+```
+
+3. Start the Qwen stack and wait for its health checks:
+
+   ```sh
+   docker compose -f docker-compose.yaml -f docker-compose.semantic-search.yaml -f docker-compose.semantic-search.qwen.yaml up -d
+   docker compose -f docker-compose.yaml -f docker-compose.semantic-search.yaml -f docker-compose.semantic-search.qwen.yaml ps
+   ```
+
+The rebuild holds a PostgreSQL advisory lock and commits schema/data reset atomically. After a successful startup, set `embeddings_rebuild: false` (or remove it) and restart; the persisted matching contract makes subsequent startup idempotent. If the rebuild fails, the transaction rolls back and the prior corpus/contract remains intact. A legacy BGE installation without a contract record is bootstrapped without clearing data.
+
+The rebuild intentionally leaves the subtitle corpus empty. Start a new whole-library index after the restart: the server owner does this once for shared-corpus mode; every user indexes their own library in private mode. Search returns no old results until that indexing completes.
 
 #### Move the semantic-search database from a desktop to a NAS
 
