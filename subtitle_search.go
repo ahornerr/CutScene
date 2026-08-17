@@ -197,9 +197,12 @@ CREATE TABLE IF NOT EXISTS subtitle_index_sources (
     subtitle_index INTEGER NOT NULL,
     fingerprint TEXT NOT NULL,
     chunk_count INTEGER NOT NULL DEFAULT 0,
+    scan_id UUID,
     indexed_at TIMESTAMPTZ NOT NULL,
     PRIMARY KEY (owner_uuid, rating_key, media_id, part_id, subtitle_index)
 );
+ALTER TABLE subtitle_index_sources ADD COLUMN IF NOT EXISTS scan_id UUID;
+CREATE INDEX IF NOT EXISTS subtitle_index_sources_owner_scan_idx ON subtitle_index_sources (owner_uuid, scan_id);
 CREATE TABLE IF NOT EXISTS subtitle_shared_sections (
     machine_identifier TEXT NOT NULL,
     section_uuid TEXT NOT NULL,
@@ -653,9 +656,10 @@ func (a *Application) indexSubtitleSource(ctx context.Context, request subtitleS
 		return subtitleSearchIndexResponse{}, subtitleItemFailure(metadataErr)
 	}
 	castContext := subtitleEmbeddingContext(metadata)
+	sourceRevision := subtitleSourceRevision(metadata, request.MediaID, request.PartID)
 	result := subtitleSearchIndexResponse{RatingKey: request.RatingKey, MediaID: request.MediaID, PartID: request.PartID, Skipped: []subtitleSearchSkipped{}}
 	for _, stream := range streams {
-		fingerprint := subtitleSourceFingerprint(request.RatingKey, request.MediaID, request.PartID, stream, castContext)
+		fingerprint := subtitleSourceFingerprint(request.RatingKey, request.MediaID, request.PartID, stream, castContext, sourceRevision)
 		unchanged := false
 		var checkErr error
 		if a.sharedCorpus {
@@ -667,6 +671,11 @@ func (a *Application) indexSubtitleSource(ctx context.Context, request subtitleS
 			return result, checkErr
 		}
 		if checkErr == nil && unchanged {
+			if !a.sharedCorpus {
+				if err := a.markSubtitleTrackSeen(ctx, owner, request, stream.Index); err != nil {
+					return result, err
+				}
+			}
 			if a.sharedCorpus {
 				if err := a.copySharedSubtitleTrack(ctx, request, stream.Index, fingerprint); err != nil {
 					return result, err
@@ -749,9 +758,55 @@ func (a *Application) sharedSubtitleTrackUnchanged(ctx context.Context, request 
 	return stored == fingerprint, nil
 }
 
-func subtitleSourceFingerprint(ratingKey string, mediaID, partID int64, stream SubtitleStream, castContext string) string {
+func subtitleSourceRevision(metadata *components.Metadata, mediaID, partID int64) string {
 	hash := sha256.New()
-	_, _ = fmt.Fprintf(hash, "%s|%d|%d|%d|%s|%s|%s|%t|%s|%s", subtitleSearchIndexVersion, mediaID, partID, stream.Index, stream.Codec, stream.Language, stream.LanguageCode, stream.External, stream.Type, castContext)
+	_, _ = fmt.Fprintf(hash, "subtitle-source-revision-v1|%d|%d", mediaID, partID)
+	if metadata == nil {
+		return hex.EncodeToString(hash.Sum(nil))
+	}
+	_, _ = fmt.Fprintf(hash, "|updated:%d", valueInt64(metadata.UpdatedAt))
+	media := findMediaByID(metadata.Media, mediaID)
+	if media == nil {
+		return hex.EncodeToString(hash.Sum(nil))
+	}
+	_, _ = fmt.Fprintf(hash, "|media:%d", media.ID)
+	for _, part := range media.Part {
+		if part.ID != partID {
+			continue
+		}
+		_, _ = fmt.Fprintf(hash, "|part:%d|key:%s", part.ID, boundedFingerprintValue(part.Key))
+		if part.Size != nil {
+			_, _ = fmt.Fprintf(hash, "|size:%d", *part.Size)
+		}
+		if part.Duration != nil {
+			_, _ = fmt.Fprintf(hash, "|duration:%d", *part.Duration)
+		}
+		break
+	}
+	return hex.EncodeToString(hash.Sum(nil))
+}
+
+func valueInt64(value *int64) int64 {
+	if value == nil {
+		return 0
+	}
+	return *value
+}
+
+func boundedFingerprintValue(value string) string {
+	if len(value) > 512 {
+		return value[:512]
+	}
+	return value
+}
+
+func subtitleSourceFingerprint(ratingKey string, mediaID, partID int64, stream SubtitleStream, castContext string, sourceRevisions ...string) string {
+	hash := sha256.New()
+	revision := ""
+	if len(sourceRevisions) > 0 {
+		revision = sourceRevisions[0]
+	}
+	_, _ = fmt.Fprintf(hash, "%s|%s|%d|%d|%d|%s|%s|%s|%t|%s|%s|%s", subtitleSearchIndexVersion, boundedFingerprintValue(ratingKey), mediaID, partID, stream.Index, stream.Codec, stream.Language, stream.LanguageCode, stream.External, stream.Type, castContext, revision)
 	return hex.EncodeToString(hash.Sum(nil))
 }
 
@@ -792,8 +847,23 @@ func (a *Application) subtitleTrackUnchanged(ctx context.Context, owner string, 
 }
 
 func (a *Application) recordSubtitleFingerprint(ctx context.Context, owner string, request subtitleSearchIndexRequest, subtitleIndex int, fingerprint string, chunkCount int) error {
-	_, err := a.subtitleSearch.pool.Exec(ctx, `INSERT INTO subtitle_index_sources (owner_uuid, rating_key, media_id, part_id, subtitle_index, fingerprint, chunk_count, indexed_at) VALUES ($1,$2,$3,$4,$5,$6,$7,NOW()) ON CONFLICT (owner_uuid, rating_key, media_id, part_id, subtitle_index) DO UPDATE SET fingerprint=EXCLUDED.fingerprint, chunk_count=EXCLUDED.chunk_count, indexed_at=EXCLUDED.indexed_at`, owner, request.RatingKey, request.MediaID, request.PartID, subtitleIndex, fingerprint, chunkCount)
+	_, err := a.subtitleSearch.pool.Exec(ctx, `INSERT INTO subtitle_index_sources (owner_uuid, rating_key, media_id, part_id, subtitle_index, fingerprint, chunk_count, scan_id, indexed_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,NOW()) ON CONFLICT (owner_uuid, rating_key, media_id, part_id, subtitle_index) DO UPDATE SET fingerprint=EXCLUDED.fingerprint, chunk_count=EXCLUDED.chunk_count, scan_id=COALESCE(EXCLUDED.scan_id, subtitle_index_sources.scan_id), indexed_at=EXCLUDED.indexed_at`, owner, request.RatingKey, request.MediaID, request.PartID, subtitleIndex, fingerprint, chunkCount, nullableUUID(request.ScanID))
 	return err
+}
+
+func (a *Application) markSubtitleTrackSeen(ctx context.Context, owner string, request subtitleSearchIndexRequest, subtitleIndex int) error {
+	if strings.TrimSpace(request.ScanID) == "" {
+		return nil
+	}
+	_, err := a.subtitleSearch.pool.Exec(ctx, `UPDATE subtitle_index_sources SET scan_id=$6, indexed_at=NOW() WHERE owner_uuid=$1 AND rating_key=$2 AND media_id=$3 AND part_id=$4 AND subtitle_index=$5`, owner, request.RatingKey, request.MediaID, request.PartID, subtitleIndex, request.ScanID)
+	return err
+}
+
+func nullableUUID(value string) any {
+	if strings.TrimSpace(value) == "" {
+		return nil
+	}
+	return value
 }
 
 func (a *Application) persistSubtitleChunks(ctx context.Context, owner string, source LibrarySearchResult, subtitleIndex int, chunks []subtitleChunk, embeddingContext string) error {

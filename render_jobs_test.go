@@ -426,6 +426,26 @@ func TestRenderJobQueueAndOwnerSaturation(t *testing.T) {
 	}
 }
 
+func TestFFmpegLimiterReleasesAfterCancelledExtractionSlot(t *testing.T) {
+	limiter := newFFmpegLimiter(1)
+	application := &Application{ffmpegLimiter: limiter}
+	firstRelease, err := application.acquireFFmpeg(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := application.acquireFFmpeg(cancelled); !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancelled limiter acquire error = %v", err)
+	}
+	firstRelease()
+	secondRelease, err := application.acquireFFmpeg(context.Background())
+	if err != nil {
+		t.Fatalf("limiter slot was not released: %v", err)
+	}
+	secondRelease()
+}
+
 func TestRenderJobFailureIsSanitizedAndCleansOutput(t *testing.T) {
 	manager, err := newRenderJobManager(t.TempDir(), func(_ context.Context, _ renderJobSpec, output string) error {
 		if err := os.WriteFile(output, []byte("partial"), 0600); err != nil {

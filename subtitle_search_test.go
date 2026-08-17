@@ -489,6 +489,28 @@ func TestSubtitleEmbeddingContextFingerprintChangesWhenCastChanges(t *testing.T)
 	}
 }
 
+func TestSubtitleSourceFingerprintIncludesSourceRevision(t *testing.T) {
+	stream := SubtitleStream{Index: 0, Codec: "srt", Language: "English", Type: "text"}
+	first := subtitleSourceFingerprint("movie", 1, 2, stream, "", "revision-a")
+	unchanged := subtitleSourceFingerprint("movie", 1, 2, stream, "", "revision-a")
+	changed := subtitleSourceFingerprint("movie", 1, 2, stream, "", "revision-b")
+	if first != unchanged || first == changed {
+		t.Fatalf("source revision fingerprints first=%q unchanged=%q changed=%q", first, unchanged, changed)
+	}
+}
+
+func TestSubtitleSourceRevisionUsesPlexMetadataAndPartRevision(t *testing.T) {
+	firstUpdated, secondUpdated := int64(100), int64(101)
+	size := int64(1234)
+	metadata := &components.Metadata{UpdatedAt: &firstUpdated, Media: []components.Media{{ID: 10, Part: []components.Part{{ID: 20, Key: "/library/parts/20/file", Size: &size}}}}}
+	first := subtitleSourceRevision(metadata, 10, 20)
+	metadata.UpdatedAt = &secondUpdated
+	second := subtitleSourceRevision(metadata, 10, 20)
+	if first == second {
+		t.Fatalf("metadata revision did not change source revision: %q", first)
+	}
+}
+
 func TestStreamingSectionTraversalCanExceedFormerCatalogCap(t *testing.T) {
 	const total = 10001
 	var pages int

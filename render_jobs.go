@@ -1695,9 +1695,16 @@ func (a *Application) executeRenderSpec(ctx context.Context, spec renderJobSpec,
 				if issueErr != nil {
 					return newRenderStageFailure("subtitle", "subtitle_unavailable", issueErr)
 				}
+				defer releaseCapability()
+				releaseFFmpeg, acquireErr := a.acquireFFmpeg(ctx)
+				if acquireErr != nil {
+					return classifyRenderStageError("subtitle", acquireErr)
+				}
 				var subtitleErr error
-				subtitleFile, subtitleErr = ExtractSubtitleContext(ctx, subtitleURL, from, to, embeddedIndex, spec.SubtitleOffsetMs)
-				releaseCapability()
+				subtitleFile, subtitleErr = func() (string, error) {
+					defer releaseFFmpeg()
+					return ExtractSubtitleContext(ctx, subtitleURL, from, to, embeddedIndex, spec.SubtitleOffsetMs)
+				}()
 				if subtitleErr != nil {
 					if errors.Is(subtitleErr, ErrNoUsableSubtitleCues) {
 						subtitleFile = ""
@@ -1709,14 +1716,12 @@ func (a *Application) executeRenderSpec(ctx context.Context, spec renderJobSpec,
 			}
 			release, err := a.acquireFFmpeg(ctx)
 			if err != nil {
-				if errors.Is(err, ErrNoUsableSubtitleCues) {
-					subtitleFile = ""
-				} else {
-					return classifyRenderStageError("subtitle", err)
-				}
+				return classifyRenderStageError("subtitle", err)
 			}
-			subtitleFile, err = ExtractSubtitleContext(ctx, sourceURL, from, to, embeddedIndex, spec.SubtitleOffsetMs)
-			release()
+			subtitleFile, err = func() (string, error) {
+				defer release()
+				return ExtractSubtitleContext(ctx, sourceURL, from, to, embeddedIndex, spec.SubtitleOffsetMs)
+			}()
 			if err != nil {
 				return classifyRenderStageError("subtitle", err)
 			}

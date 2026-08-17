@@ -51,6 +51,7 @@ type subtitleIndexJob struct {
 	sourceErrorSamples                                            []string
 	sourceElapsedNanos                                            int64
 	completedSources                                              int
+	scanID                                                        string
 }
 
 type subtitleIndexJobStatus struct {
@@ -264,6 +265,9 @@ func (m *subtitleIndexJobManager) run(parent context.Context, job *subtitleIndex
 	ctx, cancel := m.app.operationContext(jobContext)
 	defer cancel()
 	ctx = withBulkSubtitleContext(ctx)
+	job.mu.Lock()
+	job.scanID = uuid.NewString()
+	job.mu.Unlock()
 	if UserFromContext(ctx) != nil && AuthTokenFromContext(ctx) != nil && m.app.plexResources != nil {
 		access, accessErr := m.app.resolvePlexAccess(ctx)
 		if accessErr != nil {
@@ -556,6 +560,12 @@ func (a *Application) streamIndexLibrarySectionSources(ctx context.Context, toke
 }
 
 func (a *Application) discoverAndIndexSources(ctx context.Context, job *subtitleIndexJob, index func(subtitleIndexWork) error) error {
+	job.mu.Lock()
+	if strings.TrimSpace(job.scanID) == "" {
+		job.scanID = uuid.NewString()
+	}
+	privateScanID := job.scanID
+	job.mu.Unlock()
 	token := AuthTokenFromContext(ctx)
 	if token == nil || strings.TrimSpace(*token) == "" {
 		return errors.New("missing auth token")
@@ -568,7 +578,7 @@ func (a *Application) discoverAndIndexSources(ctx context.Context, job *subtitle
 		if section.Type != "movie" && section.Type != "show" {
 			continue
 		}
-		scanID := ""
+		scanID := privateScanID
 		if a.sharedCorpus {
 			if !validSharedSectionKey(section.Key) || strings.TrimSpace(section.UUID) == "" {
 				continue
@@ -681,6 +691,37 @@ func (a *Application) discoverAndIndexSources(ctx context.Context, job *subtitle
 				return errors.New("could not prune shared subtitle sources")
 			}
 		}
+	}
+	if !a.sharedCorpus {
+		job.mu.RLock()
+		failed, owner, scanID := job.failed, job.owner, job.scanID
+		job.mu.RUnlock()
+		if failed == 0 {
+			if err := a.prunePrivateSubtitleSources(ctx, owner, scanID); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func (a *Application) prunePrivateSubtitleSources(ctx context.Context, owner, scanID string) error {
+	if a.subtitleSearch == nil || strings.TrimSpace(owner) == "" || strings.TrimSpace(scanID) == "" {
+		return errors.New("private subtitle scan identity is unavailable")
+	}
+	tx, err := a.subtitleSearch.pool.Begin(ctx)
+	if err != nil {
+		return errors.New("could not prune private subtitle index")
+	}
+	defer tx.Rollback(ctx)
+	if _, err := tx.Exec(ctx, `DELETE FROM subtitle_chunks c WHERE c.owner_uuid=$1 AND NOT EXISTS (SELECT 1 FROM subtitle_index_sources s WHERE s.owner_uuid=c.owner_uuid AND s.rating_key=c.rating_key AND s.media_id=c.media_id AND s.part_id=c.part_id AND s.subtitle_index=c.subtitle_index AND s.scan_id=$2)`, owner, scanID); err != nil {
+		return errors.New("could not prune private subtitle chunks")
+	}
+	if _, err := tx.Exec(ctx, `DELETE FROM subtitle_index_sources WHERE owner_uuid=$1 AND scan_id IS DISTINCT FROM $2`, owner, scanID); err != nil {
+		return errors.New("could not prune private subtitle sources")
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return errors.New("could not prune private subtitle index")
 	}
 	return nil
 }
