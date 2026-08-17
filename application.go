@@ -211,6 +211,7 @@ type Application struct {
 	ownerUUID         string
 	subtitleCache     *subtitleCache
 	ffmpegLimiter     *ffmpegLimiter
+	subtitleBulkGate  chan struct{}
 	renderJobs        *renderJobManager
 	clipStore         *clipStore
 	lifetime          context.Context
@@ -223,6 +224,10 @@ type Application struct {
 
 func NewApplication(config Config) (*Application, error) {
 	config.Ffmpeg.Concurrency = normalizeFFmpegConcurrency(config.Ffmpeg.Concurrency)
+	bulkGateCapacity := config.Ffmpeg.Concurrency - 1
+	if bulkGateCapacity < 1 {
+		bulkGateCapacity = 1
+	}
 	lifetime, cancelLifetime := context.WithCancel(context.Background())
 	app := &Application{
 		config: config,
@@ -231,11 +236,12 @@ func NewApplication(config Config) (*Application, error) {
 			plexgo.WithServerURL(config.Plex.Host),
 			plexgo.WithSecurity(config.Plex.Token),
 		),
-		subtitleCache:  newSubtitleCache(128),
-		ffmpegLimiter:  newFFmpegLimiter(config.Ffmpeg.Concurrency),
-		lifetime:       lifetime,
-		cancelLifetime: cancelLifetime,
-		sharedCorpus:   config.SemanticSearch.SharedCorpus,
+		subtitleCache:    newSubtitleCache(128),
+		ffmpegLimiter:    newFFmpegLimiter(config.Ffmpeg.Concurrency),
+		subtitleBulkGate: make(chan struct{}, bulkGateCapacity),
+		lifetime:         lifetime,
+		cancelLifetime:   cancelLifetime,
+		sharedCorpus:     config.SemanticSearch.SharedCorpus,
 	}
 	resolver, resolverErr := NewPlexResourceResolver(config.Plex.Host)
 	if resolverErr != nil {
@@ -896,14 +902,22 @@ func sessionVisibleToCurrentUser(session sessionMetadata, user *User) bool {
 
 // SubtitleStream describes a subtitle track available in a media item.
 type SubtitleStream struct {
-	Index        int    `json:"index"` // 0-based subtitle stream index (for FFmpeg -map 0:s:N)
-	Language     string `json:"language"`
-	DisplayTitle string `json:"displayTitle"`
-	Codec        string `json:"codec"`
-	Default      bool   `json:"default"`
-	Type         string `json:"type"` // "text" or "pgs" (raster, burn-in only)
-	External     bool   `json:"external"`
-	LanguageCode string `json:"languageCode,omitempty"`
+	Index         int    `json:"index"` // 0-based subtitle stream index (for FFmpeg -map 0:s:N)
+	EmbeddedIndex int    `json:"-"`
+	Language      string `json:"language"`
+	DisplayTitle  string `json:"displayTitle"`
+	Codec         string `json:"codec"`
+	Default       bool   `json:"default"`
+	Type          string `json:"type"` // "text" or "pgs" (raster, burn-in only)
+	External      bool   `json:"external"`
+	LanguageCode  string `json:"languageCode,omitempty"`
+}
+
+type subtitleTrackPlan struct {
+	PublicIndex   int
+	EmbeddedIndex int
+	Raw           components.Stream
+	Stream        SubtitleStream
 }
 
 // SubtitleEntry represents a single subtitle line block with its time range and text.
@@ -958,40 +972,55 @@ func isExternalSubtitleStream(stream components.Stream) bool {
 	return stream.EmbeddedInVideo == nil
 }
 
-func selectSubtitleSource(streams []components.Stream, subtitleIndex int) (subtitleSource, error) {
-	if subtitleIndex < 0 {
-		return subtitleSource{}, fmt.Errorf("subtitle index is invalid")
-	}
-
-	subtitleOrdinal := 0
-	embeddedOrdinal := 0
+func enumerateSubtitleTrackPlans(streams []components.Stream) []subtitleTrackPlan {
+	plans := make([]subtitleTrackPlan, 0)
+	publicIndex, embeddedIndex := 0, 0
 	for _, stream := range streams {
 		if stream.StreamType != 3 {
 			continue
 		}
 		external := isExternalSubtitleStream(stream)
-		if subtitleOrdinal == subtitleIndex {
-			format := ""
-			if stream.Format != nil {
-				format = *stream.Format
-			}
-			embeddedIndex := -1
-			if !external {
-				embeddedIndex = embeddedOrdinal
-			}
-			return subtitleSource{
-				Index:         subtitleOrdinal,
-				EmbeddedIndex: embeddedIndex,
-				StreamKey:     stream.Key,
-				Codec:         stream.Codec,
-				Format:        format,
-				External:      external,
-				PGS:           isPGSSubtitle(stream.Codec, format),
-			}, nil
+		format := ""
+		if stream.Format != nil {
+			format = *stream.Format
 		}
-		subtitleOrdinal++
+		public := SubtitleStream{Index: publicIndex, EmbeddedIndex: -1, Codec: stream.Codec, External: external, DisplayTitle: stream.DisplayTitle}
+		if stream.Language != nil {
+			public.Language = *stream.Language
+		}
+		if stream.LanguageCode != nil {
+			public.LanguageCode = *stream.LanguageCode
+		}
+		if stream.Default != nil {
+			public.Default = *stream.Default
+		}
 		if !external {
-			embeddedOrdinal++
+			public.EmbeddedIndex = embeddedIndex
+			embeddedIndex++
+		}
+		if textSubtitleCodecs[strings.ToLower(stream.Codec)] || textSubtitleCodecs[strings.ToLower(format)] {
+			public.Type = "text"
+		} else if isPGSSubtitle(stream.Codec, format) {
+			public.Type = "pgs"
+		}
+		plans = append(plans, subtitleTrackPlan{PublicIndex: publicIndex, EmbeddedIndex: public.EmbeddedIndex, Raw: stream, Stream: public})
+		publicIndex++
+	}
+	return plans
+}
+
+func selectSubtitleSource(streams []components.Stream, subtitleIndex int) (subtitleSource, error) {
+	if subtitleIndex < 0 {
+		return subtitleSource{}, fmt.Errorf("subtitle index is invalid")
+	}
+
+	for _, plan := range enumerateSubtitleTrackPlans(streams) {
+		if plan.PublicIndex == subtitleIndex {
+			format := ""
+			if plan.Raw.Format != nil {
+				format = *plan.Raw.Format
+			}
+			return subtitleSource{Index: plan.PublicIndex, EmbeddedIndex: plan.EmbeddedIndex, StreamKey: plan.Raw.Key, Codec: plan.Raw.Codec, Format: format, External: plan.Stream.External, PGS: plan.Stream.Type == "pgs"}, nil
 		}
 	}
 	return subtitleSource{}, fmt.Errorf("subtitle index %d is not available", subtitleIndex)
@@ -1087,9 +1116,10 @@ func resolvePart(media *components.Media, mediaId int64, mediaIdSupplied bool) (
 }
 
 type subtitleCacheKey struct {
-	ratingKey     string
-	mediaId       int64
-	subtitleIndex int
+	ratingKey      string
+	mediaId        int64
+	subtitleIndex  int
+	sourceRevision string
 }
 
 func subtitleCallerID(ctx context.Context) (string, error) {
@@ -1151,45 +1181,11 @@ func (a *Application) GetSubtitleStreamsForSource(ctx context.Context, ratingKey
 	}
 
 	var result []SubtitleStream
-	subtitleIdx := 0
-	for _, stream := range selectedPart.Stream {
-		if stream.StreamType != 3 {
+	for _, plan := range enumerateSubtitleTrackPlans(selectedPart.Stream) {
+		if plan.Stream.Type == "" {
 			continue
 		}
-
-		codec := stream.Codec
-		format := ""
-		if stream.Format != nil {
-			format = *stream.Format
-		}
-
-		s := SubtitleStream{
-			Index: subtitleIdx,
-			Codec: codec,
-		}
-		if stream.Language != nil {
-			s.Language = *stream.Language
-		}
-		if stream.LanguageCode != nil {
-			s.LanguageCode = *stream.LanguageCode
-		}
-		s.External = isExternalSubtitleStream(stream)
-		s.DisplayTitle = stream.DisplayTitle
-		if stream.Default != nil {
-			s.Default = *stream.Default
-		}
-
-		if textSubtitleCodecs[strings.ToLower(codec)] || textSubtitleCodecs[strings.ToLower(format)] {
-			s.Type = "text"
-		} else if isPGSSubtitle(codec, format) {
-			s.Type = "pgs"
-		} else {
-			subtitleIdx++
-			continue
-		}
-		result = append(result, s)
-
-		subtitleIdx++
+		result = append(result, plan.Stream)
 	}
 
 	return result, nil
@@ -1208,7 +1204,7 @@ func (a *Application) GetSubtitleEntriesForSource(ctx context.Context, ratingKey
 		return nil, fmt.Errorf("could not get library metadata: %w", err)
 	}
 
-	_, part, err := resolveRequestedSource(metadata, mediaIdStr, partIdStr)
+	media, part, err := resolveRequestedSource(metadata, mediaIdStr, partIdStr)
 	if err != nil {
 		return nil, err
 	}
@@ -1222,7 +1218,7 @@ func (a *Application) GetSubtitleEntriesForSource(ctx context.Context, ratingKey
 	if a.subtitleCache == nil {
 		return nil, errors.New("subtitle cache is unavailable")
 	}
-	cacheKey := subtitleCacheKey{ratingKey: ratingKeyStr, mediaId: part.ID, subtitleIndex: subtitleIndex}
+	cacheKey := subtitleCacheKey{ratingKey: ratingKeyStr, mediaId: part.ID, subtitleIndex: subtitleIndex, sourceRevision: subtitleSourceRevision(metadata, media.ID, part.ID)}
 	if entries, ok := a.subtitleCache.getForCaller(cacheKey, callerID); ok {
 		return entries, nil
 	}
@@ -1443,7 +1439,7 @@ func (a *Application) GetCachedSubtitleEntries(ctx context.Context, ratingKeyStr
 	if err != nil {
 		return nil, false
 	}
-	_, part, err := resolveRequestedSource(metadata, mediaIdStr, partIdStr)
+	media, part, err := resolveRequestedSource(metadata, mediaIdStr, partIdStr)
 	if err != nil || part == nil {
 		return nil, false
 	}
@@ -1453,6 +1449,7 @@ func (a *Application) GetCachedSubtitleEntries(ctx context.Context, ratingKeyStr
 	}
 	return a.subtitleCache.getForCaller(subtitleCacheKey{
 		ratingKey: ratingKeyStr, mediaId: part.ID, subtitleIndex: subtitleIndex,
+		sourceRevision: subtitleSourceRevision(metadata, media.ID, part.ID),
 	}, callerID)
 }
 

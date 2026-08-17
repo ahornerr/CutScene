@@ -861,6 +861,62 @@ func ExtractSubtitleContext(ctx context.Context, url, from, to string, subtitleI
 	return WriteClipSRT(entries, fromMs, toMs, offset)
 }
 
+func ExtractSubtitleTracksBatchContext(ctx context.Context, mediaURL string, embeddedIndices []int) (map[int][]SubtitleEntry, error) {
+	result := make(map[int][]SubtitleEntry, len(embeddedIndices))
+	if len(embeddedIndices) == 0 {
+		return result, nil
+	}
+	outputDir, err := os.MkdirTemp("", "cutscene_subtitle_batch_")
+	if err != nil {
+		return nil, err
+	}
+	defer os.RemoveAll(outputDir)
+	args := []string{"-hide_banner", "-loglevel", "error"}
+	inputArgs := ffmpeg.KwArgs{}
+	configureFFmpegHTTPRecovery(inputArgs, mediaURL)
+	for _, key := range []string{"reconnect", "reconnect_streamed", "reconnect_on_network_error", "reconnect_on_http_error", "reconnect_delay_max", "rw_timeout"} {
+		if value, ok := inputArgs[key]; ok {
+			args = append(args, "-"+key, fmt.Sprint(value))
+		}
+	}
+	args = append(args, "-i", mediaURL)
+	paths := make(map[int]string, len(embeddedIndices))
+	for index, embeddedIndex := range embeddedIndices {
+		path := filepath.Join(outputDir, fmt.Sprintf("track_%03d.srt", index))
+		paths[embeddedIndex] = path
+		args = append(args, "-map", fmt.Sprintf("0:s:%d", embeddedIndex), "-c:s", "srt", path)
+	}
+	errOutput := &boundedBuffer{max: 64 << 10}
+	command := subtitleBatchFFmpegCommand(ctx, args...)
+	command.Stderr = errOutput
+	command.Stdout = io.Discard
+	err = command.Run()
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
+	if err != nil {
+		return nil, fmt.Errorf("batch subtitle extraction failed: %s", errOutput.String())
+	}
+	const maxBatchSubtitleBytes int64 = 16 << 20
+	const maxBatchSubtitleCues = 100000
+	for embeddedIndex, path := range paths {
+		info, statErr := os.Stat(path)
+		if statErr != nil || !info.Mode().IsRegular() || info.Size() == 0 || info.Size() > maxBatchSubtitleBytes {
+			return nil, errors.New("batch subtitle output is invalid")
+		}
+		entries, parseErr := ParseSRT(path)
+		if parseErr != nil || len(entries) > maxBatchSubtitleCues {
+			return nil, errors.New("batch subtitle output is invalid")
+		}
+		result[embeddedIndex] = entries
+	}
+	return result, nil
+}
+
+var subtitleBatchFFmpegCommand = func(ctx context.Context, args ...string) *exec.Cmd {
+	return exec.CommandContext(ctx, "ffmpeg", args...)
+}
+
 func subtitleOffsetArgument(offsets []int64) (int64, error) {
 	if len(offsets) > 1 {
 		return 0, errors.New("multiple subtitle offsets specified")

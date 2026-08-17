@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -458,13 +459,29 @@ func TestSubtitleIndexItemFailureIsIsolatedAndDiagnosticsAreBounded(t *testing.T
 	if !errors.Is(itemErr, errSubtitleIndexItem) {
 		t.Fatal("item failure was not classified as an isolated source failure")
 	}
-	job.recordSourceFailure(source, itemErr)
+	job.recordSourceFailure(source, itemErr, 0)
 	status := job.status()
 	if status.Failed != 1 || status.FailedTracks != 1 || status.Error == "" {
 		t.Fatalf("unexpected isolated failure status: %+v", status)
 	}
 	if len(status.Error) > 1200 || strings.Contains(status.Error, "X-Plex-Token") {
 		t.Fatalf("diagnostic was not bounded/sanitized: %q", status.Error)
+	}
+}
+
+func TestSubtitleIndexJobCountsFailedTracksSeparatelyFromEmptyTracks(t *testing.T) {
+	job := &subtitleIndexJob{}
+	result := subtitleSearchIndexResponse{
+		Skipped:               []subtitleSearchSkipped{{SubtitleIndex: 1}, {SubtitleIndex: 2}, {SubtitleIndex: 3}},
+		EmptyTracks:           1,
+		FailedTracks:          2,
+		FailedEmbeddedIndices: []int{4, 5},
+	}
+	job.recordSourceFailure(LibrarySearchResult{Title: "partially broken media"}, errors.New("subtitle extraction failed"), result.FailedTracks)
+	job.recordIndexResult(result)
+	status := job.status()
+	if status.Failed != 1 || status.FailedTracks != 2 || status.EmptyTracks != 1 || status.Skipped != 3 {
+		t.Fatalf("unexpected track outcome status: %+v", status)
 	}
 }
 
@@ -504,11 +521,47 @@ func TestSubtitleSourceRevisionUsesPlexMetadataAndPartRevision(t *testing.T) {
 	size := int64(1234)
 	metadata := &components.Metadata{UpdatedAt: &firstUpdated, Media: []components.Media{{ID: 10, Part: []components.Part{{ID: 20, Key: "/library/parts/20/file", Size: &size}}}}}
 	first := subtitleSourceRevision(metadata, 10, 20)
+	metadata.Media[0].Part[0].Key = "/library/parts/20/replaced"
 	metadata.UpdatedAt = &secondUpdated
 	second := subtitleSourceRevision(metadata, 10, 20)
 	if first == second {
 		t.Fatalf("metadata revision did not change source revision: %q", first)
 	}
+}
+
+func TestSubtitleIndexMediaURLRestoresAuthenticatedCallerCapability(t *testing.T) {
+	upstream := httptest.NewServer(http.NotFoundHandler())
+	defer upstream.Close()
+	resolver, err := NewPlexResourceResolver(upstream.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	access := &PlexAccess{baseOrigin: upstream.URL, secretToken: "resource-token", accountToken: "caller-token", callerUUID: "caller", machineIdentifier: "machine"}
+	resolver.mu.Lock()
+	resolver.cache[plexAccessCacheKey{callerUUID: "caller", machineIdentifier: "machine", accountTokenHash: sha256.Sum256([]byte("caller-token"))}] = plexAccessCacheEntry{access: access, expires: time.Now().Add(time.Minute)}
+	resolver.mu.Unlock()
+	app := &Application{
+		plexResources:     resolver,
+		machineIdentifier: "machine",
+	}
+	ctx := ContextWithUser(ContextWithAuthToken(context.Background(), "caller-token"), User{Uuid: "caller"})
+	url, release, err := app.subtitleIndexMediaURL(ctx, &components.Part{Key: "/library/parts/1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release()
+	defer app.mediaProxy.Close()
+	if strings.Contains(url, "X-Plex-Token") || !strings.HasPrefix(url, app.mediaProxy.URL()+"/plex-media/") {
+		t.Fatalf("authenticated subtitle URL leaked credentials or bypassed proxy: %q", url)
+	}
+	app.mediaProxy.mu.Lock()
+	for _, lease := range app.mediaProxy.items {
+		if time.Until(lease.expires) <= 2*time.Minute {
+			app.mediaProxy.mu.Unlock()
+			t.Fatalf("index capability retained the short default TTL: %v", time.Until(lease.expires))
+		}
+	}
+	app.mediaProxy.mu.Unlock()
 }
 
 func TestStreamingSectionTraversalCanExceedFormerCatalogCap(t *testing.T) {

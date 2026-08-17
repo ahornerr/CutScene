@@ -13,6 +13,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"os"
 	"sort"
 	"strconv"
 	"strings"
@@ -605,14 +606,16 @@ type subtitleSearchSkipped struct {
 }
 
 type subtitleSearchIndexResponse struct {
-	RatingKey         string                  `json:"ratingKey"`
-	MediaID           int64                   `json:"mediaId"`
-	PartID            int64                   `json:"partId"`
-	Indexed           int                     `json:"indexed"`
-	Skipped           []subtitleSearchSkipped `json:"skipped"`
-	UnchangedTracks   int                     `json:"-"`
-	UnsupportedTracks int                     `json:"-"`
-	EmptyTracks       int                     `json:"-"`
+	RatingKey             string                  `json:"ratingKey"`
+	MediaID               int64                   `json:"mediaId"`
+	PartID                int64                   `json:"partId"`
+	Indexed               int                     `json:"indexed"`
+	Skipped               []subtitleSearchSkipped `json:"skipped"`
+	UnchangedTracks       int                     `json:"-"`
+	UnsupportedTracks     int                     `json:"-"`
+	EmptyTracks           int                     `json:"-"`
+	FailedTracks          int                     `json:"-"`
+	FailedEmbeddedIndices []int                   `json:"-"`
 }
 
 func isEnglishSubtitleStream(stream SubtitleStream) bool {
@@ -623,6 +626,48 @@ func isEnglishSubtitleStream(stream SubtitleStream) bool {
 		}
 	}
 	return false
+}
+
+func (a *Application) acquireSubtitleBulkFFmpeg(ctx context.Context) (func(), error) {
+	if a.subtitleBulkGate != nil {
+		select {
+		case a.subtitleBulkGate <- struct{}{}:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	releaseGlobal, err := a.acquireFFmpeg(ctx)
+	if err != nil {
+		if a.subtitleBulkGate != nil {
+			<-a.subtitleBulkGate
+		}
+		return nil, err
+	}
+	return func() {
+		releaseGlobal()
+		if a.subtitleBulkGate != nil {
+			<-a.subtitleBulkGate
+		}
+	}, nil
+}
+
+func (a *Application) subtitleIndexMediaURL(ctx context.Context, part *components.Part) (string, func(), error) {
+	if part == nil || strings.TrimSpace(part.Key) == "" {
+		return "", nil, errors.New("subtitle source path is unavailable")
+	}
+	if AuthTokenFromContext(ctx) != nil {
+		proxy, err := a.ensureMediaProxy()
+		if err != nil {
+			return "", nil, errors.New("Plex capability proxy is unavailable")
+		}
+		access, _, err := a.callerPlexAccess(ctx, "")
+		if err != nil {
+			return "", nil, errors.New("caller Plex access is unavailable")
+		}
+		return proxy.IssueWithTTL(ctx, access, part.Key, renderTimeout)
+	}
+	mediaURL, err := a.buildPlexSourceURL(part.Key, a.plexSourceToken(ctx, AuthTokenFromContext(ctx) != nil))
+	return mediaURL, nil, err
 }
 
 func (a *Application) indexSubtitleSource(ctx context.Context, request subtitleSearchIndexRequest) (subtitleSearchIndexResponse, error) {
@@ -640,26 +685,38 @@ func (a *Application) indexSubtitleSource(ctx context.Context, request subtitleS
 	}
 	unlock := a.subtitleSearch.trackLocks.acquire(fmt.Sprintf("%s:%d:%d", owner, request.MediaID, request.PartID))
 	defer unlock()
-	source, err := a.GetLibrarySource(ctx, request.RatingKey, request.MediaID, request.PartID)
-	if err != nil {
-		return subtitleSearchIndexResponse{}, subtitleItemFailure(err)
-	}
-	streams, err := a.GetSubtitleStreamsForSource(ctx, request.RatingKey, strconv.FormatInt(request.MediaID, 10), strconv.FormatInt(request.PartID, 10))
-	if err != nil {
-		return subtitleSearchIndexResponse{}, subtitleItemFailure(err)
-	}
-	if len(streams) == 0 {
-		return subtitleSearchIndexResponse{RatingKey: request.RatingKey, MediaID: request.MediaID, PartID: request.PartID, Skipped: []subtitleSearchSkipped{{-1, "no subtitle streams"}}, EmptyTracks: 1}, nil
-	}
 	metadata, metadataErr := a.getMetadataItem(ctx, request.RatingKey, true)
 	if metadataErr != nil {
 		return subtitleSearchIndexResponse{}, subtitleItemFailure(metadataErr)
 	}
+	media, part, sourceErr := resolveLibraryMetadataSource(metadata, request.MediaID, request.PartID)
+	if sourceErr != nil || media == nil || part == nil {
+		if sourceErr == nil {
+			sourceErr = errors.New("subtitle source is unavailable")
+		}
+		return subtitleSearchIndexResponse{}, subtitleItemFailure(sourceErr)
+	}
+	source := librarySearchResultFromMetadata(metadata, media, part)
+	duration, durationErr := selectedSourceDuration(media, part)
+	if durationErr != nil {
+		return subtitleSearchIndexResponse{}, subtitleItemFailure(durationErr)
+	}
+	if duration > 0 {
+		source.Duration = duration
+	}
+	plans := enumerateSubtitleTrackPlans(part.Stream)
+	if len(plans) == 0 {
+		return subtitleSearchIndexResponse{RatingKey: request.RatingKey, MediaID: request.MediaID, PartID: request.PartID, Skipped: []subtitleSearchSkipped{{-1, "no subtitle streams"}}, EmptyTracks: 1}, nil
+	}
 	castContext := subtitleEmbeddingContext(metadata)
 	sourceRevision := subtitleSourceRevision(metadata, request.MediaID, request.PartID)
 	result := subtitleSearchIndexResponse{RatingKey: request.RatingKey, MediaID: request.MediaID, PartID: request.PartID, Skipped: []subtitleSearchSkipped{}}
-	for _, stream := range streams {
+	changed := make([]subtitleTrackPlan, 0)
+	fingerprints := make(map[int]string)
+	for _, plan := range plans {
+		stream := plan.Stream
 		fingerprint := subtitleSourceFingerprint(request.RatingKey, request.MediaID, request.PartID, stream, castContext, sourceRevision)
+		fingerprints[plan.PublicIndex] = fingerprint
 		unchanged := false
 		var checkErr error
 		if a.sharedCorpus {
@@ -672,79 +729,154 @@ func (a *Application) indexSubtitleSource(ctx context.Context, request subtitleS
 		}
 		if checkErr == nil && unchanged {
 			if !a.sharedCorpus {
-				if err := a.markSubtitleTrackSeen(ctx, owner, request, stream.Index); err != nil {
+				if err := a.markSubtitleTrackSeen(ctx, owner, request, plan.PublicIndex); err != nil {
 					return result, err
 				}
 			}
 			if a.sharedCorpus {
-				if err := a.copySharedSubtitleTrack(ctx, request, stream.Index, fingerprint); err != nil {
+				if err := a.copySharedSubtitleTrack(ctx, request, plan.PublicIndex, fingerprint); err != nil {
 					return result, err
 				}
 			}
-			result.Skipped = append(result.Skipped, subtitleSearchSkipped{stream.Index, "unchanged subtitle track"})
+			result.Skipped = append(result.Skipped, subtitleSearchSkipped{plan.PublicIndex, "unchanged subtitle track"})
 			result.UnchangedTracks++
 			continue
 		}
 		if stream.External {
-			result.Skipped = append(result.Skipped, subtitleSearchSkipped{stream.Index, "external subtitle track"})
+			result.Skipped = append(result.Skipped, subtitleSearchSkipped{plan.PublicIndex, "external subtitle track"})
 			result.UnsupportedTracks++
 			if a.sharedCorpus {
-				if err := a.recordSharedSubtitleSeen(ctx, request, stream.Index, fingerprint, 0); err != nil {
+				if err := a.recordSharedSubtitleSeen(ctx, request, plan.PublicIndex, fingerprint, 0); err != nil {
 					return result, err
 				}
 			}
 			continue
 		}
 		if stream.Type != "text" {
-			result.Skipped = append(result.Skipped, subtitleSearchSkipped{stream.Index, "image subtitle format"})
+			result.Skipped = append(result.Skipped, subtitleSearchSkipped{plan.PublicIndex, "unsupported subtitle format"})
 			result.UnsupportedTracks++
 			if a.sharedCorpus {
-				if err := a.recordSharedSubtitleSeen(ctx, request, stream.Index, fingerprint, 0); err != nil {
+				if err := a.recordSharedSubtitleSeen(ctx, request, plan.PublicIndex, fingerprint, 0); err != nil {
 					return result, err
 				}
 			}
 			continue
 		}
 		if !isEnglishSubtitleStream(stream) {
-			result.Skipped = append(result.Skipped, subtitleSearchSkipped{stream.Index, "not an English text track"})
+			result.Skipped = append(result.Skipped, subtitleSearchSkipped{plan.PublicIndex, "not an English text track"})
 			result.UnsupportedTracks++
 			if a.sharedCorpus {
-				if err := a.recordSharedSubtitleSeen(ctx, request, stream.Index, fingerprint, 0); err != nil {
+				if err := a.recordSharedSubtitleSeen(ctx, request, plan.PublicIndex, fingerprint, 0); err != nil {
 					return result, err
 				}
 			}
 			continue
 		}
-		entries, entryErr := a.GetSubtitleEntriesForSource(ctx, request.RatingKey, strconv.FormatInt(request.MediaID, 10), strconv.FormatInt(request.PartID, 10), stream.Index)
-		if entryErr != nil {
-			return result, subtitleItemFailure(entryErr)
+		changed = append(changed, plan)
+	}
+	if len(changed) == 0 {
+		return result, nil
+	}
+	mediaURL, releaseCapability, urlErr := a.subtitleIndexMediaURL(ctx, part)
+	if urlErr != nil {
+		return result, subtitleItemFailure(urlErr)
+	}
+	if releaseCapability != nil {
+		defer releaseCapability()
+	}
+	embeddedIndices := make([]int, 0, len(changed))
+	for _, plan := range changed {
+		embeddedIndices = append(embeddedIndices, plan.EmbeddedIndex)
+	}
+	releaseBatch, err := a.acquireSubtitleBulkFFmpeg(ctx)
+	if err != nil {
+		return result, err
+	}
+	entriesByEmbedded, batchErr := ExtractSubtitleTracksBatchContext(ctx, mediaURL, embeddedIndices)
+	releaseBatch()
+	if batchErr != nil && (errors.Is(batchErr, context.Canceled) || errors.Is(batchErr, context.DeadlineExceeded)) {
+		return result, batchErr
+	}
+	if batchErr != nil && ctx.Err() != nil {
+		return result, ctx.Err()
+	}
+	var firstItemErr error
+	if batchErr != nil {
+		entriesByEmbedded = make(map[int][]SubtitleEntry, len(changed))
+		for _, plan := range changed {
+			releaseOne, acquireErr := a.acquireSubtitleBulkFFmpeg(ctx)
+			if acquireErr != nil {
+				if errors.Is(acquireErr, context.Canceled) || errors.Is(acquireErr, context.DeadlineExceeded) {
+					return result, acquireErr
+				}
+				if firstItemErr == nil {
+					firstItemErr = acquireErr
+				}
+				continue
+			}
+			file, extractErr := ExtractSubtitleFullContext(ctx, mediaURL, plan.EmbeddedIndex)
+			releaseOne()
+			if extractErr != nil {
+				if errors.Is(extractErr, context.Canceled) || errors.Is(extractErr, context.DeadlineExceeded) {
+					return result, extractErr
+				}
+				if !errors.Is(extractErr, ErrNoUsableSubtitleCues) {
+					if firstItemErr == nil {
+						firstItemErr = extractErr
+					}
+					continue
+				}
+				entriesByEmbedded[plan.EmbeddedIndex] = nil
+				continue
+			}
+			entries, parseErr := ParseSRT(file)
+			_ = os.Remove(file)
+			if parseErr != nil {
+				if firstItemErr == nil {
+					firstItemErr = parseErr
+				}
+				continue
+			}
+			entriesByEmbedded[plan.EmbeddedIndex] = entries
+		}
+	}
+	for _, plan := range changed {
+		entries, extracted := entriesByEmbedded[plan.EmbeddedIndex]
+		if !extracted {
+			result.FailedTracks++
+			result.FailedEmbeddedIndices = append(result.FailedEmbeddedIndices, plan.EmbeddedIndex)
+			result.Skipped = append(result.Skipped, subtitleSearchSkipped{plan.PublicIndex, "subtitle extraction failed"})
+			continue
 		}
 		chunks := chunkSubtitleEntries(entries)
 		if len(chunks) == 0 {
-			result.Skipped = append(result.Skipped, subtitleSearchSkipped{stream.Index, "subtitle contains no searchable text"})
+			result.Skipped = append(result.Skipped, subtitleSearchSkipped{plan.PublicIndex, "subtitle contains no searchable text"})
 			result.EmptyTracks++
 			if a.sharedCorpus {
-				if err := a.recordSharedSubtitleSeen(ctx, request, stream.Index, fingerprint, 0); err != nil {
+				if err := a.recordSharedSubtitleSeen(ctx, request, plan.PublicIndex, fingerprints[plan.PublicIndex], 0); err != nil {
 					return result, err
 				}
 			}
 			continue
 		}
 		if a.sharedCorpus {
-			if err := a.persistSharedSubtitleChunks(ctx, request, source, stream.Index, chunks, castContext, fingerprint); err != nil {
+			if err := a.persistSharedSubtitleChunks(ctx, request, source, plan.PublicIndex, chunks, castContext, fingerprints[plan.PublicIndex]); err != nil {
 				return result, err
 			}
-		} else if err := a.persistSubtitleChunks(ctx, owner, source, stream.Index, chunks, castContext); err != nil {
+		} else if err := a.persistSubtitleChunks(ctx, owner, source, plan.PublicIndex, chunks, castContext); err != nil {
 			return result, err
 		}
 		var recordErr error
 		if !a.sharedCorpus {
-			recordErr = a.recordSubtitleFingerprint(ctx, owner, request, stream.Index, fingerprint, len(chunks))
+			recordErr = a.recordSubtitleFingerprint(ctx, owner, request, plan.PublicIndex, fingerprints[plan.PublicIndex], len(chunks))
 		}
 		if recordErr != nil {
 			return result, recordErr
 		}
 		result.Indexed += len(chunks)
+	}
+	if firstItemErr != nil {
+		return result, subtitleItemFailure(firstItemErr)
 	}
 	return result, nil
 }

@@ -87,7 +87,7 @@ func (j *subtitleIndexJob) status() subtitleIndexJobStatus {
 	return subtitleIndexJobStatus{ID: j.id, State: j.state, Discovered: j.discovered, Processed: j.processed, DiscoveredSources: j.discovered, ProcessedSources: j.processed, IndexedChunks: j.indexed, Skipped: j.skipped, Failed: j.failed, UnchangedTracks: j.unchangedTracks, UnsupportedTracks: j.unsupportedTracks, EmptyTracks: j.emptyTracks, FailedTracks: j.failedTracks, SourceValidationSkips: j.sourceValidationSkips, CurrentTitle: j.currentTitle, StartedAt: j.startedAt, UpdatedAt: j.updatedAt, FinishedAt: j.finishedAt, Error: j.err}
 }
 
-func (j *subtitleIndexJob) recordSourceFailure(source LibrarySearchResult, err error) {
+func (j *subtitleIndexJob) recordSourceFailure(source LibrarySearchResult, err error, failedTracks int) {
 	diagnostic := redactedDiagnostic(err)
 	if diagnostic == "" {
 		diagnostic = "source processing failed"
@@ -95,7 +95,10 @@ func (j *subtitleIndexJob) recordSourceFailure(source LibrarySearchResult, err e
 	j.mu.Lock()
 	defer j.mu.Unlock()
 	j.failed++
-	j.failedTracks++
+	if failedTracks < 1 {
+		failedTracks = 1
+	}
+	j.failedTracks += failedTracks
 	if len(j.sourceErrorSamples) < 3 {
 		j.sourceErrorSamples = append(j.sourceErrorSamples, diagnostic)
 	}
@@ -302,7 +305,7 @@ func (m *subtitleIndexJobManager) run(parent context.Context, job *subtitleIndex
 				}
 				return indexErr
 			}
-			job.recordSourceFailure(source, indexErr)
+			job.recordSourceFailure(source, indexErr, result.FailedTracks)
 			job.recordIndexResult(result)
 			job.mu.Lock()
 			failed := job.failed

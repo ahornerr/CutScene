@@ -446,6 +446,20 @@ func TestFFmpegLimiterReleasesAfterCancelledExtractionSlot(t *testing.T) {
 	secondRelease()
 }
 
+func TestSubtitleBulkGateReservesForegroundFFmpegSlot(t *testing.T) {
+	application := &Application{ffmpegLimiter: newFFmpegLimiter(2), subtitleBulkGate: make(chan struct{}, 1)}
+	bulkRelease, err := application.acquireSubtitleBulkFFmpeg(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	foregroundRelease, err := application.acquireFFmpeg(context.Background())
+	if err != nil {
+		t.Fatalf("bulk indexing consumed foreground slot: %v", err)
+	}
+	foregroundRelease()
+	bulkRelease()
+}
+
 func TestRenderJobFailureIsSanitizedAndCleansOutput(t *testing.T) {
 	manager, err := newRenderJobManager(t.TempDir(), func(_ context.Context, _ renderJobSpec, output string) error {
 		if err := os.WriteFile(output, []byte("partial"), 0600); err != nil {

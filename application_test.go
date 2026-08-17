@@ -459,28 +459,28 @@ func TestSubtitleCacheBoundedEviction(t *testing.T) {
 	cache := newSubtitleCache(3)
 
 	// Insert 3 entries
-	cache.set(subtitleCacheKey{"a", 1, 0}, []SubtitleEntry{{Start: 100, End: 200, Text: "A"}})
-	cache.set(subtitleCacheKey{"b", 1, 0}, []SubtitleEntry{{Start: 300, End: 400, Text: "B"}})
-	cache.set(subtitleCacheKey{"c", 1, 0}, []SubtitleEntry{{Start: 500, End: 600, Text: "C"}})
+	cache.set(subtitleCacheKey{"a", 1, 0, ""}, []SubtitleEntry{{Start: 100, End: 200, Text: "A"}})
+	cache.set(subtitleCacheKey{"b", 1, 0, ""}, []SubtitleEntry{{Start: 300, End: 400, Text: "B"}})
+	cache.set(subtitleCacheKey{"c", 1, 0, ""}, []SubtitleEntry{{Start: 500, End: 600, Text: "C"}})
 
 	if cache.len() != 3 {
 		t.Fatalf("expected cache len 3, got %d", cache.len())
 	}
 
 	// Insert 4th entry - should evict oldest ("a")
-	cache.set(subtitleCacheKey{"d", 1, 0}, []SubtitleEntry{{Start: 700, End: 800, Text: "D"}})
+	cache.set(subtitleCacheKey{"d", 1, 0, ""}, []SubtitleEntry{{Start: 700, End: 800, Text: "D"}})
 
 	if cache.len() != 3 {
 		t.Fatalf("expected cache len 3 after eviction, got %d", cache.len())
 	}
 
 	// "a" should be gone
-	if _, ok := cache.get(subtitleCacheKey{"a", 1, 0}); ok {
+	if _, ok := cache.get(subtitleCacheKey{"a", 1, 0, ""}); ok {
 		t.Error("expected entry 'a' to be evicted, but it's still present")
 	}
 
 	// "b", "c", "d" should be present
-	for _, key := range []subtitleCacheKey{{"b", 1, 0}, {"c", 1, 0}, {"d", 1, 0}} {
+	for _, key := range []subtitleCacheKey{{"b", 1, 0, ""}, {"c", 1, 0, ""}, {"d", 1, 0, ""}} {
 		if _, ok := cache.get(key); !ok {
 			t.Errorf("expected entry %q to be present", key.ratingKey)
 		}
@@ -491,12 +491,12 @@ func TestSubtitleCacheDefensiveCopy(t *testing.T) {
 	cache := newSubtitleCache(10)
 	original := []SubtitleEntry{{Start: 100, End: 200, Text: "test"}}
 
-	cache.set(subtitleCacheKey{"x", 1, 0}, original)
+	cache.set(subtitleCacheKey{"x", 1, 0, ""}, original)
 
 	// Mutate the original slice (should not affect cache)
 	original[0].Text = "mutated"
 
-	got, ok := cache.get(subtitleCacheKey{"x", 1, 0})
+	got, ok := cache.get(subtitleCacheKey{"x", 1, 0, ""})
 	if !ok {
 		t.Fatal("expected entry to be present")
 	}
@@ -509,7 +509,7 @@ func TestSubtitleCacheDefensiveCopy(t *testing.T) {
 
 	// Mutate the returned slice (should not affect cache)
 	got[0].Text = "changed again"
-	retry, ok := cache.get(subtitleCacheKey{"x", 1, 0})
+	retry, ok := cache.get(subtitleCacheKey{"x", 1, 0, ""})
 	if !ok {
 		t.Fatal("expected entry still present")
 	}
@@ -527,7 +527,7 @@ func TestSubtitleCacheConcurrency(t *testing.T) {
 		wg.Add(1)
 		go func(n int) {
 			defer wg.Done()
-			key := subtitleCacheKey{fmt.Sprintf("key-%d", n), 1, 0}
+			key := subtitleCacheKey{fmt.Sprintf("key-%d", n), 1, 0, ""}
 			cache.set(key, []SubtitleEntry{{Start: int64(n), End: int64(n + 100), Text: fmt.Sprintf("entry-%d", n)}})
 		}(i)
 	}
@@ -537,7 +537,7 @@ func TestSubtitleCacheConcurrency(t *testing.T) {
 		wg.Add(1)
 		go func(n int) {
 			defer wg.Done()
-			key := subtitleCacheKey{fmt.Sprintf("key-%d", n), 1, 0}
+			key := subtitleCacheKey{fmt.Sprintf("key-%d", n), 1, 0, ""}
 			_, _ = cache.get(key)
 		}(i)
 	}
@@ -552,9 +552,9 @@ func TestSubtitleCacheConcurrency(t *testing.T) {
 
 func TestSubtitleCacheEmptyValue(t *testing.T) {
 	cache := newSubtitleCache(10)
-	cache.set(subtitleCacheKey{"empty", 0, 0}, []SubtitleEntry{})
+	cache.set(subtitleCacheKey{"empty", 0, 0, ""}, []SubtitleEntry{})
 
-	got, ok := cache.get(subtitleCacheKey{"empty", 0, 0})
+	got, ok := cache.get(subtitleCacheKey{"empty", 0, 0, ""})
 	if !ok {
 		t.Fatal("expected empty entry to be present")
 	}
@@ -1212,7 +1212,7 @@ func TestStrs(t *testing.T) {
 func TestSubtitleCacheMaxZero(t *testing.T) {
 	// Cache with max=0 should reject all entries (or behave as unbounded, depending on implementation)
 	cache := newSubtitleCache(0)
-	cache.set(subtitleCacheKey{"a", 0, 0}, []SubtitleEntry{{Text: "test"}})
+	cache.set(subtitleCacheKey{"a", 0, 0, ""}, []SubtitleEntry{{Text: "test"}})
 	// With max=0, the eviction check: len(c.m) >= c.max && c.max > 0 is false, so it's effectively unbounded
 	if cache.len() != 1 {
 		t.Errorf("expected cache with max=0 to accept entry, got len=%d", cache.len())
@@ -1221,15 +1221,15 @@ func TestSubtitleCacheMaxZero(t *testing.T) {
 
 func TestSubtitleCacheMaxOne(t *testing.T) {
 	cache := newSubtitleCache(1)
-	cache.set(subtitleCacheKey{"a", 0, 0}, []SubtitleEntry{{Text: "first"}})
-	cache.set(subtitleCacheKey{"b", 0, 0}, []SubtitleEntry{{Text: "second"}})
+	cache.set(subtitleCacheKey{"a", 0, 0, ""}, []SubtitleEntry{{Text: "first"}})
+	cache.set(subtitleCacheKey{"b", 0, 0, ""}, []SubtitleEntry{{Text: "second"}})
 
 	if cache.len() != 1 {
 		t.Fatalf("expected len=1, got %d", cache.len())
 	}
 
-	_, okA := cache.get(subtitleCacheKey{"a", 0, 0})
-	gotB, okB := cache.get(subtitleCacheKey{"b", 0, 0})
+	_, okA := cache.get(subtitleCacheKey{"a", 0, 0, ""})
+	gotB, okB := cache.get(subtitleCacheKey{"b", 0, 0, ""})
 	if okA {
 		t.Error("expected 'a' to be evicted (FIFO)")
 	}
@@ -1455,6 +1455,26 @@ func TestSelectSubtitleSourceSeparatesExternalAndEmbeddedOrdinals(t *testing.T) 
 	}
 	if embeddedPGS.External || !embeddedPGS.PGS || embeddedPGS.EmbeddedIndex != 1 {
 		t.Fatalf("unexpected embedded PGS source: %+v", embeddedPGS)
+	}
+}
+
+func TestSubtitleTrackPlansPreserveOrdinalsAcrossUnsupportedInterleaving(t *testing.T) {
+	embedded := "1"
+	plans := enumerateSubtitleTrackPlans([]components.Stream{
+		{StreamType: 3, Key: "/external", Codec: "srt"},
+		{StreamType: 3, Codec: "unknown", EmbeddedInVideo: &embedded},
+		{StreamType: 3, Codec: "ass", EmbeddedInVideo: &embedded},
+		{StreamType: 3, Codec: "pgssub", EmbeddedInVideo: &embedded},
+	})
+	if len(plans) != 4 {
+		t.Fatalf("plans=%d, want 4", len(plans))
+	}
+	wantPublic := []int{0, 1, 2, 3}
+	wantEmbedded := []int{-1, 0, 1, 2}
+	for i, plan := range plans {
+		if plan.PublicIndex != wantPublic[i] || plan.EmbeddedIndex != wantEmbedded[i] {
+			t.Fatalf("plan %d=%+v, want public=%d embedded=%d", i, plan, wantPublic[i], wantEmbedded[i])
+		}
 	}
 }
 
