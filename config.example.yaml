@@ -28,6 +28,16 @@ semantic_search:
   postgres_dsn: postgresql://cutscene:cutscene-poc@postgres:5432/cutscene?sslmode=disable
   embeddings_provider: tei
   embeddings_url: http://tei:80
+  # Phase 1 contract. Omit these for legacy BGE 768 compatibility; an
+  # explicit model/profile/dimension is recommended for new deployments.
+  embeddings_model: BAAI/bge-base-en-v1.5
+  embeddings_dimensions: 768
+  embeddings_profile: bge
+  # Set true only for an intentional destructive derived-data corpus rebuild.
+  # It is safely ignored when the persisted contract already matches.
+  embeddings_rebuild: false
+  # Optional model revision/checkpoint identifier, included in the contract.
+  # embeddings_model_revision: 2024-01
   # AMD alternative: use the AMD overlay instead, then change the two lines
   # above to:
   # embeddings_provider: openai

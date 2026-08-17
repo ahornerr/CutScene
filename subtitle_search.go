@@ -11,6 +11,8 @@ import (
 	"fmt"
 	"html"
 	"io"
+	"log"
+	"math"
 	"net/http"
 	"net/url"
 	"os"
@@ -24,13 +26,16 @@ import (
 
 	"github.com/LukeHagar/plexgo/models/components"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 	pgvector "github.com/pgvector/pgvector-go"
 	pgxvector "github.com/pgvector/pgvector-go/pgx"
 )
 
 const (
-	subtitleEmbeddingDimensions            = 768
+	currentSubtitleSchemaDimensions        = 768 // Legacy/bootstrap schema dimension; rebuilds may alter both vector columns.
+	maxEmbeddingDimensions                 = 16000
+	subtitleEmbeddingDimensions            = currentSubtitleSchemaDimensions
 	subtitleEmbeddingBatchSize             = 32
 	maxSharedSubtitleCandidates            = 200
 	maxSharedSubtitleSourceChecks          = 100
@@ -96,10 +101,254 @@ func releaseSubtitleSemaphore(semaphore chan struct{}) {
 type subtitleSearchStore struct {
 	pool           *pgxpool.Pool
 	embeddings     *teiClient
+	contract       embeddingContract
 	bulkEmbeddings chan struct{}
 	bulkWrites     chan struct{}
 	trackLocks     keyedSubtitleLocks
 	jobMu          sync.Mutex
+}
+
+const subtitleVectorColumnQuery = `
+SELECT c.relname,
+       EXISTS (
+           SELECT 1 FROM pg_attribute ea
+           WHERE ea.attrelid = c.oid AND ea.attname = 'embedding' AND NOT ea.attisdropped
+       ) AS has_embedding,
+       COALESCE((
+           SELECT ea.atttypmod FROM pg_attribute ea
+           WHERE ea.attrelid = c.oid AND ea.attname = 'embedding' AND NOT ea.attisdropped
+       ), -1) AS typmod,
+       COALESCE((
+           SELECT format_type(ea.atttypid, -1) FROM pg_attribute ea
+           WHERE ea.attrelid = c.oid AND ea.attname = 'embedding' AND NOT ea.attisdropped
+       ), '') AS data_type
+FROM pg_class c
+JOIN pg_namespace n ON n.oid = c.relnamespace
+WHERE n.nspname = current_schema()
+  AND c.relname IN ('subtitle_chunks', 'subtitle_shared_chunks')
+  AND c.relkind IN ('r', 'p')`
+
+type subtitleVectorColumn struct {
+	Table        string
+	TableExists  bool
+	HasEmbedding bool
+	Typmod       int32
+	DataType     string
+}
+
+func validateSubtitleVectorColumns(columns []subtitleVectorColumn, expectedDimensions ...int) error {
+	expected := currentSubtitleSchemaDimensions
+	if len(expectedDimensions) > 0 {
+		expected = expectedDimensions[0]
+	}
+	for _, column := range columns {
+		if !column.TableExists {
+			continue
+		}
+		if !column.HasEmbedding {
+			return fmt.Errorf("semantic_search table %s has no embedding column; corpus rebuild required", column.Table)
+		}
+		if column.DataType != "vector" && column.DataType != "public.vector" {
+			return fmt.Errorf("semantic_search table %s embedding type is %q, want vector; corpus rebuild required", column.Table, column.DataType)
+		}
+		if column.Typmod != int32(expected) {
+			return fmt.Errorf("semantic_search table %s embedding typmod is %d, want %d; corpus rebuild required", column.Table, column.Typmod, expected)
+		}
+	}
+	return nil
+}
+
+func inspectSubtitleVectorColumns(ctx context.Context, pool *pgxpool.Pool) ([]subtitleVectorColumn, error) {
+	return inspectSubtitleVectorColumnsWith(ctx, pool)
+}
+
+type subtitleRowsQueryer interface {
+	Query(context.Context, string, ...any) (pgx.Rows, error)
+}
+
+type subtitleRowQueryer interface {
+	QueryRow(context.Context, string, ...any) pgx.Row
+}
+
+func inspectSubtitleVectorColumnsWith(ctx context.Context, queryer subtitleRowsQueryer) ([]subtitleVectorColumn, error) {
+	rows, err := queryer.Query(ctx, subtitleVectorColumnQuery)
+	if err != nil {
+		return nil, errors.New("could not inspect subtitle vector schema")
+	}
+	defer rows.Close()
+	columns := make([]subtitleVectorColumn, 0, 2)
+	for rows.Next() {
+		var column subtitleVectorColumn
+		if err := rows.Scan(&column.Table, &column.HasEmbedding, &column.Typmod, &column.DataType); err != nil {
+			return nil, errors.New("could not inspect subtitle vector schema")
+		}
+		column.TableExists = true
+		columns = append(columns, column)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, errors.New("could not inspect subtitle vector schema")
+	}
+	return columns, nil
+}
+
+type persistedEmbeddingContract struct {
+	embeddingContract
+	Generation int64
+	State      string
+}
+
+func loadEmbeddingContract(ctx context.Context, queryer subtitleRowQueryer) (*persistedEmbeddingContract, error) {
+	var record persistedEmbeddingContract
+	err := queryer.QueryRow(ctx, `SELECT contract_hash, provider, model, model_revision, dimensions, profile, template_version, index_version, generation, state FROM subtitle_embedding_contract WHERE singleton_id=1`).Scan(
+		&record.Hash, &record.Provider, &record.Model, &record.Revision, &record.Dimensions, &record.Profile, &record.TemplateVersion, &record.IndexVersion, &record.Generation, &record.State)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, errors.New("could not read semantic search embedding contract")
+	}
+	return &record, nil
+}
+
+func embeddingContractsMatch(configured embeddingContract, persisted *persistedEmbeddingContract) bool {
+	if persisted == nil || persisted.State != "ready" {
+		return false
+	}
+	return configured.Hash == persisted.Hash && configured.Provider == persisted.Provider && configured.Model == persisted.Model &&
+		configured.Revision == persisted.Revision && configured.Dimensions == persisted.Dimensions && configured.Profile == persisted.Profile &&
+		configured.TemplateVersion == persisted.TemplateVersion && configured.IndexVersion == persisted.IndexVersion
+}
+
+func validateRebuildColumns(columns []subtitleVectorColumn) error {
+	seen := make(map[string]bool, len(columns))
+	for _, column := range columns {
+		if !column.TableExists || !column.HasEmbedding || (column.DataType != "vector" && column.DataType != "public.vector") {
+			return fmt.Errorf("semantic_search table %s is not an alterable vector table; corpus rebuild required", column.Table)
+		}
+		seen[column.Table] = true
+	}
+	for _, table := range []string{"subtitle_chunks", "subtitle_shared_chunks"} {
+		if !seen[table] {
+			return fmt.Errorf("semantic_search table %s is missing; corpus rebuild required", table)
+		}
+	}
+	return nil
+}
+
+func validateExistingSubtitleVectorTypes(columns []subtitleVectorColumn) error {
+	for _, column := range columns {
+		if !column.TableExists {
+			continue
+		}
+		if !column.HasEmbedding || (column.DataType != "vector" && column.DataType != "public.vector") {
+			return fmt.Errorf("semantic_search table %s has an incompatible embedding column; corpus rebuild required", column.Table)
+		}
+	}
+	return nil
+}
+
+func embeddingVectorAlterStatements(dimensions int) ([]string, error) {
+	if dimensions < 1 || dimensions > maxEmbeddingDimensions {
+		return nil, fmt.Errorf("embedding dimensions %d are outside the safe DDL range", dimensions)
+	}
+	return []string{
+		fmt.Sprintf("ALTER TABLE subtitle_chunks ALTER COLUMN embedding TYPE vector(%d) USING embedding::vector", dimensions),
+		fmt.Sprintf("ALTER TABLE subtitle_shared_chunks ALTER COLUMN embedding TYPE vector(%d) USING embedding::vector", dimensions),
+	}, nil
+}
+
+func persistEmbeddingContract(ctx context.Context, execer interface {
+	Exec(context.Context, string, ...any) (pgconn.CommandTag, error)
+}, contract embeddingContract, generation int64) error {
+	_, err := execer.Exec(ctx, `INSERT INTO subtitle_embedding_contract (singleton_id, contract_hash, provider, model, model_revision, dimensions, profile, template_version, index_version, generation, state, updated_at) VALUES (1,$1,$2,$3,$4,$5,$6,$7,$8,$9,'ready',NOW()) ON CONFLICT (singleton_id) DO UPDATE SET contract_hash=EXCLUDED.contract_hash, provider=EXCLUDED.provider, model=EXCLUDED.model, model_revision=EXCLUDED.model_revision, dimensions=EXCLUDED.dimensions, profile=EXCLUDED.profile, template_version=EXCLUDED.template_version, index_version=EXCLUDED.index_version, generation=EXCLUDED.generation, state=EXCLUDED.state, updated_at=EXCLUDED.updated_at`, contract.Hash, contract.Provider, contract.Model, contract.Revision, contract.Dimensions, contract.Profile, contract.TemplateVersion, contract.IndexVersion, generation)
+	return err
+}
+
+type subtitleDBBeginner interface {
+	Begin(context.Context) (pgx.Tx, error)
+}
+
+func bootstrapLegacyEmbeddingContract(ctx context.Context, db subtitleDBBeginner, contract embeddingContract) error {
+	tx, err := db.Begin(ctx)
+	if err != nil {
+		return errors.New("could not begin semantic search contract bootstrap")
+	}
+	defer tx.Rollback(ctx)
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended('cutscene.semantic_embedding_rebuild', 0))`); err != nil {
+		return errors.New("could not lock semantic search contract")
+	}
+	existing, err := loadEmbeddingContract(ctx, tx)
+	if err != nil {
+		return err
+	}
+	if existing == nil {
+		if err := persistEmbeddingContract(ctx, tx, contract, 1); err != nil {
+			return errors.New("could not persist semantic search embedding contract")
+		}
+	}
+	return tx.Commit(ctx)
+}
+
+func rebuildEmbeddingCorpus(ctx context.Context, db subtitleDBBeginner, contract embeddingContract) error {
+	alterStatements, err := embeddingVectorAlterStatements(contract.Dimensions)
+	if err != nil {
+		return err
+	}
+	tx, err := db.Begin(ctx)
+	if err != nil {
+		return errors.New("could not begin semantic search corpus rebuild")
+	}
+	defer tx.Rollback(ctx)
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended('cutscene.semantic_embedding_rebuild', 0))`); err != nil {
+		return errors.New("could not acquire semantic search corpus rebuild lock")
+	}
+	columns, err := inspectSubtitleVectorColumnsWith(ctx, tx)
+	if err != nil {
+		return err
+	}
+	if err := validateRebuildColumns(columns); err != nil {
+		return err
+	}
+	existing, err := loadEmbeddingContract(ctx, tx)
+	if err != nil {
+		return err
+	}
+	if existing != nil && embeddingContractsMatch(contract, existing) && validateSubtitleVectorColumns(columns, contract.Dimensions) == nil {
+		return tx.Commit(ctx)
+	}
+	for _, statement := range []string{
+		"DROP INDEX IF EXISTS subtitle_chunks_embedding_hnsw_idx",
+		"DROP INDEX IF EXISTS subtitle_shared_chunks_embedding_idx",
+		"TRUNCATE TABLE subtitle_chunks, subtitle_shared_chunks, subtitle_index_sources, subtitle_shared_sources, subtitle_shared_sections, subtitle_index_jobs, subtitle_embedding_contract",
+	} {
+		if _, err := tx.Exec(ctx, statement); err != nil {
+			return errors.New("could not reset semantic search corpus")
+		}
+	}
+	for _, statement := range alterStatements {
+		if _, err := tx.Exec(ctx, statement); err != nil {
+			return errors.New("could not alter semantic search vector dimensions")
+		}
+	}
+	for _, statement := range []string{
+		"CREATE INDEX subtitle_chunks_embedding_hnsw_idx ON subtitle_chunks USING hnsw (embedding vector_cosine_ops)",
+		"CREATE INDEX subtitle_shared_chunks_embedding_idx ON subtitle_shared_chunks USING hnsw (embedding vector_cosine_ops)",
+	} {
+		if _, err := tx.Exec(ctx, statement); err != nil {
+			return errors.New("could not recreate semantic search vector indexes")
+		}
+	}
+	generation := int64(1)
+	if existing != nil && existing.Generation >= generation {
+		generation = existing.Generation + 1
+	}
+	if err := persistEmbeddingContract(ctx, tx, contract, generation); err != nil {
+		return errors.New("could not persist rebuilt semantic search embedding contract")
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return errors.New("could not commit semantic search corpus rebuild")
+	}
+	return nil
 }
 
 type keyedSubtitleLocks struct {
@@ -140,7 +389,123 @@ const (
 	embeddingsProviderTEI    = "tei"
 	embeddingsProviderOpenAI = "openai"
 	openAIEmbeddingModel     = "BAAI/bge-base-en-v1.5"
+	qwenEmbeddingModel       = "Qwen/Qwen3-Embedding-0.6B"
+	embeddingProfileBGE      = "bge"
+	embeddingProfileQwen     = "qwen"
+	embeddingTemplateVersion = "embedding-template-v1"
 )
+
+type embeddingContract struct {
+	Provider        string
+	Model           string
+	Revision        string
+	Dimensions      int
+	Profile         string
+	TemplateVersion string
+	IndexVersion    string
+	Hash            string
+}
+
+var legacyEmbeddingContract = embeddingContract{
+	Provider: embeddingsProviderTEI, Model: openAIEmbeddingModel,
+	Dimensions: subtitleEmbeddingDimensions, Profile: embeddingProfileBGE,
+	TemplateVersion: embeddingTemplateVersion, IndexVersion: subtitleSearchIndexVersion,
+}
+
+func isLegacyEmbeddingContract(contract embeddingContract) bool {
+	legacyProvider := contract.Provider == embeddingsProviderTEI || contract.Provider == embeddingsProviderOpenAI
+	return legacyProvider &&
+		contract.Model == legacyEmbeddingContract.Model &&
+		contract.Dimensions == legacyEmbeddingContract.Dimensions &&
+		contract.Profile == legacyEmbeddingContract.Profile &&
+		strings.TrimSpace(contract.Revision) == ""
+}
+
+func normalizeSemanticEmbeddingConfig(cfg *SemanticSearchConfig) error {
+	if cfg == nil {
+		return errors.New("semantic_search embedding configuration is unavailable")
+	}
+	provider, err := normalizeEmbeddingsProvider(cfg.EmbeddingsProvider)
+	if err != nil {
+		return fmt.Errorf("semantic_search.embeddings_provider: %w", err)
+	}
+	cfg.EmbeddingsProvider = provider
+	profile := strings.ToLower(strings.TrimSpace(cfg.EmbeddingsProfile))
+	if profile == "" {
+		profile = embeddingProfileBGE
+		log.Printf("semantic_search.embeddings_profile is omitted; defaulting to %q (BGE compatibility; configure explicitly)", profile)
+	}
+	profile, err = normalizeEmbeddingProfile(profile)
+	if err != nil {
+		return fmt.Errorf("semantic_search.embeddings_profile: %w", err)
+	}
+	cfg.EmbeddingsProfile = profile
+	cfg.EmbeddingsModel = strings.TrimSpace(cfg.EmbeddingsModel)
+	if cfg.EmbeddingsModel == "" {
+		if profile == embeddingProfileQwen {
+			cfg.EmbeddingsModel = qwenEmbeddingModel
+		} else {
+			cfg.EmbeddingsModel = openAIEmbeddingModel
+		}
+		log.Printf("semantic_search.embeddings_model is omitted; defaulting to %q (legacy BGE compatibility)", cfg.EmbeddingsModel)
+	}
+	if cfg.EmbeddingsDimensions == 0 {
+		if profile == embeddingProfileQwen {
+			cfg.EmbeddingsDimensions = 1024
+		} else {
+			cfg.EmbeddingsDimensions = subtitleEmbeddingDimensions
+		}
+		log.Printf("semantic_search.embeddings_dimensions is omitted; defaulting to %d", cfg.EmbeddingsDimensions)
+	}
+	if cfg.EmbeddingsDimensions < 1 || cfg.EmbeddingsDimensions > maxEmbeddingDimensions {
+		return fmt.Errorf("semantic_search.embeddings_dimensions must be between 1 and %d", maxEmbeddingDimensions)
+	}
+	return nil
+}
+
+func normalizeEmbeddingProfile(value string) (string, error) {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "bge", "bge-v1", "bge_v1":
+		return embeddingProfileBGE, nil
+	case "qwen", "qwen-v1", "qwen_v1":
+		return embeddingProfileQwen, nil
+	default:
+		return "", fmt.Errorf("unsupported embedding profile %q (want bge or qwen)", value)
+	}
+}
+
+func newEmbeddingContract(cfg SemanticSearchConfig) (embeddingContract, error) {
+	if err := normalizeSemanticEmbeddingConfig(&cfg); err != nil {
+		return embeddingContract{}, err
+	}
+	contract := embeddingContract{
+		Provider: cfg.EmbeddingsProvider, Model: cfg.EmbeddingsModel,
+		Revision: strings.TrimSpace(cfg.EmbeddingsModelRevision), Dimensions: cfg.EmbeddingsDimensions,
+		Profile: cfg.EmbeddingsProfile, TemplateVersion: embeddingTemplateVersion,
+		IndexVersion: subtitleSearchIndexVersion,
+	}
+	contract.Hash = embeddingContractHash(contract)
+	return contract, nil
+}
+
+func embeddingContractHash(contract embeddingContract) string {
+	hash := sha256.New()
+	_, _ = fmt.Fprintf(hash, "embedding-contract-v1|provider:%s|model:%s|revision:%s|dimensions:%d|profile:%s|template:%s|index:%s",
+		contract.Provider, contract.Model, contract.Revision, contract.Dimensions, contract.Profile, contract.TemplateVersion, contract.IndexVersion)
+	return hex.EncodeToString(hash.Sum(nil))
+}
+
+func (contract embeddingContract) documentInput(prefix, dialogue string) string {
+	return subtitleEmbeddingInputForProfile(contract.Profile, prefix, dialogue)
+}
+
+func (contract embeddingContract) queryInput(query string) string {
+	query = strings.TrimSpace(query)
+	if contract.Profile == embeddingProfileQwen {
+		return "Instruct: Given a query, retrieve relevant passages\nQuery: " + query
+	}
+	return bgeQueryInstruction + query
+}
 
 const subtitleSearchSchema = `
 CREATE EXTENSION IF NOT EXISTS vector;
@@ -257,21 +622,34 @@ CREATE TABLE IF NOT EXISTS subtitle_shared_chunks (
 CREATE INDEX IF NOT EXISTS subtitle_shared_chunks_text_idx ON subtitle_shared_chunks USING GIN (text_search);
 CREATE INDEX IF NOT EXISTS subtitle_shared_chunks_embedding_idx ON subtitle_shared_chunks USING hnsw (embedding vector_cosine_ops);
 ALTER TABLE subtitle_shared_sections ADD COLUMN IF NOT EXISTS ready BOOLEAN NOT NULL DEFAULT FALSE;
+CREATE TABLE IF NOT EXISTS subtitle_embedding_contract (
+    singleton_id SMALLINT PRIMARY KEY CHECK (singleton_id = 1),
+    contract_hash TEXT NOT NULL,
+    provider TEXT NOT NULL,
+    model TEXT NOT NULL,
+    model_revision TEXT NOT NULL,
+    dimensions INTEGER NOT NULL,
+    profile TEXT NOT NULL,
+    template_version TEXT NOT NULL,
+    index_version TEXT NOT NULL,
+    generation BIGINT NOT NULL,
+    state TEXT NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
 `
 
 const subtitleSearchIndexVersion = "subtitle-index-v4-chunk-400-cast-clean-text"
 
 func newSubtitleSearchStore(ctx context.Context, cfg SemanticSearchConfig) (*subtitleSearchStore, error) {
-	provider, err := normalizeEmbeddingsProvider(cfg.EmbeddingsProvider)
+	contract, err := newEmbeddingContract(cfg)
 	if err != nil {
 		return nil, err
+	}
+	if !isLegacyEmbeddingContract(contract) && !cfg.EmbeddingsRebuild && strings.TrimSpace(cfg.PostgresDSN) == "" {
+		return nil, fmt.Errorf("semantic_search embedding contract %s is not the persisted legacy BGE contract; corpus rebuild required; set semantic_search.embeddings_rebuild: true to perform the destructive corpus rebuild", contract.Hash)
 	}
 	if strings.TrimSpace(cfg.PostgresDSN) == "" {
 		return nil, errors.New("semantic_search.postgres_dsn is required when semantic search is enabled")
-	}
-	embeddings, err := newEmbeddingClient(cfg.EmbeddingsURL, provider, cfg.EmbeddingsAPIKey)
-	if err != nil {
-		return nil, err
 	}
 	poolConfig, err := pgxpool.ParseConfig(cfg.PostgresDSN)
 	if err != nil {
@@ -286,9 +664,84 @@ func newSubtitleSearchStore(ctx context.Context, cfg SemanticSearchConfig) (*sub
 		pool.Close()
 		return nil, errors.New("could not connect to semantic search database")
 	}
+	existingColumns, err := inspectSubtitleVectorColumns(ctx, pool)
+	if err != nil {
+		pool.Close()
+		return nil, err
+	}
+	if err := validateExistingSubtitleVectorTypes(existingColumns); err != nil {
+		pool.Close()
+		return nil, err
+	}
+	if !cfg.EmbeddingsRebuild && validateSubtitleVectorColumns(existingColumns, contract.Dimensions) != nil {
+		pool.Close()
+		return nil, fmt.Errorf("semantic_search vector schema does not match configured contract; corpus rebuild required; set semantic_search.embeddings_rebuild: true")
+	}
 	if _, err := pool.Exec(ctx, subtitleSearchSchema); err != nil {
 		pool.Close()
 		return nil, errors.New("could not initialize semantic search schema")
+	}
+	columns, err := inspectSubtitleVectorColumns(ctx, pool)
+	if err != nil {
+		pool.Close()
+		return nil, err
+	}
+	persisted, err := loadEmbeddingContract(ctx, pool)
+	if err != nil {
+		pool.Close()
+		return nil, err
+	}
+	schemaMatches := validateSubtitleVectorColumns(columns, contract.Dimensions) == nil
+	contractMatches := embeddingContractsMatch(contract, persisted)
+	needRebuild := !schemaMatches || !contractMatches
+	if persisted == nil && isLegacyEmbeddingContract(contract) && schemaMatches {
+		needRebuild = false
+	}
+	if needRebuild && !cfg.EmbeddingsRebuild {
+		pool.Close()
+		return nil, fmt.Errorf("semantic_search embedding contract or vector schema does not match configured contract %s; corpus rebuild required; set semantic_search.embeddings_rebuild: true to perform the destructive corpus rebuild", contract.Hash)
+	}
+	embeddings, err := newEmbeddingClientWithContract(cfg.EmbeddingsURL, contract, cfg.EmbeddingsAPIKey)
+	if err != nil {
+		pool.Close()
+		return nil, err
+	}
+	if err := embeddings.probe(ctx); err != nil {
+		pool.Close()
+		return nil, fmt.Errorf("semantic_search embedding contract probe failed for model %q/profile %q/dimensions %d: %w", contract.Model, contract.Profile, contract.Dimensions, err)
+	}
+	if needRebuild {
+		if err := rebuildEmbeddingCorpus(ctx, pool, contract); err != nil {
+			pool.Close()
+			return nil, err
+		}
+	} else if persisted == nil {
+		if err := bootstrapLegacyEmbeddingContract(ctx, pool, contract); err != nil {
+			pool.Close()
+			return nil, err
+		}
+		if cfg.EmbeddingsRebuild {
+			log.Printf("semantic_search.embeddings_rebuild is enabled but the legacy corpus has no contract; initialized legacy contract without resetting data")
+		}
+	} else if cfg.EmbeddingsRebuild {
+		log.Printf("semantic_search.embeddings_rebuild is enabled but contract %s already matches; no corpus reset performed", contract.Hash)
+	}
+	columns, err = inspectSubtitleVectorColumns(ctx, pool)
+	if err != nil {
+		pool.Close()
+		return nil, err
+	}
+	if err := validateSubtitleVectorColumns(columns, contract.Dimensions); err != nil {
+		pool.Close()
+		return nil, err
+	}
+	persisted, err = loadEmbeddingContract(ctx, pool)
+	if err != nil || !embeddingContractsMatch(contract, persisted) {
+		pool.Close()
+		if err != nil {
+			return nil, err
+		}
+		return nil, errors.New("semantic_search embedding contract was not committed")
 	}
 	pool.Close()
 	poolConfig.AfterConnect = func(ctx context.Context, conn *pgx.Conn) error {
@@ -302,7 +755,7 @@ func newSubtitleSearchStore(ctx context.Context, cfg SemanticSearchConfig) (*sub
 		pool.Close()
 		return nil, errors.New("could not connect to semantic search database")
 	}
-	return &subtitleSearchStore{pool: pool, embeddings: embeddings, bulkEmbeddings: make(chan struct{}, 1), bulkWrites: make(chan struct{}, 1)}, nil
+	return &subtitleSearchStore{pool: pool, embeddings: embeddings, contract: contract, bulkEmbeddings: make(chan struct{}, 1), bulkWrites: make(chan struct{}, 1)}, nil
 }
 
 func (s *subtitleSearchStore) close() {
@@ -395,10 +848,13 @@ func chunkSubtitleEntries(entries []SubtitleEntry) []subtitleChunk {
 }
 
 type teiClient struct {
-	url      string
-	provider string
-	apiKey   string
-	client   *http.Client
+	url        string
+	provider   string
+	model      string
+	dimensions int
+	profile    string
+	apiKey     string
+	client     *http.Client
 }
 
 func newTEIClient(rawURL string) (*teiClient, error) {
@@ -419,16 +875,20 @@ func normalizeEmbeddingsProvider(value string) (string, error) {
 }
 
 func newEmbeddingClient(rawURL, provider, apiKey string) (*teiClient, error) {
+	contract, err := newEmbeddingContract(SemanticSearchConfig{EmbeddingsProvider: provider})
+	if err != nil {
+		return nil, err
+	}
+	return newEmbeddingClientWithContract(rawURL, contract, apiKey)
+}
+
+func newEmbeddingClientWithContract(rawURL string, contract embeddingContract, apiKey string) (*teiClient, error) {
 	parsed, err := url.Parse(strings.TrimSpace(rawURL))
 	if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" || parsed.User != nil {
 		return nil, errors.New("semantic_search.embeddings_url must be an HTTP(S) URL")
 	}
-	provider, err = normalizeEmbeddingsProvider(provider)
-	if err != nil {
-		return nil, err
-	}
 	parsed.Path = strings.TrimRight(parsed.Path, "/")
-	if provider == embeddingsProviderTEI {
+	if contract.Provider == embeddingsProviderTEI {
 		if !strings.HasSuffix(parsed.Path, "/embed") {
 			parsed.Path += "/embed"
 		}
@@ -439,17 +899,53 @@ func newEmbeddingClient(rawURL, provider, apiKey string) (*teiClient, error) {
 			parsed.Path += "/v1/embeddings"
 		}
 	}
-	return &teiClient{url: parsed.String(), provider: provider, apiKey: strings.TrimSpace(apiKey), client: &http.Client{Timeout: 30 * time.Second}}, nil
+	return &teiClient{url: parsed.String(), provider: contract.Provider, model: contract.Model, dimensions: contract.Dimensions, profile: contract.Profile, apiKey: strings.TrimSpace(apiKey), client: &http.Client{Timeout: 30 * time.Second}}, nil
 }
 
-func validateEmbeddings(embeddings [][]float32, expected int) error {
+func validateEmbeddings(embeddings [][]float32, expected int, dimensions ...int) error {
+	expectedDimensions := subtitleEmbeddingDimensions
+	if len(dimensions) > 0 {
+		expectedDimensions = dimensions[0]
+	}
+	return validateEmbeddingsForDimension(embeddings, expected, expectedDimensions)
+}
+
+func validateEmbeddingsForDimension(embeddings [][]float32, expected, dimensions int) error {
 	if len(embeddings) != expected {
 		return fmt.Errorf("embedding response count %d does not match request count %d", len(embeddings), expected)
 	}
 	for i, embedding := range embeddings {
-		if len(embedding) != subtitleEmbeddingDimensions {
-			return fmt.Errorf("embedding %d has dimension %d, want %d", i, len(embedding), subtitleEmbeddingDimensions)
+		if len(embedding) != dimensions {
+			return fmt.Errorf("embedding %d has dimension %d, want %d", i, len(embedding), dimensions)
 		}
+		for _, value := range embedding {
+			if math.IsNaN(float64(value)) || math.IsInf(float64(value), 0) {
+				return fmt.Errorf("embedding %d contains a non-finite value", i)
+			}
+		}
+	}
+	return nil
+}
+
+func (c *teiClient) probe(ctx context.Context) error {
+	embeddings, err := c.embed(ctx, []string{"embedding contract probe"})
+	if err != nil {
+		return err
+	}
+	if len(embeddings) != 1 || len(embeddings[0]) != c.dimensions {
+		return errors.New("probe response count or dimension mismatch")
+	}
+	nonzero := false
+	for _, value := range embeddings[0] {
+		if math.IsNaN(float64(value)) || math.IsInf(float64(value), 0) {
+			return errors.New("probe response contains a non-finite value")
+		}
+		if value != 0 {
+			nonzero = true
+		}
+	}
+	if !nonzero {
+		return errors.New("probe response is an all-zero vector")
 	}
 	return nil
 }
@@ -503,7 +999,7 @@ func (c *teiClient) embed(ctx context.Context, inputs []string) ([][]float32, er
 		}
 		embeddings = wrapped.Embeddings
 	}
-	if err := validateEmbeddings(embeddings, len(inputs)); err != nil {
+	if err := validateEmbeddingsForDimension(embeddings, len(inputs), c.dimensions); err != nil {
 		return nil, err
 	}
 	return embeddings, nil
@@ -515,7 +1011,8 @@ type openAIEmbeddingItem struct {
 }
 
 type openAIEmbeddingResponse struct {
-	Data []openAIEmbeddingItem `json:"data"`
+	Model string                `json:"model"`
+	Data  []openAIEmbeddingItem `json:"data"`
 }
 
 func (c *teiClient) embedOpenAI(ctx context.Context, inputs []string) ([][]float32, error) {
@@ -523,7 +1020,7 @@ func (c *teiClient) embedOpenAI(ctx context.Context, inputs []string) ([][]float
 		Model          string   `json:"model"`
 		Input          []string `json:"input"`
 		EncodingFormat string   `json:"encoding_format"`
-	}{openAIEmbeddingModel, inputs, "float"})
+	}{c.model, inputs, "float"})
 	if err != nil {
 		return nil, errors.New("could not encode embedding request")
 	}
@@ -551,6 +1048,10 @@ func (c *teiClient) embedOpenAI(ctx context.Context, inputs []string) ([][]float
 	if err := json.Unmarshal(body, &response); err != nil {
 		return nil, errors.New("embedding response is invalid JSON")
 	}
+	responseModel := strings.TrimSpace(response.Model)
+	if responseModel != "" && responseModel != c.model {
+		return nil, fmt.Errorf("embedding response model %q does not match configured model %q", responseModel, c.model)
+	}
 	if len(response.Data) != len(inputs) {
 		return nil, fmt.Errorf("embedding response count %d does not match request count %d", len(response.Data), len(inputs))
 	}
@@ -568,7 +1069,7 @@ func (c *teiClient) embedOpenAI(ctx context.Context, inputs []string) ([][]float
 			return nil, errors.New("embedding response indexes are incomplete")
 		}
 	}
-	if err := validateEmbeddings(ordered, len(inputs)); err != nil {
+	if err := validateEmbeddingsForDimension(ordered, len(inputs), c.dimensions); err != nil {
 		return nil, err
 	}
 	return ordered, nil
@@ -715,7 +1216,11 @@ func (a *Application) indexSubtitleSource(ctx context.Context, request subtitleS
 	fingerprints := make(map[int]string)
 	for _, plan := range plans {
 		stream := plan.Stream
-		fingerprint := subtitleSourceFingerprint(request.RatingKey, request.MediaID, request.PartID, stream, castContext, sourceRevision)
+		contractRevision := sourceRevision
+		if a.subtitleSearch != nil {
+			contractRevision += "|embedding-contract:" + a.subtitleSearch.contract.Hash
+		}
+		fingerprint := subtitleSourceFingerprint(request.RatingKey, request.MediaID, request.PartID, stream, castContext, contractRevision)
 		fingerprints[plan.PublicIndex] = fingerprint
 		unchanged := false
 		var checkErr error
@@ -1001,7 +1506,7 @@ func nullableUUID(value string) any {
 func (a *Application) persistSubtitleChunks(ctx context.Context, owner string, source LibrarySearchResult, subtitleIndex int, chunks []subtitleChunk, embeddingContext string) error {
 	inputs := make([]string, len(chunks))
 	for i, chunk := range chunks {
-		inputs[i] = subtitleEmbeddingInput(embeddingContext, chunk.Text)
+		inputs[i] = a.subtitleSearch.contract.documentInput(embeddingContext, chunk.Text)
 	}
 	bulkEmbedding := isBulkSubtitleContext(ctx)
 	if bulkEmbedding {
@@ -1053,7 +1558,7 @@ func (a *Application) persistSubtitleChunks(ctx context.Context, owner string, s
 func (a *Application) persistSharedSubtitleChunks(ctx context.Context, request subtitleSearchIndexRequest, source LibrarySearchResult, subtitleIndex int, chunks []subtitleChunk, embeddingContext, fingerprint string) error {
 	inputs := make([]string, len(chunks))
 	for i, chunk := range chunks {
-		inputs[i] = subtitleEmbeddingInput(embeddingContext, chunk.Text)
+		inputs[i] = a.subtitleSearch.contract.documentInput(embeddingContext, chunk.Text)
 	}
 	embeddings := make([][]float32, 0, len(chunks))
 	for start := 0; start < len(inputs); start += subtitleEmbeddingBatchSize {
@@ -1111,8 +1616,15 @@ func (a *Application) recordSharedSubtitleSeen(ctx context.Context, request subt
 }
 
 func subtitleEmbeddingInput(prefix, dialogue string) string {
+	return subtitleEmbeddingInputForProfile(embeddingProfileBGE, prefix, dialogue)
+}
+
+func subtitleEmbeddingInputForProfile(profile, prefix, dialogue string) string {
 	if prefix == "" {
 		return "Dialogue: " + dialogue
+	}
+	if profile == embeddingProfileQwen {
+		return prefix + "\nDialogue: " + dialogue
 	}
 	return prefix + "\nDialogue: " + dialogue
 }
@@ -1559,7 +2071,7 @@ func (a *Application) searchSubtitleIndex(ctx context.Context, query string) ([]
 	if err := load(`SELECT rating_key, media_id, part_id, subtitle_index, title, show_title, season, episode, year, start_ms, end_ms, text, ts_rank_cd(text_search, phraseto_tsquery('simple', $2)) AS score FROM subtitle_chunks WHERE owner_uuid=$1 AND text_search @@ phraseto_tsquery('simple', $2) ORDER BY score DESC, id LIMIT $3`, []any{owner, trimmedQuery, maxSubtitleLexicalCandidates}, 1); err != nil {
 		return nil, err
 	}
-	embeddings, err := a.subtitleSearch.embeddings.embed(ctx, []string{bgeQueryInstruction + trimmedQuery})
+	embeddings, err := a.subtitleSearch.embeddings.embed(ctx, []string{a.subtitleSearch.contract.queryInput(trimmedQuery)})
 	if err != nil {
 		return nil, err
 	}
@@ -1637,7 +2149,7 @@ func (a *Application) searchSharedSubtitleIndex(ctx context.Context, query strin
 	if err := load(`SELECT c.machine_identifier, c.section_uuid, c.section_key, c.scan_id, s.section_type, c.rating_key, c.media_id, c.part_id, c.subtitle_index, c.start_ms, c.end_ms, ts_rank_cd(c.text_search, phraseto_tsquery('simple', $3)) AS score FROM subtitle_shared_chunks c JOIN subtitle_shared_sections s ON s.machine_identifier=c.machine_identifier AND s.section_uuid=c.section_uuid AND s.ready_scan_id=c.scan_id AND s.state='ready' WHERE c.machine_identifier=$1 AND c.section_uuid=ANY($2) AND c.text_search @@ phraseto_tsquery('simple', $3) AND EXISTS (SELECT 1 FROM subtitle_shared_sources v WHERE v.machine_identifier=c.machine_identifier AND v.section_uuid=c.section_uuid AND v.scan_id=c.scan_id AND v.rating_key=c.rating_key AND v.media_id=c.media_id AND v.part_id=c.part_id AND v.subtitle_index=c.subtitle_index AND v.chunk_count > 0) ORDER BY score DESC, c.id LIMIT $4`, []any{a.machineIdentifier, uuidKeys, trimmedQuery, maxSharedSubtitleCandidates}, 1); err != nil {
 		return nil, err
 	}
-	embeddings, err := a.subtitleSearch.embeddings.embed(ctx, []string{bgeQueryInstruction + trimmedQuery})
+	embeddings, err := a.subtitleSearch.embeddings.embed(ctx, []string{a.subtitleSearch.contract.queryInput(trimmedQuery)})
 	if err != nil {
 		return nil, err
 	}

@@ -80,6 +80,17 @@ func TestFFmpegConcurrencyConfig(t *testing.T) {
 	}
 }
 
+func TestEmbeddingContractConfigDefaultsAndOverrides(t *testing.T) {
+	defaults := loadConfigForTest(t, "plex:\n  host: http://plex\n")
+	if defaults.SemanticSearch.EmbeddingsModel != openAIEmbeddingModel || defaults.SemanticSearch.EmbeddingsDimensions != subtitleEmbeddingDimensions || defaults.SemanticSearch.EmbeddingsProfile != embeddingProfileBGE {
+		t.Fatalf("embedding defaults = %+v", defaults.SemanticSearch)
+	}
+	configured := loadConfigForTest(t, "plex:\n  host: http://plex\nsemantic_search:\n  embeddings_model: custom/model\n  embeddings_dimensions: 1024\n  embeddings_profile: qwen\n  embeddings_model_revision: rev-1\n  embeddings_rebuild: true\n")
+	if configured.SemanticSearch.EmbeddingsModel != "custom/model" || configured.SemanticSearch.EmbeddingsDimensions != 1024 || configured.SemanticSearch.EmbeddingsProfile != embeddingProfileQwen || configured.SemanticSearch.EmbeddingsModelRevision != "rev-1" || !configured.SemanticSearch.EmbeddingsRebuild {
+		t.Fatalf("configured embedding contract = %+v", configured.SemanticSearch)
+	}
+}
+
 func TestDurableStorageConfig(t *testing.T) {
 	config := loadConfigForTest(t, "plex:\n  host: http://plex\n"+
 		"storage:\n  root: /srv/cutscene\n  database: metadata.sqlite3\n")

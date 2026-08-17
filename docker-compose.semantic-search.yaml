@@ -1,6 +1,7 @@
 # Shared semantic-search infrastructure. Combine this file with exactly one of
-# docker-compose.semantic-search.nvidia.yaml or
-# docker-compose.semantic-search.amd.yaml. Neither backend service publishes
+# docker-compose.semantic-search.nvidia.yaml,
+# docker-compose.semantic-search.amd.yaml, or
+# docker-compose.semantic-search.qwen.yaml. Neither backend service publishes
 # a host port; CutScene reaches it over Compose's private network.
 services:
   cutscene:

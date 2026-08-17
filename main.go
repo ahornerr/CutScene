@@ -34,12 +34,17 @@ type Config struct {
 }
 
 type SemanticSearchConfig struct {
-	PostgresDSN        string `mapstructure:"postgres_dsn"`
-	EmbeddingsURL      string `mapstructure:"embeddings_url"`
-	EmbeddingsProvider string `mapstructure:"embeddings_provider"`
-	EmbeddingsAPIKey   string `mapstructure:"embeddings_api_key"`
-	Enabled            bool   `mapstructure:"enabled"`
-	SharedCorpus       bool   `mapstructure:"shared_corpus"`
+	PostgresDSN             string `mapstructure:"postgres_dsn"`
+	EmbeddingsURL           string `mapstructure:"embeddings_url"`
+	EmbeddingsProvider      string `mapstructure:"embeddings_provider"`
+	EmbeddingsAPIKey        string `mapstructure:"embeddings_api_key"`
+	EmbeddingsModel         string `mapstructure:"embeddings_model"`
+	EmbeddingsDimensions    int    `mapstructure:"embeddings_dimensions"`
+	EmbeddingsProfile       string `mapstructure:"embeddings_profile"`
+	EmbeddingsModelRevision string `mapstructure:"embeddings_model_revision"`
+	EmbeddingsRebuild       bool   `mapstructure:"embeddings_rebuild"`
+	Enabled                 bool   `mapstructure:"enabled"`
+	SharedCorpus            bool   `mapstructure:"shared_corpus"`
 }
 
 func loadConfig() (*Config, error) {
@@ -58,6 +63,9 @@ func loadConfig() (*Config, error) {
 	cfg.SemanticSearch.EmbeddingsProvider, err = normalizeEmbeddingsProvider(cfg.SemanticSearch.EmbeddingsProvider)
 	if err != nil {
 		return nil, fmt.Errorf("semantic_search.embeddings_provider: %w", err)
+	}
+	if err := normalizeSemanticEmbeddingConfig(&cfg.SemanticSearch); err != nil {
+		return nil, err
 	}
 
 	return &cfg, nil
