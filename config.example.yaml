@@ -21,3 +21,14 @@ storage:
   # Relative paths are resolved below storage.root. Omit to use clips.sqlite3.
   # Absolute paths and paths escaping root are rejected.
   database: clips.sqlite3
+semantic_search:
+  # NVIDIA: use docker-compose.yaml + docker-compose.semantic-search.yaml +
+  # docker-compose.semantic-search.nvidia.yaml.
+  enabled: true
+  postgres_dsn: postgresql://cutscene:cutscene-poc@postgres:5432/cutscene?sslmode=disable
+  embeddings_provider: tei
+  embeddings_url: http://tei:80
+  # AMD alternative: use the AMD overlay instead, then change the two lines
+  # above to:
+  # embeddings_provider: openai
+  # embeddings_url: http://embeddings:8000

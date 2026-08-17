@@ -203,6 +203,9 @@ type Application struct {
 	plexAdmin         *plexgo.PlexAPI
 	plexUser          *plexgo.PlexAPI
 	plexTv            *PlexTV
+	plexResources     *PlexResourceResolver
+	mediaProxy        *plexCapabilityProxy
+	sharedCorpus      bool
 	machineIdentifier string
 	ownerEmail        string
 	ownerUUID         string
@@ -214,6 +217,8 @@ type Application struct {
 	cancelLifetime    context.CancelFunc
 	closeOnce         sync.Once
 	closeErr          error
+	subtitleSearch    *subtitleSearchStore
+	subtitleJobs      *subtitleIndexJobManager
 }
 
 func NewApplication(config Config) (*Application, error) {
@@ -230,6 +235,32 @@ func NewApplication(config Config) (*Application, error) {
 		ffmpegLimiter:  newFFmpegLimiter(config.Ffmpeg.Concurrency),
 		lifetime:       lifetime,
 		cancelLifetime: cancelLifetime,
+		sharedCorpus:   config.SemanticSearch.SharedCorpus,
+	}
+	resolver, resolverErr := NewPlexResourceResolver(config.Plex.Host)
+	if resolverErr != nil {
+		cancelLifetime()
+		return nil, resolverErr
+	}
+	app.plexResources = resolver
+	app.mediaProxy, resolverErr = newPlexCapabilityProxy(resolver)
+	if resolverErr != nil {
+		cancelLifetime()
+		return nil, resolverErr
+	}
+	app.subtitleJobs = newSubtitleIndexJobManager(app)
+	if config.SemanticSearch.Enabled {
+		searchCtx, cancelSearch := context.WithTimeout(context.Background(), 15*time.Second)
+		searchStore, searchErr := newSubtitleSearchStore(searchCtx, config.SemanticSearch)
+		cancelSearch()
+		if searchErr != nil {
+			return nil, searchErr
+		}
+		app.subtitleSearch = searchStore
+		if err := app.subtitleJobs.recoverPersistedJobs(); err != nil {
+			app.subtitleSearch.close()
+			return nil, err
+		}
 	}
 
 	identity, err := app.plexAdmin.General.GetIdentity(context.Background())
@@ -238,6 +269,12 @@ func NewApplication(config Config) (*Application, error) {
 	}
 
 	app.machineIdentifier = *identity.Object.MediaContainer.MachineIdentifier
+	// Admin-scoped discovery seeds the resolver's trusted HTTPS intersection.
+	// Discovery failure is intentionally non-fatal: the configured origin
+	// remains usable, while untrusted advertised alternatives remain rejected.
+	if err := app.plexResources.DiscoverTrustedOrigins(context.Background(), config.Plex.Token, app.machineIdentifier); err != nil {
+		log.Printf("Plex trusted-origin discovery unavailable: %s", redactedDiagnostic(err))
+	}
 
 	tokenDetails, err := app.plexAdmin.Authentication.GetTokenDetails(context.Background(), operations.GetTokenDetailsRequest{})
 	if err != nil {
@@ -261,11 +298,17 @@ func NewApplication(config Config) (*Application, error) {
 	app.renderJobs, err = newRenderJobManagerWithContextAndPromotion(app.lifetime, renderRoot, app.executeRenderSpec, func(job *renderJob, outputPath string) error {
 		artworkContext, cancelArtwork := context.WithTimeout(app.lifetime, 30*time.Second)
 		defer cancelArtwork()
-		artworkToken := job.spec.SourceToken
-		if artworkToken == "" {
-			artworkToken = app.config.Plex.Token
+		var artworkPath, artworkMIME string
+		var artworkErr error
+		if job.spec.CallerScoped {
+			access, ok := app.renderJobs.callerLease(job.id)
+			if !ok {
+				return newRenderStageFailure("artwork", "source_unavailable", errors.New("caller render lease is unavailable"))
+			}
+			artworkPath, artworkMIME, artworkErr = app.fetchClipArtworkWithAccess(artworkContext, job.spec.ThumbnailURL, access)
+		} else {
+			artworkPath, artworkMIME, artworkErr = app.fetchClipArtworkWithToken(artworkContext, job.spec.ThumbnailURL, app.config.Plex.Token)
 		}
-		artworkPath, artworkMIME, artworkErr := app.fetchClipArtworkWithToken(artworkContext, job.spec.ThumbnailURL, artworkToken)
 		if artworkErr != nil {
 			log.Printf("clip artwork snapshot unavailable: %s", redactedDiagnostic(artworkErr))
 		}
@@ -304,6 +347,17 @@ func (a *Application) Close() error {
 				log.Printf("clip storage close failed: %s", redactedDiagnostic(err))
 			}
 		}
+		if a.subtitleSearch != nil {
+			a.subtitleSearch.close()
+		}
+		if a.subtitleJobs != nil {
+			a.subtitleJobs.cancel()
+		}
+		if a.mediaProxy != nil {
+			if err := a.mediaProxy.Close(); err != nil && a.closeErr == nil {
+				a.closeErr = err
+			}
+		}
 	})
 	return a.closeErr
 }
@@ -312,6 +366,57 @@ const maxClipArtworkBytes int64 = 8 << 20
 
 func (a *Application) fetchClipArtwork(ctx context.Context, artworkPath string) (string, string, error) {
 	return a.fetchClipArtworkWithToken(ctx, artworkPath, a.config.Plex.Token)
+}
+
+func (a *Application) fetchClipArtworkWithAccess(ctx context.Context, artworkPath string, access *PlexAccess) (string, string, error) {
+	if access == nil || a.plexResources == nil {
+		return "", "", errors.New("caller Plex access is unavailable")
+	}
+	parsed, err := url.Parse(artworkPath)
+	if err != nil || parsed.User != nil || parsed.IsAbs() || !strings.HasPrefix(parsed.Path, "/") || parsed.RawQuery != "" || parsed.Fragment != "" {
+		return "", "", errors.New("artwork path is invalid")
+	}
+	request, err := newPlexRequest(ctx, access, http.MethodGet, parsed.Path)
+	if err != nil {
+		return "", "", err
+	}
+	response, err := a.plexResources.DoPlexRequest(ctx, access, request)
+	if err != nil {
+		return "", "", err
+	}
+	defer response.Body.Close()
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		return "", "", fmt.Errorf("artwork returned status %d", response.StatusCode)
+	}
+	contentType, _, err := mime.ParseMediaType(response.Header.Get("Content-Type"))
+	if err != nil {
+		return "", "", errors.New("artwork response has invalid content type")
+	}
+	data, err := io.ReadAll(io.LimitReader(response.Body, maxClipArtworkBytes+1))
+	if err != nil || int64(len(data)) == 0 || int64(len(data)) > maxClipArtworkBytes {
+		if err != nil {
+			return "", "", err
+		}
+		return "", "", errors.New("artwork response is empty or too large")
+	}
+	if err := validateRasterArtwork(contentType, data); err != nil {
+		return "", "", err
+	}
+	tmp, err := os.CreateTemp("", "cutscene-artwork-*")
+	if err != nil {
+		return "", "", err
+	}
+	path := tmp.Name()
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		os.Remove(path)
+		return "", "", err
+	}
+	if err := tmp.Close(); err != nil {
+		os.Remove(path)
+		return "", "", err
+	}
+	return path, contentType, nil
 }
 
 func (a *Application) fetchClipArtworkWithToken(ctx context.Context, artworkPath, token string) (string, string, error) {
@@ -484,6 +589,82 @@ func (a *Application) plexSecurityUserToken(ctx context.Context) (components.Sec
 	}, nil
 }
 
+// resolvePlexAccess binds the authenticated request identity to this
+// application's configured PMS machine. The resolver itself owns the
+// short-lived cache and identity probe.
+func (a *Application) resolvePlexAccess(ctx context.Context) (*PlexAccess, error) {
+	if a == nil || a.plexResources == nil {
+		return nil, errors.New("Plex resource resolver is unavailable")
+	}
+	user := UserFromContext(ctx)
+	token := AuthTokenFromContext(ctx)
+	if user == nil || strings.TrimSpace(user.Uuid) == "" {
+		return nil, errors.New("caller UUID is required")
+	}
+	if token == nil || strings.TrimSpace(*token) == "" {
+		return nil, errors.New("Plex account token is required")
+	}
+	return a.plexResources.Resolve(ctx, user.Uuid, *token, a.machineIdentifier)
+}
+
+// callerPlexAccess is the compatibility boundary for caller-scoped catalog
+// requests. Production HTTP requests carry a validated Plex user UUID and use
+// the resolver; small in-process tests that construct an Application directly
+// retain a configured-origin-only access without bypassing DoPlex.
+func (a *Application) callerPlexAccess(ctx context.Context, fallbackToken string) (*PlexAccess, *PlexResourceResolver, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	token := AuthTokenFromContext(ctx)
+	if token == nil || strings.TrimSpace(*token) == "" {
+		token = &fallbackToken
+	}
+	if strings.TrimSpace(*token) == "" {
+		return nil, nil, errors.New("missing auth token")
+	}
+	if user := UserFromContext(ctx); user != nil && strings.TrimSpace(user.Uuid) != "" && strings.TrimSpace(a.machineIdentifier) != "" && a.plexResources != nil {
+		if access := PlexAccessFromContext(ctx); access != nil {
+			return access, a.plexResources, nil
+		}
+		access, err := a.resolvePlexAccess(ctx)
+		return access, a.plexResources, err
+	}
+	if a.plexResources == nil {
+		resolver, err := NewPlexResourceResolver(a.config.Plex.Host)
+		if err != nil {
+			return nil, nil, err
+		}
+		a.plexResources = resolver
+	}
+	origin, err := validatePlexOrigin(a.config.Plex.Host)
+	if err != nil {
+		return nil, nil, err
+	}
+	return &PlexAccess{
+		baseOrigin: origin.String(), secretToken: strings.TrimSpace(*token), accountToken: strings.TrimSpace(*token),
+		callerUUID: "legacy-caller", machineIdentifier: "legacy-machine",
+	}, a.plexResources, nil
+}
+
+func (a *Application) ensureMediaProxy() (*plexCapabilityProxy, error) {
+	if a.mediaProxy != nil {
+		return a.mediaProxy, nil
+	}
+	if a.plexResources == nil {
+		resolver, err := NewPlexResourceResolver(a.config.Plex.Host)
+		if err != nil {
+			return nil, err
+		}
+		a.plexResources = resolver
+	}
+	proxy, err := newPlexCapabilityProxy(a.plexResources)
+	if err != nil {
+		return nil, err
+	}
+	a.mediaProxy = proxy
+	return proxy, nil
+}
+
 // getMetadataItem keeps the access decision explicit. Library requests must
 // use the token belonging to the caller; the configured administrator client
 // is retained for the existing active-session path.
@@ -492,7 +673,7 @@ func (a *Application) getMetadataItem(ctx context.Context, ratingKey string, use
 		if token := AuthTokenFromContext(ctx); token == nil || strings.TrimSpace(*token) == "" {
 			return nil, errors.New("caller-scoped Plex client is unavailable")
 		} else {
-			return a.getCallerMetadataItem(ctx, ratingKey, *token)
+			return a.getCallerMetadataItem(ctx, ratingKey, "")
 		}
 	} else {
 		if a.plexAdmin == nil {
@@ -721,6 +902,8 @@ type SubtitleStream struct {
 	Codec        string `json:"codec"`
 	Default      bool   `json:"default"`
 	Type         string `json:"type"` // "text" or "pgs" (raster, burn-in only)
+	External     bool   `json:"external"`
+	LanguageCode string `json:"languageCode,omitempty"`
 }
 
 // SubtitleEntry represents a single subtitle line block with its time range and text.
@@ -987,12 +1170,16 @@ func (a *Application) GetSubtitleStreamsForSource(ctx context.Context, ratingKey
 		if stream.Language != nil {
 			s.Language = *stream.Language
 		}
+		if stream.LanguageCode != nil {
+			s.LanguageCode = *stream.LanguageCode
+		}
+		s.External = isExternalSubtitleStream(stream)
 		s.DisplayTitle = stream.DisplayTitle
 		if stream.Default != nil {
 			s.Default = *stream.Default
 		}
 
-		if textSubtitleCodecs[codec] {
+		if textSubtitleCodecs[strings.ToLower(codec)] || textSubtitleCodecs[strings.ToLower(format)] {
 			s.Type = "text"
 		} else if isPGSSubtitle(codec, format) {
 			s.Type = "pgs"
@@ -1062,11 +1249,29 @@ func (a *Application) GetSubtitleEntriesForSource(ctx context.Context, ratingKey
 		return entries, nil
 	}
 
-	fileURL := fmt.Sprintf("%s%s?X-Plex-Token=%s",
-		a.config.Plex.Host,
-		part.Key,
-		a.plexSourceToken(operationCtx, AuthTokenFromContext(operationCtx) != nil),
-	)
+	fileURL := ""
+	var releaseCapability func()
+	if AuthTokenFromContext(operationCtx) != nil {
+		access, resolver, accessErr := a.callerPlexAccess(operationCtx, "")
+		if accessErr != nil {
+			return nil, errors.New("caller Plex access is unavailable")
+		}
+		proxy, proxyErr := a.ensureMediaProxy()
+		if proxyErr != nil {
+			return nil, errors.New("Plex capability proxy is unavailable")
+		}
+		_ = resolver
+		fileURL, releaseCapability, err = proxy.Issue(operationCtx, access, part.Key)
+		if err != nil {
+			return nil, err
+		}
+		defer releaseCapability()
+	} else {
+		fileURL, err = a.buildPlexSourceURL(part.Key, a.plexSourceToken(operationCtx, false))
+		if err != nil {
+			return nil, err
+		}
+	}
 
 	release, err := a.acquireFFmpeg(operationCtx)
 	if err != nil {
@@ -1090,7 +1295,34 @@ func (a *Application) GetSubtitleEntriesForSource(ctx context.Context, ratingKey
 }
 
 func (a *Application) downloadSubtitle(ctx context.Context, streamKey, codec string) ([]SubtitleEntry, error) {
-	return a.downloadSubtitleWithToken(ctx, streamKey, codec, a.plexSourceToken(ctx, AuthTokenFromContext(ctx) != nil))
+	if AuthTokenFromContext(ctx) != nil {
+		access, resolver, err := a.callerPlexAccess(ctx, "")
+		if err != nil {
+			return nil, errors.New("caller Plex access is unavailable")
+		}
+		return a.downloadSubtitleWithAccess(ctx, streamKey, codec, access, resolver)
+	}
+	return a.downloadSubtitleWithToken(ctx, streamKey, codec, a.plexSourceToken(ctx, false))
+}
+
+func (a *Application) downloadSubtitleWithAccess(ctx context.Context, streamKey, codec string, access *PlexAccess, resolver *PlexResourceResolver) ([]SubtitleEntry, error) {
+	request, err := newPlexRequest(ctx, access, http.MethodGet, streamKey)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := resolver.DoPlexRequest(ctx, access, request)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("subtitle download returned status %d", resp.StatusCode)
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxLibraryResponseBytes+1))
+	if err != nil || len(body) > maxLibraryResponseBytes {
+		return nil, errors.New("subtitle response exceeds size limit")
+	}
+	return parseSubtitleBody(body, codec)
 }
 
 func (a *Application) downloadSubtitleWithToken(ctx context.Context, streamKey, codec, token string) ([]SubtitleEntry, error) {
@@ -1145,6 +1377,32 @@ func (a *Application) downloadSubtitleWithToken(ctx context.Context, streamKey, 
 	}
 }
 
+func parseSubtitleBody(body []byte, codec string) ([]SubtitleEntry, error) {
+	switch strings.ToLower(strings.TrimSpace(codec)) {
+	case "webvtt":
+		return ParseWebVTT(body)
+	case "ass", "ssa":
+		return ParseASS(body)
+	case "srt", "subrip", "text":
+		tmpFile, err := os.CreateTemp("", "cutscene_sub_*.srt")
+		if err != nil {
+			return nil, err
+		}
+		tmpFilePath := tmpFile.Name()
+		defer os.Remove(tmpFilePath)
+		if _, err := tmpFile.Write(body); err != nil {
+			_ = tmpFile.Close()
+			return nil, err
+		}
+		if err := tmpFile.Close(); err != nil {
+			return nil, err
+		}
+		return ParseSRT(tmpFilePath)
+	default:
+		return nil, fmt.Errorf("unsupported native subtitle codec %q", codec)
+	}
+}
+
 func (a *Application) prepareExternalSubtitle(ctx context.Context, source subtitleSource, fromMs, toMs int64, subtitleOffsets ...int64) (string, error) {
 	return a.prepareExternalSubtitleWithToken(ctx, source, fromMs, toMs, subtitleOffsets, a.plexSourceToken(ctx, AuthTokenFromContext(ctx) != nil))
 }
@@ -1156,7 +1414,17 @@ func (a *Application) prepareExternalSubtitleWithToken(ctx context.Context, sour
 	if source.PGS || !isSupportedTextSubtitle(source) {
 		return "", fmt.Errorf("external subtitle codec is not supported")
 	}
-	entries, err := a.downloadSubtitleWithToken(ctx, source.StreamKey, subtitleSourceCodec(source), token)
+	var entries []SubtitleEntry
+	var err error
+	if UserFromContext(ctx) != nil && AuthTokenFromContext(ctx) != nil {
+		access, resolver, accessErr := a.callerPlexAccess(ctx, "")
+		if accessErr != nil {
+			return "", errors.New("caller Plex access is unavailable")
+		}
+		entries, err = a.downloadSubtitleWithAccess(ctx, source.StreamKey, subtitleSourceCodec(source), access, resolver)
+	} else {
+		entries, err = a.downloadSubtitleWithToken(ctx, source.StreamKey, subtitleSourceCodec(source), token)
+	}
 	if err != nil {
 		return "", fmt.Errorf("could not download external subtitle: %w", err)
 	}

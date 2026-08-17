@@ -1,0 +1,29 @@
+# Shared semantic-search infrastructure. Combine this file with exactly one of
+# docker-compose.semantic-search.nvidia.yaml or
+# docker-compose.semantic-search.amd.yaml. Neither backend service publishes
+# a host port; CutScene reaches it over Compose's private network.
+services:
+  cutscene:
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  postgres:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_DB: cutscene
+      POSTGRES_USER: cutscene
+      # This is an internal POC credential. Change it, and semantic_search
+      # .postgres_dsn in config.yaml, before using the setup beyond a local POC.
+      POSTGRES_PASSWORD: cutscene-poc
+    volumes:
+      - semantic-search-postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U cutscene -d cutscene"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 5s
+
+volumes:
+  semantic-search-postgres-data:

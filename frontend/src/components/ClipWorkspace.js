@@ -21,7 +21,7 @@ export default function ClipWorkspace({
   onCreateJob, onDownloadJob, onRetryJob, onRetryPoll, onCreateNewJob,
   onOpenClip,
   audioMode, onAudioModeChange, resolution, onResolutionChange,
-  theaterMode, onToggleTheater,
+  theaterMode, onToggleTheater, autoPlay,
               subtitleOffsetMs, onSubtitleOffsetChange,
               subtitle, ...subProps
             }) {
@@ -38,7 +38,7 @@ export default function ClipWorkspace({
           <PlayerPane
             playerUrl={playerUrl} onError={onPlayerError} onReady={onPlayerReady}
             previewStale={previewStale} onApplyPreview={onApplyPreview}
-            theaterMode={theaterMode} onToggleTheater={onToggleTheater}
+            theaterMode={theaterMode} onToggleTheater={onToggleTheater} autoPlay={autoPlay}
           />
         </Box>
         <Box className="cs-workspace-trim" sx={{minWidth: 0}}>

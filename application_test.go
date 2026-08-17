@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -998,12 +999,12 @@ func TestNVENCTextSubtitleArgs(t *testing.T) {
 		{
 			name:   "with scaling",
 			height: 720,
-			want:   "subtitles=/tmp/subtitle.srt,format=yuv420p,hwupload_cuda,scale_cuda=-2:720",
+			want:   "subtitles=filename='/tmp/subtitle.srt',format=yuv420p,hwupload_cuda,scale_cuda=-2:720",
 		},
 		{
 			name:   "without scaling",
 			height: 0,
-			want:   "subtitles=/tmp/subtitle.srt,format=yuv420p,hwupload_cuda",
+			want:   "subtitles=filename='/tmp/subtitle.srt',format=yuv420p,hwupload_cuda",
 		},
 	}
 
@@ -1034,6 +1035,40 @@ func TestNVENCTextSubtitleArgs(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestSubtitleFilterFilenameEscapesFilterSpecialCharacters(t *testing.T) {
+	path := `/tmp/sub title:one,two[three]=it's.srt`
+	got := subtitlesFilter(path)
+	want := `subtitles=filename='/tmp/sub title\:one\,two\[three\]\=it\'s.srt'`
+	if got != want {
+		t.Fatalf("subtitle filter = %q, want %q", got, want)
+	}
+}
+
+func TestConfigureFFmpegHTTPRecoveryOnlyAppliesToHTTPInputs(t *testing.T) {
+	remote := ffmpeg.KwArgs{}
+	configureFFmpegHTTPRecovery(remote, "https://plex.example/library/parts/1/file")
+	for key, want := range map[string]string{
+		"reconnect":                  "1",
+		"reconnect_streamed":         "1",
+		"reconnect_on_network_error": "1",
+		"reconnect_on_http_error":    "502,503,504",
+		"reconnect_delay_max":        "2",
+		"rw_timeout":                 "15000000",
+	} {
+		if got := remote[key]; got != want {
+			t.Fatalf("remote %s = %v, want %q", key, got, want)
+		}
+	}
+	if _, exists := remote["reconnect_at_eof"]; exists {
+		t.Fatal("reconnect_at_eof must not be enabled")
+	}
+	local := ffmpeg.KwArgs{}
+	configureFFmpegHTTPRecovery(local, "/tmp/media.mkv")
+	if len(local) != 0 {
+		t.Fatalf("local input received HTTP recovery options: %+v", local)
 	}
 }
 
@@ -1154,17 +1189,8 @@ func TestParseTimestampToMs_Roundtrip(t *testing.T) {
 
 func TestWriteClipSRT_EmptyEntries(t *testing.T) {
 	path, err := WriteClipSRT([]SubtitleEntry{}, 1000, 5000)
-	if err != nil {
-		t.Fatalf("WriteClipSRT with empty entries error: %v", err)
-	}
-	defer os.Remove(path)
-
-	content, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(content) > 0 && strings.TrimSpace(string(content)) == "" {
-		t.Log("empty entries produced an empty file")
+	if !errors.Is(err, ErrNoUsableSubtitleCues) || path != "" {
+		t.Fatalf("empty entries outcome path=%q err=%v", path, err)
 	}
 }
 

@@ -7,6 +7,8 @@ import LibrarySearchPanel from "./components/LibrarySearchPanel";
 import ClipWorkspace from "./components/ClipWorkspace";
 import ClipLibrary from "./components/ClipLibrary";
 import ClipDetail from "./components/ClipDetail";
+import SemanticSubtitleSearch from "./components/SemanticSubtitleSearch";
+import {orderSubtitleStreams} from "./components/subtitle-formats";
 import {stripSubtitleMarkup} from "./components/subtitle-markup";
 import {
   buildRenderJobRequest, buildRenderJobRequestFromSpec, isTerminal, isActive, JOB_STATES, snapshotJobSpec, AUDIO_MODES, RENDER_RESOLUTIONS,
@@ -85,6 +87,7 @@ const EXPIRY_TICK_MS = 1000
 function viewFromHash(hash) {
   if (!hash || hash === '#' || hash === '#/') return {name: 'home'}
   if (hash === '#/clips') return {name: 'library'}
+  if (hash === '#/subtitle-search') return {name: 'subtitleSearch'}
 
   const workspaceMatch = hash.match(/^#\/workspace\/([^/?#]+)\?mediaId=([1-9]\d*)(?:&partId=([1-9]\d*))?$/)
   if (workspaceMatch) {
@@ -120,6 +123,7 @@ function isPositiveSafeInteger(value) {
 
 function hashForView(view) {
   if (view.name === 'library') return '#/clips'
+  if (view.name === 'subtitleSearch') return '#/subtitle-search'
   if (view.name === 'clip' && view.clipId) return `#/clips/${encodeURIComponent(view.clipId)}`
   if (view.name === 'workspace' && view.ratingKey && isPositiveSafeInteger(view.mediaId)) {
     const partParam = view.partId != null && isPositiveSafeInteger(view.partId) ? `&partId=${view.partId}` : ''
@@ -239,6 +243,7 @@ function App() {
   // the player. Reset on session change alongside the other ephemeral
   // workspace state for a predictable per-session default.
   const [theaterMode, setTheaterMode] = useState(false)
+  const [autoPlayFromSearch, setAutoPlayFromSearch] = useState(false)
 
   // --- Subtitle offset ---
   // Positive = subtitles appear later, negative = earlier. Retained across
@@ -290,6 +295,11 @@ function App() {
   const sessionRefreshRunnerRef = useRef(null)
   const sessionsHaveDataRef = useRef(false)
   const workspaceHydrationControllerRef = useRef(null)
+  // Search ranges are intentionally transient. The workspace URL remains its
+  // established source-only deep link, while this ref carries one selected
+  // subtitle moment through source hydration without polluting history.
+  const pendingSubtitleRangeRef = useRef(null)
+  const searchPlaybackWorkspaceRef = useRef(null)
 
   // ---------------------------------------------------------------- render-job cleanup
   const stopPolling = useCallback(() => {
@@ -489,8 +499,12 @@ function App() {
         .then(safeJsonArray)
         .then(streams => {
           if (controller.signal.aborted || sessionGenerationRef.current !== generation) return
-          const availableStreams = streams
-          const selectedStreamIndex = availableStreams.length > 0 ? availableStreams[0].index : -1
+          const availableStreams = orderSubtitleStreams(streams)
+          const pendingSearchSelection = pendingSubtitleRangeRef.current
+          const requestedStreamIndex = Number(pendingSearchSelection?.subtitleIndex)
+          const selectedStreamIndex = availableStreams.some(stream => stream.index === requestedStreamIndex)
+            ? requestedStreamIndex
+            : availableStreams.length > 0 ? availableStreams[0].index : -1
           setSubtitleStreams(availableStreams)
           setStreamsLoading(false)
           playerReadyRef.current = true
@@ -516,6 +530,29 @@ function App() {
     }
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedSession])
+
+  // Apply a subtitle-search range only after its source is the active
+  // workspace. Identity matching prevents a stale pending click from changing
+  // a later workspace, and clearing before state writes makes this one-shot.
+  useEffect(() => {
+    const pending = pendingSubtitleRangeRef.current
+    if (!pending || !selectedSession || !sessionMatchesWorkspace(selectedSession, pending.workspace)) return
+    // Let source stream discovery validate the requested subtitle index before
+    // applying the hit range; otherwise the normal first-track default wins.
+    if (streamsLoading) return
+    pendingSubtitleRangeRef.current = null
+    const [start, end] = clampToBounds(selectedSession, pending.startMs, pending.endMs)
+    const requestedSubtitle = Number(pending.subtitleIndex)
+    const effectiveSubtitle = subtitleStreams.some(stream => stream.index === requestedSubtitle)
+      ? requestedSubtitle
+      : selectedSubtitle
+    setStartPosition(start)
+    setEndPosition(end)
+    setPlayerPosition(start, end, effectiveSubtitle >= 0 ? effectiveSubtitle : -1)
+    setPreviewStale(false)
+    setTrimFlashKey(key => key + 1)
+    setAutoPlayFromSearch(true)
+  }, [clampToBounds, selectedSession, selectedSubtitle, setPlayerPosition, subtitleStreams, streamsLoading, view])
 
   // ---------------------------------------------------------------- subtitle entries fetch
   useEffect(() => {
@@ -996,6 +1033,14 @@ function App() {
 
   // ---------------------------------------------------------------- hash navigation
   const navigateTo = useCallback((nextView, replace = false) => {
+    // Autoplay is a one-source intent from a subtitle hit, never a property of
+    // ordinary workspace history navigation.
+    if (!searchPlaybackWorkspaceRef.current || !sessionMatchesWorkspace({
+      ratingKey: nextView.ratingKey,
+      Media: [{Part: [{id: String(nextView.mediaId)}]}],
+      _sourceType: nextView.partId != null ? 'library' : undefined,
+      _partId: nextView.partId,
+    }, searchPlaybackWorkspaceRef.current)) setAutoPlayFromSearch(false)
     setView(nextView)
     const nextHash = hashForView(nextView)
     if (window.location.hash === nextHash) return
@@ -1036,6 +1081,7 @@ function App() {
     setResolution(RENDER_RESOLUTIONS.NATIVE)
     setSubtitleOffsetMs(0)
     setTheaterMode(false)
+    setAutoPlayFromSearch(false)
     setTrimFlashKey(0)
     navigateTo({name: 'home'})
   }, [jobIsActive, navigateTo, stopPolling, stopSessionRefresh])
@@ -1188,6 +1234,23 @@ const handleLibraryAuthRequired = useCallback(() => setNeedsAuth(true), [])
 
   // ---------------------------------------------------------------- clip library navigation
   const openLibrary = useCallback(() => navigateTo({name: 'library'}), [navigateTo])
+  const openSubtitleSearch = useCallback(() => navigateTo({name: 'subtitleSearch'}), [navigateTo])
+  const openSubtitleResult = useCallback((hit) => {
+    const mediaId = Number(hit?.mediaId)
+    const partId = Number(hit?.partId)
+    const startMs = Number(hit?.startMs)
+    const endMs = Number(hit?.endMs)
+    if (!hit?.ratingKey || !isPositiveSafeInteger(mediaId) || !isPositiveSafeInteger(partId) || !Number.isFinite(startMs) || !Number.isFinite(endMs) || startMs < 0 || endMs <= startMs) return
+    const workspace = {name: 'workspace', ratingKey: String(hit.ratingKey), mediaId, partId}
+    // A search hit must never switch a source while a render owns it. This is
+    // the same protection used by hash navigation and source changes.
+    if (jobIsActive && (!selectedSession || !sessionMatchesWorkspace(selectedSession, workspace))) return
+    if (jobIsActive) return
+    pendingSubtitleRangeRef.current = {workspace, startMs, endMs, subtitleIndex: Number(hit.subtitleIndex)}
+    searchPlaybackWorkspaceRef.current = workspace
+    setTheaterMode(true)
+    navigateTo(workspace)
+  }, [jobIsActive, navigateTo, selectedSession])
   const openClip = useCallback((clipId) => navigateTo({name: 'clip', clipId}), [navigateTo])
   const goHome = useCallback(() => navigateTo({name: 'home'}), [navigateTo])
   const goBackFromLibrary = useCallback(() => {
@@ -1243,6 +1306,15 @@ const handleLibraryAuthRequired = useCallback(() => setNeedsAuth(true), [])
             <Box sx={{flex: 1}}/>
             {!needsAuth && (
               <Button
+                variant={view.name === 'subtitleSearch' ? 'contained' : 'text'} color="primary" onClick={openSubtitleSearch}
+                sx={view.name === 'subtitleSearch' ? {px: 2, py: 0.5} : {color: 'text.secondary', '&:hover': {color: '#ffd9b0'}}}
+                aria-current={view.name === 'subtitleSearch' ? 'page' : undefined}
+              >
+                Subtitle search
+              </Button>
+            )}
+            {!needsAuth && (
+              <Button
                 variant={view.name === 'library' || view.name === 'clip' ? 'contained' : 'text'}
                 color="primary"
                 onClick={openLibrary}
@@ -1270,6 +1342,8 @@ const handleLibraryAuthRequired = useCallback(() => setNeedsAuth(true), [])
                 Log in with Plex
               </Button>
             </Stack>
+          ) : view.name === 'subtitleSearch' ? (
+            <SemanticSubtitleSearch onOpenResult={openSubtitleResult} onAuthRequired={handleLibraryAuthRequired}/>
           ) : view.name === 'library' ? (
             <ClipLibrary
               onOpenClip={openClip}
@@ -1339,6 +1413,7 @@ const handleLibraryAuthRequired = useCallback(() => setNeedsAuth(true), [])
               }}
               theaterMode={theaterMode}
               onToggleTheater={() => setTheaterMode(mode => !mode)}
+              autoPlay={autoPlayFromSearch}
               subtitleOffsetMs={subtitleOffsetMs}
               onSubtitleOffsetChange={setSubtitleOffsetMs}
               subtitle={selectedSubtitle}

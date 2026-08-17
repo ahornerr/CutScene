@@ -72,6 +72,7 @@ type RenderJobCreateRequest struct {
 type renderJobSpec struct {
 	OwnerUUID             string
 	SourceToken           string
+	CallerScoped          bool
 	RatingKey             string
 	MediaID               int64
 	PartID                int64
@@ -415,6 +416,19 @@ type renderJobManager struct {
 	timeout            time.Duration
 	promote            func(*renderJob, string) error
 	terminalDeleteHook func() // test synchronization point; called under both locks
+	callerLeases       map[string]*renderCallerLease
+}
+
+type renderCallerLease struct {
+	access  *PlexAccess
+	expires time.Time
+}
+
+type renderCallerAccessContextKey struct{}
+
+func activeRenderCallerAccess(ctx context.Context) *PlexAccess {
+	access, _ := ctx.Value(renderCallerAccessContextKey{}).(*PlexAccess)
+	return access
 }
 
 var errRenderQueueFull = errors.New("render queue is full")
@@ -457,6 +471,7 @@ func newRenderJobManagerWithContextAndPromotion(parent context.Context, root str
 		maxFailed:        renderMaxFailedRecords,
 		timeout:          renderTimeout,
 		promote:          promote,
+		callerLeases:     make(map[string]*renderCallerLease),
 	}
 	go m.worker()
 	go m.cleanupLoop()
@@ -486,6 +501,10 @@ func (m *renderJobManager) stopAndWait() {
 }
 
 func (m *renderJobManager) enqueue(owner string, spec renderJobSpec) (*renderJob, error) {
+	return m.enqueueWithCallerLease(owner, spec, nil)
+}
+
+func (m *renderJobManager) enqueueWithCallerLease(owner string, spec renderJobSpec, access *PlexAccess) (*renderJob, error) {
 	if owner == "" {
 		return nil, errors.New("missing owner")
 	}
@@ -515,6 +534,9 @@ func (m *renderJobManager) enqueue(owner string, spec renderJobSpec) (*renderJob
 		return nil, errRenderOwnerLimit
 	}
 	m.jobs[id] = job
+	if access != nil {
+		m.callerLeases[id] = &renderCallerLease{access: access, expires: m.now().Add(m.timeout)}
+	}
 	m.ownerOutstanding[owner]++
 	select {
 	case m.queue <- job:
@@ -522,11 +544,42 @@ func (m *renderJobManager) enqueue(owner string, spec renderJobSpec) (*renderJob
 		return job, nil
 	default:
 		delete(m.jobs, id)
+		delete(m.callerLeases, id)
 		m.ownerOutstanding[owner]--
 		m.mu.Unlock()
 		_ = m.store.removeJobDir(dir)
 		return nil, errRenderQueueFull
 	}
+}
+
+func (m *renderJobManager) setCallerLease(id string, access *PlexAccess, expires time.Time) error {
+	if id == "" || access == nil || expires.IsZero() {
+		return errors.New("caller render lease is invalid")
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.jobs[id]; !ok || m.stopped {
+		return errRenderNotFound
+	}
+	m.callerLeases[id] = &renderCallerLease{access: access, expires: expires}
+	return nil
+}
+
+func (m *renderJobManager) callerLease(id string) (*PlexAccess, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	lease, ok := m.callerLeases[id]
+	if !ok || !m.now().Before(lease.expires) {
+		delete(m.callerLeases, id)
+		return nil, false
+	}
+	return lease.access, true
+}
+
+func (m *renderJobManager) clearCallerLease(id string) {
+	m.mu.Lock()
+	delete(m.callerLeases, id)
+	m.mu.Unlock()
 }
 
 func (m *renderJobManager) worker() {
@@ -542,6 +595,9 @@ func (m *renderJobManager) worker() {
 		}
 		select {
 		case job := <-m.queue:
+			if job == nil {
+				continue
+			}
 			m.run(job)
 		case <-m.stop:
 			m.cancelQueued()
@@ -570,6 +626,7 @@ func (m *renderJobManager) cancelQueued() {
 		case job := <-m.queue:
 			m.mu.Lock()
 			delete(m.jobs, job.id)
+			delete(m.callerLeases, job.id)
 			if m.ownerOutstanding[job.ownerUUID] > 0 {
 				m.ownerOutstanding[job.ownerUUID]--
 			}
@@ -592,8 +649,32 @@ func (m *renderJobManager) run(job *renderJob) {
 	if m.execute == nil {
 		err = newRenderStageFailure("executor", "encoder_unavailable", errors.New("render executor is unavailable"))
 	} else {
+		if job.spec.CallerScoped {
+			access, ok := m.callerLease(job.id)
+			if !ok {
+				err = newRenderStageFailure("source", "source_unavailable", errors.New("caller render lease is unavailable"))
+			} else {
+				ctx = context.WithValue(ctx, renderCallerAccessContextKey{}, access)
+			}
+		}
+		if err != nil {
+			cancel()
+			public := publicRenderFailure(err)
+			job.mu.Lock()
+			job.state = renderFailed
+			job.failure = &public
+			job.updatedAt = m.now()
+			job.mu.Unlock()
+			m.mu.Lock()
+			if m.ownerOutstanding[job.ownerUUID] > 0 {
+				m.ownerOutstanding[job.ownerUUID]--
+			}
+			m.mu.Unlock()
+			return
+		}
 		err = m.execute(ctx, job.spec, filepath.Join(job.dir, "output.partial"))
 	}
+	defer m.clearCallerLease(job.id)
 	cancel()
 	if err == nil {
 		if shutdownErr := m.lifetime.Err(); shutdownErr != nil {
@@ -1042,10 +1123,15 @@ func (a *API) createRenderJob(ctx fiber.Ctx) error {
 	if err != nil {
 		return renderAPIErrorCode(ctx, http.StatusUnprocessableEntity, "validation_error", err.Error())
 	}
+	var callerAccess *PlexAccess
 	if userScoped {
-		spec.SourceToken = a.app.plexSourceToken(ctx.UserContext(), true)
+		callerAccess, _, err = a.app.callerPlexAccess(ctx.UserContext(), "")
+		if err != nil {
+			return renderAPIErrorCode(ctx, http.StatusServiceUnavailable, "source_unavailable", "caller Plex source is unavailable")
+		}
+		spec.CallerScoped = true
 	}
-	job, err := a.app.renderJobs.enqueue(user.Uuid, spec)
+	job, err := a.app.renderJobs.enqueueWithCallerLease(user.Uuid, spec, callerAccess)
 	if err != nil {
 		if errors.Is(err, errRenderQueueFull) || errors.Is(err, errRenderOwnerLimit) {
 			ctx.Set("Retry-After", "5")
@@ -1542,11 +1628,28 @@ func sessionValueMatchesID(value any, wanted int64) bool {
 }
 
 func (a *Application) executeRenderSpec(ctx context.Context, spec renderJobSpec, outputPartial string) error {
-	token := spec.SourceToken
-	if token == "" {
-		token = a.config.Plex.Token
+	callerScoped := false
+	var callerAccess *PlexAccess
+	if current := activeRenderCallerAccess(ctx); current != nil {
+		callerScoped = true
+		callerAccess = current
 	}
-	sourceURL := fmt.Sprintf("%s%s?X-Plex-Token=%s", a.config.Plex.Host, spec.PartKey, token)
+	sourceURL := ""
+	var capabilityRelease func()
+	if callerScoped {
+		var err error
+		proxy, err := a.ensureMediaProxy()
+		if err != nil {
+			return newRenderStageFailure("source", "source_unavailable", errors.New("Plex capability proxy is unavailable"))
+		}
+		sourceURL, capabilityRelease, err = proxy.IssueWithTTL(ctx, callerAccess, spec.PartKey, renderTimeout)
+		if err != nil {
+			return newRenderStageFailure("source", "source_unavailable", err)
+		}
+		defer capabilityRelease()
+	} else {
+		sourceURL = fmt.Sprintf("%s%s?X-Plex-Token=%s", a.config.Plex.Host, spec.PartKey, a.config.Plex.Token)
+	}
 	from := formatRenderTimestamp(spec.FromMs)
 	to := formatRenderTimestamp(spec.ToMs)
 	var subtitleFile string
@@ -1559,18 +1662,58 @@ func (a *Application) executeRenderSpec(ctx context.Context, spec renderJobSpec,
 				External:  true,
 			}
 			var err error
-			subtitleFile, err = a.prepareExternalSubtitleWithToken(ctx, source, spec.FromMs, spec.ToMs, []int64{spec.SubtitleOffsetMs}, token)
+			if callerScoped {
+				entries, downloadErr := a.downloadSubtitleWithAccess(ctx, source.StreamKey, subtitleSourceCodec(source), callerAccess, a.plexResources)
+				if downloadErr == nil {
+					subtitleFile, downloadErr = WriteClipSRT(entries, spec.FromMs, spec.ToMs, spec.SubtitleOffsetMs)
+					if errors.Is(downloadErr, ErrNoUsableSubtitleCues) {
+						subtitleFile, downloadErr = "", nil
+					}
+				}
+				err = downloadErr
+			} else {
+				subtitleFile, err = a.prepareExternalSubtitleWithToken(ctx, source, spec.FromMs, spec.ToMs, []int64{spec.SubtitleOffsetMs}, a.config.Plex.Token)
+			}
 			if err != nil {
-				return newRenderStageFailure("subtitle", "subtitle_unavailable", err)
+				if errors.Is(err, ErrNoUsableSubtitleCues) {
+					subtitleFile = ""
+				} else {
+					return newRenderStageFailure("subtitle", "subtitle_unavailable", err)
+				}
 			}
 		} else {
 			embeddedIndex := spec.SubtitleEmbeddedIndex
 			if embeddedIndex < 0 {
 				embeddedIndex = spec.SubtitleIndex
 			}
+			if callerScoped {
+				proxy, proxyErr := a.ensureMediaProxy()
+				if proxyErr != nil {
+					return newRenderStageFailure("subtitle", "subtitle_unavailable", proxyErr)
+				}
+				subtitleURL, releaseCapability, issueErr := proxy.IssueWithTTL(ctx, callerAccess, spec.PartKey, renderTimeout)
+				if issueErr != nil {
+					return newRenderStageFailure("subtitle", "subtitle_unavailable", issueErr)
+				}
+				var subtitleErr error
+				subtitleFile, subtitleErr = ExtractSubtitleContext(ctx, subtitleURL, from, to, embeddedIndex, spec.SubtitleOffsetMs)
+				releaseCapability()
+				if subtitleErr != nil {
+					if errors.Is(subtitleErr, ErrNoUsableSubtitleCues) {
+						subtitleFile = ""
+					} else {
+						return classifyRenderStageError("subtitle", subtitleErr)
+					}
+				}
+				goto subtitleReady
+			}
 			release, err := a.acquireFFmpeg(ctx)
 			if err != nil {
-				return classifyRenderStageError("subtitle", err)
+				if errors.Is(err, ErrNoUsableSubtitleCues) {
+					subtitleFile = ""
+				} else {
+					return classifyRenderStageError("subtitle", err)
+				}
 			}
 			subtitleFile, err = ExtractSubtitleContext(ctx, sourceURL, from, to, embeddedIndex, spec.SubtitleOffsetMs)
 			release()
@@ -1578,6 +1721,7 @@ func (a *Application) executeRenderSpec(ctx context.Context, spec renderJobSpec,
 				return classifyRenderStageError("subtitle", err)
 			}
 		}
+	subtitleReady:
 		defer os.Remove(subtitleFile)
 	}
 	params := FfmpegParams{

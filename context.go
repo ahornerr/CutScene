@@ -3,12 +3,22 @@ package main
 import "context"
 
 var (
-	ctxKeyAuthToken = &contextKey{"authToken"}
-	ctxKeyUser      = &contextKey{"user"}
+	ctxKeyAuthToken  = &contextKey{"authToken"}
+	ctxKeyUser       = &contextKey{"user"}
+	ctxKeyPlexAccess = &contextKey{"plexAccess"}
 )
 
 type contextKey struct {
 	name string
+}
+
+func PlexAccessFromContext(ctx context.Context) *PlexAccess {
+	value, _ := ctx.Value(ctxKeyPlexAccess).(*PlexAccess)
+	return value
+}
+
+func ContextWithPlexAccess(ctx context.Context, access *PlexAccess) context.Context {
+	return context.WithValue(ctx, ctxKeyPlexAccess, access)
 }
 
 func AuthTokenFromContext(ctx context.Context) *string {

@@ -1,0 +1,28 @@
+# NVIDIA embedding overlay. Use with docker-compose.yaml and
+# docker-compose.semantic-search.yaml, and do not combine with the AMD
+# overlay.
+services:
+  cutscene:
+    depends_on:
+      tei:
+        condition: service_healthy
+
+  tei:
+    # CUDA 86-1.9 is a sensible default for Ampere GPUs such as RTX 30-series
+    # cards and A10. Select a compatible TEI CUDA tag for another architecture.
+    image: ghcr.io/huggingface/text-embeddings-inference:86-1.9
+    command:
+      - --model-id
+      - BAAI/bge-base-en-v1.5
+      - --port
+      - "80"
+    gpus: all
+    environment:
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+    healthcheck:
+      test: ["CMD-SHELL", "curl --fail --silent http://localhost:80/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 30s

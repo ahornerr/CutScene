@@ -267,6 +267,18 @@
   position: relative;
 }
 
+/* Subtitle search is a compact editorial stack: each match reads as a small
+   cue card, with the dialogue line doing the visual work. */
+.cs-subtitle-search { max-width: 760px; margin-inline: auto; }
+.cs-subtitle-hit {
+  background: linear-gradient(110deg, rgba(255,115,0,.055), rgba(0,0,0,.16) 42%);
+  border-color: rgba(255,255,255,.1) !important;
+  transition: transform 180ms ease, border-color 180ms ease, box-shadow 180ms ease;
+}
+.cs-subtitle-hit:hover { transform: translateY(-2px); border-color: rgba(255,115,0,.42) !important; box-shadow: 0 15px 30px -24px rgba(0,0,0,.9); }
+.cs-subtitle-quote { font-family: Georgia, serif; font-size: 1.1rem; line-height: 1.55; color: #ffe8d0; }
+@media (prefers-reduced-motion: reduce) { .cs-subtitle-hit { transition: none; } .cs-subtitle-hit:hover { transform: none; } }
+
 @media (max-width: 899px) {
   /* The render grid item supplies the full scroll range; only its final
      decision control sticks, so all context and feedback stay in document flow. */
