@@ -36,6 +36,22 @@ const DEBOUNCE_MS = 300
 const MIN_QUERY_CHARS = 2
 const MAX_QUERY_RUNES = 128
 
+// A complete YouTube URL is treated as an external source; all other input
+// remains an ordinary Plex library query.
+export function isYouTubeUrl(value) {
+  if (typeof value !== 'string' || !value.trim()) return false
+  let url
+  try { url = new URL(value.trim()) } catch { return false }
+  if (!['http:', 'https:'].includes(url.protocol)) return false
+  const host = url.hostname.toLowerCase().replace(/^www\./, '')
+  if (host === 'youtu.be') return url.pathname.slice(1).split('/')[0].length > 0
+  if (!['youtube.com', 'm.youtube.com', 'youtube-nocookie.com'].includes(host)) return false
+  if (url.pathname === '/watch') return Boolean(url.searchParams.get('v'))
+  return ['/shorts/', '/embed/', '/live/'].some(prefix => (
+    url.pathname.startsWith(prefix) && url.pathname.slice(prefix.length).split('/')[0].length > 0
+  ))
+}
+
 function SearchIcon(props) {
   return (
     <svg viewBox="0 0 24 24" width="1em" height="1em" fill="none" stroke="currentColor"
@@ -59,6 +75,7 @@ export default function LibrarySearchPanel({
   // empty. The contracts (selection shape, polling, partId-free requests) are
   // unchanged; the panel only takes over presentation.
   sessions, sessionsLoading, sessionsError, onSelectSession, onRetrySessions,
+  onSelectExternalSource,
 }) {
   const [query, setQuery] = useState('')
   const [committed, setCommitted] = useState('') // debounced, min-length-gated
@@ -70,12 +87,17 @@ export default function LibrarySearchPanel({
   const [children, setChildren] = useState(null)
   const [hierarchyLoading, setHierarchyLoading] = useState(false)
   const [hierarchyError, setHierarchyError] = useState(null)
+  const [externalLoading, setExternalLoading] = useState(false)
+  const [externalError, setExternalError] = useState(null)
+  const [externalUrl, setExternalUrl] = useState('')
 
   const abortRef = useRef(null)
   const generationRef = useRef(0)
   const hierarchyAbortRef = useRef(null)
   const hierarchyGenerationRef = useRef(0)
   const backButtonRef = useRef(null)
+  const externalAbortRef = useRef(null)
+  const externalGenerationRef = useRef(0)
 
   // onAuthRequired arrives from App as an inline arrow (`() => setNeedsAuth(true)`),
   // so its identity changes on every parent render. Session polling on the home
@@ -90,6 +112,51 @@ export default function LibrarySearchPanel({
   // most recently.
   const onAuthRequiredRef = useRef(onAuthRequired)
   onAuthRequiredRef.current = onAuthRequired
+
+  const submitExternalSource = useCallback((url) => {
+    externalAbortRef.current?.abort()
+    const controller = new AbortController()
+    externalAbortRef.current = controller
+    const generation = ++externalGenerationRef.current
+    setExternalUrl(url)
+    setExternalLoading(true)
+    setExternalError(null)
+    setResults(null)
+    setCommitted('')
+    fetch('/media-sources', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({url}),
+      signal: controller.signal,
+    })
+      .then(async response => {
+        if (response.status === 401 || response.status === 403) {
+          onAuthRequiredRef.current?.()
+          const error = new Error('Authentication required.')
+          error.kind = 'auth'
+          throw error
+        }
+        if (!response.ok) {
+          const body = await response.json().catch(() => null)
+          const error = new Error(body?.error?.message || 'Couldn’t add this YouTube source.')
+          error.kind = response.status === 422 ? 'validation' : 'retryable'
+          throw error
+        }
+        return response.json()
+      })
+      .then(source => {
+        if (controller.signal.aborted || externalGenerationRef.current !== generation) return
+        onSelectExternalSource?.(source)
+      })
+      .catch(error => {
+        if (controller.signal.aborted || isAbortError(error) || externalGenerationRef.current !== generation) return
+        if (error?.kind === 'auth') return
+        setExternalError({kind: error?.kind || 'retryable', message: error?.message || 'Couldn’t add this YouTube source.'})
+      })
+      .finally(() => {
+        if (!controller.signal.aborted && externalGenerationRef.current === generation) setExternalLoading(false)
+      })
+  }, [onSelectExternalSource])
 
   // Immediately abort any in-flight search and invalidate its generation on
   // every raw input edit. The debounce effect below schedules a new committed
@@ -115,12 +182,18 @@ export default function LibrarySearchPanel({
       abortRef.current.abort()
       abortRef.current = null
     }
+    externalAbortRef.current?.abort()
+    externalAbortRef.current = null
     generationRef.current += 1
+    externalGenerationRef.current += 1
     setLoading(false)
     setResults(null)
     setError(null)
+    setExternalLoading(false)
+    setExternalError(null)
     resetHierarchy()
-  }, [query, resetHierarchy])
+    if (isYouTubeUrl(next)) submitExternalSource(next.trim())
+  }, [query, resetHierarchy, submitExternalSource])
 
   const loadChildren = useCallback((node, nextHierarchy) => {
     hierarchyAbortRef.current?.abort()
@@ -196,6 +269,10 @@ export default function LibrarySearchPanel({
   // query that the backend accepts at 128 runes.
   useEffect(() => {
     const trimmed = query.trim()
+    if (isYouTubeUrl(trimmed)) {
+      setCommitted('')
+      return
+    }
     const runeCount = [...trimmed].length
     if (runeCount === 0) {
       setCommitted('')
@@ -214,6 +291,11 @@ export default function LibrarySearchPanel({
     const t = setTimeout(() => setCommitted(trimmed), DEBOUNCE_MS)
     return () => clearTimeout(t)
   }, [query])
+
+  useEffect(() => () => {
+    externalAbortRef.current?.abort()
+    externalGenerationRef.current += 1
+  }, [])
 
   // Fire the search for the committed query. Aborts any in-flight request on
   // change/unmount so stale results can't commit.
@@ -309,13 +391,19 @@ export default function LibrarySearchPanel({
   const empty = showResults && results.length === 0
   const validationError = error?.kind === 'validation'
   const retryableError = error?.kind === 'retryable'
-  const searchOwnsRegion = searching || validationError || retryableError
+  const externalValidationError = externalError?.kind === 'validation'
+  const externalRetryableError = externalError?.kind === 'retryable'
+  const externalOwnsRegion = externalLoading || externalValidationError || externalRetryableError
+  const searchOwnsRegion = searching || validationError || retryableError || externalOwnsRegion
   const hierarchyActive = hierarchy.length > 0
 
   // One concise status line for the helper text. The full messages live in the
   // status region below; this is a compact visual cue kept distinct so
   // screen-reader users don't hear the same phrase twice.
   const helperText =
+    externalLoading ? 'Adding YouTube source…' :
+    externalValidationError ? 'Source is invalid.' :
+    externalRetryableError ? 'Source failed.' :
     searchLoading ? 'Searching…' :
     validationError ? 'Invalid search.' :
     retryableError ? 'Search failed.' :
@@ -340,7 +428,7 @@ export default function LibrarySearchPanel({
         value={query}
         onChange={handleQueryChange}
         disabled={disabled}
-        inputProps={{maxLength: MAX_QUERY_RUNES, 'aria-label': 'Search Plex library'}}
+        inputProps={{maxLength: isYouTubeUrl(query) ? undefined : MAX_QUERY_RUNES, 'aria-label': 'Search Plex library'}}
         InputProps={{
           startAdornment: <InputAdornment position="start"><SearchIcon sx={{color: 'text.secondary', fontSize: 18}}/></InputAdornment>,
           endAdornment: query ? (
@@ -371,11 +459,11 @@ export default function LibrarySearchPanel({
           getByRole('status'). */}
       <Box
         aria-live="polite"
-        aria-busy={(hierarchyActive ? hierarchyLoading : searchOwnsRegion ? searchLoading : sessionsLoading) || undefined}
+        aria-busy={(hierarchyActive ? hierarchyLoading : externalOwnsRegion ? externalLoading : searchOwnsRegion ? searchLoading : sessionsLoading) || undefined}
         aria-label="Plex library search status"
         sx={{minHeight: 160, position: 'relative'}}
       >
-        {searchLoading && !hierarchyActive && (
+        {(searchLoading || externalLoading) && !hierarchyActive && (
           <LinearProgress
             aria-hidden
             sx={{
@@ -437,6 +525,19 @@ export default function LibrarySearchPanel({
                 Try again
               </Box>
             }
+          />
+        )}
+
+        {!hierarchyActive && externalValidationError && (
+          <StateMessage variant="error" title={externalError.message} hint="Paste a complete YouTube video URL."/>
+        )}
+
+        {!hierarchyActive && externalRetryableError && (
+          <StateMessage
+            variant="error"
+            title="Couldn’t add this YouTube source."
+            hint={externalError.message}
+            action={<Button size="small" onClick={() => submitExternalSource(externalUrl)}>Try again</Button>}
           />
         )}
 

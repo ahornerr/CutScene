@@ -13,6 +13,13 @@ ffmpeg:
   # h264_nvenc requires Nvidia drivers, Docker GPU access, and the Nvidia
   # Container Toolkit. See README.md for the Docker GPU setup.
   codec: libx264
+youtube:
+  # yt-dlp must be installed in the host/container and executable by CutScene.
+  executable: yt-dlp
+  # Each source download is bounded by this command timeout and retained in
+  # transient storage for this long.
+  timeout: 15m
+  retention: 1h
 storage:
   # Durable clips, clips.sqlite3, and clip-token.key live below this root.
   # In the supplied Compose setup this is the mounted cutscene-data volume.

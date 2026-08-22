@@ -5,7 +5,9 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
+	"time"
 
 	"github.com/spf13/viper"
 )
@@ -23,6 +25,7 @@ type Config struct {
 		Codec       Codec `mapstructure:"codec"`
 		Concurrency int   `mapstructure:"concurrency"`
 	} `mapstructure:"ffmpeg"`
+	YouTube YouTubeConfig `mapstructure:"youtube"`
 	Storage struct {
 		// Root contains durable application data, including saved clips and the
 		// clip metadata database. It is deliberately separate from the transient
@@ -31,6 +34,12 @@ type Config struct {
 		Database string `mapstructure:"database"`
 	} `mapstructure:"storage"`
 	SemanticSearch SemanticSearchConfig `mapstructure:"semantic_search"`
+}
+
+type YouTubeConfig struct {
+	Executable string        `mapstructure:"executable"`
+	Timeout    time.Duration `mapstructure:"timeout"`
+	Retention  time.Duration `mapstructure:"retention"`
 }
 
 type SemanticSearchConfig struct {
@@ -47,6 +56,9 @@ func loadConfig() (*Config, error) {
 	viper.SetConfigName("config")
 	viper.AddConfigPath(".")
 	viper.SetDefault("ffmpeg.concurrency", defaultFFmpegConcurrency)
+	viper.SetDefault("youtube.executable", defaultYouTubeExecutable)
+	viper.SetDefault("youtube.timeout", defaultYouTubeTimeout)
+	viper.SetDefault("youtube.retention", defaultYouTubeRetention)
 	if err := viper.ReadInConfig(); err != nil {
 		return nil, fmt.Errorf("reading config file: %w", err)
 	}
@@ -55,6 +67,15 @@ func loadConfig() (*Config, error) {
 		return nil, fmt.Errorf("unmarshal config file: %w", err)
 	}
 	cfg.Ffmpeg.Concurrency = normalizeFFmpegConcurrency(cfg.Ffmpeg.Concurrency)
+	if strings.TrimSpace(cfg.YouTube.Executable) == "" {
+		cfg.YouTube.Executable = defaultYouTubeExecutable
+	}
+	if cfg.YouTube.Timeout <= 0 {
+		cfg.YouTube.Timeout = defaultYouTubeTimeout
+	}
+	if cfg.YouTube.Retention <= 0 {
+		cfg.YouTube.Retention = defaultYouTubeRetention
+	}
 	cfg.SemanticSearch.EmbeddingsProvider, err = normalizeEmbeddingsProvider(cfg.SemanticSearch.EmbeddingsProvider)
 	if err != nil {
 		return nil, fmt.Errorf("semantic_search.embeddings_provider: %w", err)

@@ -54,6 +54,7 @@ const (
 )
 
 type RenderJobCreateRequest struct {
+	ExternalSourceID string `json:"externalSourceId,omitempty"`
 	RatingKey        string `json:"ratingKey"`
 	MediaID          int64  `json:"mediaId"`
 	PartID           *int64 `json:"partId,omitempty"`
@@ -71,6 +72,10 @@ type RenderJobCreateRequest struct {
 
 type renderJobSpec struct {
 	OwnerUUID             string
+	ExternalSourceID      string
+	ExternalPath          string
+	ExternalDuration      int64
+	ExternalSourceType    string
 	SourceToken           string
 	CallerScoped          bool
 	RatingKey             string
@@ -1080,6 +1085,27 @@ func (a *API) createRenderJob(ctx fiber.Ctx) error {
 	if err := validateRenderJobRequestFields(request); err != nil {
 		return renderAPIErrorCode(ctx, http.StatusUnprocessableEntity, "validation_error", err.Error())
 	}
+	if request.ExternalSourceID != "" {
+		spec, err := a.app.validateExternalRenderJobRequest(request, *user)
+		if err != nil {
+			return renderAPIErrorCode(ctx, http.StatusUnprocessableEntity, "validation_error", err.Error())
+		}
+		job, err := a.app.renderJobs.enqueue(user.Uuid, spec)
+		if err != nil {
+			if errors.Is(err, errRenderQueueFull) || errors.Is(err, errRenderOwnerLimit) {
+				ctx.Set("Retry-After", "5")
+				return renderAPIError(ctx, http.StatusTooManyRequests, "render queue is busy")
+			}
+			ctx.Set("Retry-After", "5")
+			return renderAPIError(ctx, http.StatusServiceUnavailable, "render storage is unavailable")
+		}
+		result, _ := a.app.renderJobs.status(job.id, user.Uuid)
+		ctx.Status(http.StatusAccepted)
+		ctx.Set("Cache-Control", "no-store")
+		ctx.Set("Referrer-Policy", "no-referrer")
+		ctx.Set("Location", "/render-jobs/"+job.id)
+		return ctx.JSON(result)
+	}
 
 	var sessions []sessionMetadata
 	var selection previewSessionSelection
@@ -1521,11 +1547,17 @@ func validateRenderJobRequestWithMetadataAndItem(request RenderJobCreateRequest,
 }
 
 func validateRenderJobRequestFields(request RenderJobCreateRequest) error {
-	if request.RatingKey == "" || len(request.RatingKey) > 512 {
+	if request.ExternalSourceID == "" && (request.RatingKey == "" || len(request.RatingKey) > 512) {
 		return errors.New("ratingKey is invalid")
 	}
-	if request.MediaID <= 0 && request.PartID == nil {
+	if len(request.RatingKey) > 512 {
+		return errors.New("ratingKey is invalid")
+	}
+	if request.ExternalSourceID == "" && request.MediaID <= 0 && request.PartID == nil {
 		return errors.New("mediaId is invalid")
+	}
+	if request.ExternalSourceID != "" && len(request.ExternalSourceID) > 128 {
+		return errors.New("externalSourceId is invalid")
 	}
 	if request.PartID != nil && *request.PartID <= 0 {
 		return errors.New("partId is invalid")
@@ -1555,6 +1587,54 @@ func validateRenderJobRequestFields(request RenderJobCreateRequest) error {
 		return errors.New("qp is invalid")
 	}
 	return nil
+}
+
+func (a *Application) validateExternalRenderJobRequest(request RenderJobCreateRequest, user User) (renderJobSpec, error) {
+	if err := validateRenderJobRequestFields(request); err != nil {
+		return renderJobSpec{}, err
+	}
+	if user.Uuid == "" {
+		return renderJobSpec{}, errors.New("authenticated user is missing a stable id")
+	}
+	if a == nil || a.youtubeSources == nil {
+		return renderJobSpec{}, errors.New("external source is unavailable")
+	}
+	source, ok := a.youtubeSources.get(request.ExternalSourceID, user.Uuid)
+	if !ok {
+		return renderJobSpec{}, errors.New("external source is unavailable")
+	}
+	if request.RatingKey != "" && request.RatingKey != source.Response.RatingKey {
+		return renderJobSpec{}, errors.New("ratingKey does not match the external source")
+	}
+	if request.MediaID > 0 && request.MediaID != source.Response.MediaID {
+		return renderJobSpec{}, errors.New("mediaId does not match the external source")
+	}
+	if request.PartID != nil && *request.PartID != source.Response.PartID {
+		return renderJobSpec{}, errors.New("partId does not match the external source")
+	}
+	if request.SubtitleIndex >= 0 {
+		return renderJobSpec{}, errors.New("external sources do not provide Plex subtitles")
+	}
+	if source.Response.Duration > 0 && request.ToMs > source.Response.Duration {
+		return renderJobSpec{}, errors.New("requested range exceeds the selected media duration")
+	}
+	audioMode, err := parseAudioMode(string(request.AudioMode))
+	if err != nil {
+		return renderJobSpec{}, errors.New("audioMode is invalid")
+	}
+	height, err := resolveRequestRenderHeight(request, 0)
+	if err != nil {
+		return renderJobSpec{}, err
+	}
+	return renderJobSpec{
+		OwnerUUID: user.Uuid, ExternalSourceID: source.Response.SourceID, ExternalPath: source.Path,
+		ExternalDuration: source.Response.Duration, ExternalSourceType: source.Response.SourceType,
+		RatingKey: source.Response.RatingKey, MediaID: source.Response.MediaID, PartID: source.Response.PartID,
+		Title: source.Response.Title, FromMs: request.FromMs, ToMs: request.ToMs,
+		SubtitleIndex: -1, Resolution: normalizedRenderResolution(request), Height: height,
+		QP: request.QP, AudioMode: audioMode, ThumbnailURL: source.Response.Thumb,
+		MediaKind: source.Response.Type,
+	}, nil
 }
 
 func normalizedRenderResolution(request RenderJobCreateRequest) string {
@@ -1628,6 +1708,12 @@ func sessionValueMatchesID(value any, wanted int64) bool {
 }
 
 func (a *Application) executeRenderSpec(ctx context.Context, spec renderJobSpec, outputPartial string) error {
+	if spec.ExternalPath != "" {
+		info, err := os.Stat(spec.ExternalPath)
+		if err != nil || !info.Mode().IsRegular() || info.Size() == 0 {
+			return newRenderStageFailure("source", "source_unavailable", errors.New("external source is unavailable"))
+		}
+	}
 	callerScoped := false
 	var callerAccess *PlexAccess
 	if current := activeRenderCallerAccess(ctx); current != nil {
@@ -1636,7 +1722,9 @@ func (a *Application) executeRenderSpec(ctx context.Context, spec renderJobSpec,
 	}
 	sourceURL := ""
 	var capabilityRelease func()
-	if callerScoped {
+	if spec.ExternalPath != "" {
+		sourceURL = spec.ExternalPath
+	} else if callerScoped {
 		var err error
 		proxy, err := a.ensureMediaProxy()
 		if err != nil {
@@ -1746,7 +1834,11 @@ func (a *Application) executeRenderSpec(ctx context.Context, spec renderJobSpec,
 	if err != nil {
 		return classifyRenderStageError("encoder", err)
 	}
-	_, err = DoFfmpeg(params)
+	if a.ffmpegRunner != nil {
+		_, err = a.ffmpegRunner(params)
+	} else {
+		_, err = DoFfmpeg(params)
+	}
 	release()
 	if err != nil {
 		return classifyRenderError(err)

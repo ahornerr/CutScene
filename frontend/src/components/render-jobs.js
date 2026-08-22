@@ -113,6 +113,19 @@ export function audioModeLabel(value) {
 // requires partId to resolve an explicit library source, so a silent omission
 // would route the request through the wrong (session-based) path.
 export function buildRenderJobRequest(session, startPosition, endPosition, selectedSubtitle, audioMode, subtitleOffsetMs, resolution) {
+  if (session?._sourceType === 'youtube') {
+    const externalSourceId = normalizeExternalSourceId(session.sourceId)
+    if (externalSourceId == null) throw new Error('The selected YouTube source has an invalid source ID.')
+    return {
+      externalSourceId,
+      fromMs: startPosition,
+      toMs: endPosition,
+      subtitleIndex: selectedSubtitle,
+      audioMode: audioMode || AUDIO_MODES.STANDARD,
+      subtitleOffsetMs: clampSubtitleOffsetMs(subtitleOffsetMs),
+      resolution: resolution || RENDER_RESOLUTIONS.NATIVE,
+    }
+  }
   const mediaId = normalizeMediaId(session?.Media?.[0]?.Part?.[0]?.id)
   if (mediaId == null) throw new Error('The selected media part has an invalid media ID.')
   const body = {
@@ -135,6 +148,19 @@ export function buildRenderJobRequest(session, startPosition, endPosition, selec
 
 // Build a request body from an immutable submitted spec (for re-render).
 export function buildRenderJobRequestFromSpec(spec) {
+  if (spec?.sourceType === 'youtube') {
+    const externalSourceId = normalizeExternalSourceId(spec.externalSourceId)
+    if (externalSourceId == null) throw new Error('The submitted YouTube source has an invalid source ID.')
+    return {
+      externalSourceId,
+      fromMs: spec.fromMs,
+      toMs: spec.toMs,
+      subtitleIndex: spec.subtitleIndex,
+      audioMode: spec.audioMode || AUDIO_MODES.STANDARD,
+      subtitleOffsetMs: clampSubtitleOffsetMs(spec?.subtitleOffsetMs),
+      resolution: spec?.resolution || RENDER_RESOLUTIONS.NATIVE,
+    }
+  }
   const mediaId = normalizeMediaId(spec?.mediaId)
   if (mediaId == null) throw new Error('The submitted render job has an invalid media ID.')
   const body = {
@@ -165,6 +191,11 @@ export function normalizeMediaId(value) {
   if (value == null || (typeof value === 'string' && value.trim() === '')) return null
   const numeric = Number(value)
   return Number.isFinite(numeric) && Number.isInteger(numeric) ? numeric : null
+}
+
+export function normalizeExternalSourceId(value) {
+  if (value == null || String(value).trim() === '') return null
+  return String(value).trim()
 }
 
 // Like normalizeMediaId, but for the explicit library-source part id. Returns
@@ -213,6 +244,26 @@ export function isTransportError(error) {
 export function snapshotJobSpec(session, startPosition, endPosition, selectedSubtitle, streams, audioMode, subtitleOffsetMs, resolution) {
   const stream = selectedSubtitle >= 0 ? streams.find(s => s.index === selectedSubtitle) : null
   const offsetMs = clampSubtitleOffsetMs(subtitleOffsetMs)
+  if (session?._sourceType === 'youtube') {
+    return {
+      externalSourceId: normalizeExternalSourceId(session.sourceId),
+      sourceType: 'youtube',
+      title: session.title || '',
+      fromMs: startPosition,
+      toMs: endPosition,
+      subtitleIndex: selectedSubtitle,
+      subtitleLabel: stream
+        ? (stream.language
+            ? `${stream.language} (${stream.displayTitle || 'Track ' + (stream.index + 1)})`
+            : stream.displayTitle || 'Track ' + (stream.index + 1))
+        : 'None',
+      clipDuration: Math.max(0, endPosition - startPosition),
+      audioMode: audioMode || AUDIO_MODES.STANDARD,
+      subtitleOffsetMs: offsetMs,
+      subtitleOffsetLabel: `Offset ${formatSubtitleOffsetMs(offsetMs)}`,
+      resolution: resolution || RENDER_RESOLUTIONS.NATIVE,
+    }
+  }
   return {
     ratingKey: session.ratingKey,
     mediaId: normalizeMediaId(session?.Media?.[0]?.Part?.[0]?.id),

@@ -2,12 +2,14 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log"
+	"mime"
 	"net/http"
 	"net/url"
 	"os"
@@ -77,6 +79,8 @@ func NewAPI(config Config, app *Application) (*API, error) {
 	api.http.Get("/sessions", api.getSessions, api.authMiddleware)
 	api.http.Get("/library/search", api.searchLibrary, api.authMiddlewareJSON)
 	api.http.Get("/library/source/:ratingKey", api.getLibrarySource, api.authMiddlewareJSON)
+	api.http.Post("/media-sources", api.createMediaSource, api.authMiddlewareJSON)
+	api.http.Get("/media-sources/:sourceId", api.getMediaSource, api.authMiddlewareJSON)
 	api.http.Get("/library/metadata/:ratingKey/children", api.getLibraryMetadataChildren, api.authMiddlewareJSON)
 	api.http.Get("/thumb", api.thumb, api.authMiddleware)
 	api.http.Get("/streams/:ratingKey", api.getStreams, api.authMiddleware)
@@ -103,6 +107,72 @@ func NewAPI(config Config, app *Application) (*API, error) {
 	api.http.Get("/*", static.New("./frontend/build"))
 
 	return api, nil
+}
+
+type mediaSourceCreateRequest struct {
+	URL string `json:"url"`
+}
+
+func decodeMediaSourceCreateRequest(body []byte) (mediaSourceCreateRequest, error) {
+	var request mediaSourceCreateRequest
+	decoder := json.NewDecoder(bytes.NewReader(body))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&request); err != nil {
+		return mediaSourceCreateRequest{}, err
+	}
+	var extra any
+	if err := decoder.Decode(&extra); err != io.EOF {
+		return mediaSourceCreateRequest{}, errors.New("trailing JSON")
+	}
+	if strings.TrimSpace(request.URL) == "" {
+		return mediaSourceCreateRequest{}, errors.New("url is required")
+	}
+	return request, nil
+}
+
+func (a *API) createMediaSource(ctx fiber.Ctx) error {
+	user := UserFromContext(ctx.UserContext())
+	if user == nil || strings.TrimSpace(user.Uuid) == "" {
+		return renderAPIError(ctx, http.StatusUnauthorized, "authentication required")
+	}
+	contentType, _, err := mime.ParseMediaType(ctx.Get("Content-Type"))
+	if err != nil || strings.ToLower(contentType) != "application/json" {
+		return renderAPIError(ctx, http.StatusUnsupportedMediaType, "content type must be application/json")
+	}
+	request, err := decodeMediaSourceCreateRequest(ctx.Body())
+	if err != nil {
+		return renderAPIErrorCode(ctx, http.StatusUnprocessableEntity, "validation_error", "invalid media source request")
+	}
+	response, err := a.app.ingestYouTubeSource(ctx.UserContext(), user.Uuid, request.URL)
+	if err != nil {
+		var validationErr *sourceValidationError
+		if errors.As(err, &validationErr) {
+			return renderAPIErrorCode(ctx, http.StatusUnprocessableEntity, "validation_error", validationErr.Error())
+		}
+		log.Printf("YouTube source ingestion failed: %s", redactedDiagnostic(err))
+		ctx.Set("Retry-After", "5")
+		return renderAPIErrorCode(ctx, http.StatusServiceUnavailable, "source_unavailable", "could not ingest the YouTube source")
+	}
+	ctx.Status(http.StatusCreated)
+	ctx.Set("Cache-Control", "no-store")
+	ctx.Set("Location", "/media-sources/"+response.SourceID)
+	return ctx.JSON(response)
+}
+
+func (a *API) getMediaSource(ctx fiber.Ctx) error {
+	user := UserFromContext(ctx.UserContext())
+	if user == nil || strings.TrimSpace(user.Uuid) == "" {
+		return renderAPIError(ctx, http.StatusUnauthorized, "authentication required")
+	}
+	if a.app == nil || a.app.youtubeSources == nil {
+		return renderAPIErrorCode(ctx, http.StatusNotFound, "not_found", "media source not found")
+	}
+	source, ok := a.app.youtubeSources.get(ctx.Params("sourceId"), user.Uuid)
+	if !ok {
+		return renderAPIErrorCode(ctx, http.StatusNotFound, "not_found", "media source not found")
+	}
+	ctx.Set("Cache-Control", "no-store")
+	return ctx.JSON(source.Response)
 }
 
 func (a *API) indexSubtitleSearch(ctx fiber.Ctx) error {

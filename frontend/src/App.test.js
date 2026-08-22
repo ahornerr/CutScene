@@ -3,7 +3,8 @@ import {act, fireEvent, render, screen, waitFor} from '@testing-library/react';
 import App from './App';
 import TrimScrubber from './components/TrimScrubber';
 import {renderSubtitleMarkup, stripSubtitleMarkup} from './components/subtitle-markup';
-import {getAvailableResolutionChoices, getSafeResolution, formatJobSpec, RENDER_RESOLUTIONS} from './components/render-jobs';
+import {getAvailableResolutionChoices, getSafeResolution, formatJobSpec, RENDER_RESOLUTIONS, buildRenderJobRequest} from './components/render-jobs';
+import {isYouTubeUrl} from './components/LibrarySearchPanel';
 
 const mockPlayerUrls = [];
 
@@ -2059,6 +2060,62 @@ test('library search debounces the query and does not fire below the 2-character
   const searchReq = librarySearchRequest(pending);
   expect(searchReq).toBeDefined();
   expect(decodeURIComponent(searchReq.url)).toBe('/library/search?query=Al');
+});
+
+test('YouTube detection is strict while ordinary text remains a library query', () => {
+  expect(isYouTubeUrl('https://www.youtube.com/watch?v=abc123')).toBe(true);
+  expect(isYouTubeUrl('https://youtu.be/abc123?t=30')).toBe(true);
+  expect(isYouTubeUrl('https://www.youtube.com/watch')).toBe(false);
+  expect(isYouTubeUrl('watch this video')).toBe(false);
+});
+
+test('a complete YouTube URL submits through the existing library search input', async () => {
+  const pending = installFetch();
+  render(<App/>);
+  await flush();
+
+  fireEvent.change(screen.getByRole('textbox', {name: 'Search Plex library'}), {
+    target: {value: 'https://www.youtube.com/watch?v=external-123'},
+  });
+  const createRequest = requestFor(pending, url => url === '/media-sources');
+  expect(createRequest.options.method).toBe('POST');
+  expect(JSON.parse(createRequest.options.body)).toEqual({url: 'https://www.youtube.com/watch?v=external-123'});
+  expect(screen.getByText('Adding YouTube source…')).toBeInTheDocument();
+
+  await resolveRequest(createRequest, {
+    sourceId: 'external-123', title: 'External video', duration: 90000, thumb: '/thumb/external-123',
+    _sourceType: 'youtube',
+  });
+  expect(window.location.hash).toBe('#/workspace/youtube/external-123');
+  expect(screen.getByText('External video')).toBeInTheDocument();
+  expect(pending.some(request => request.url.startsWith('/library/search'))).toBe(false);
+});
+
+test('an external workspace deep link hydrates only through media-sources', async () => {
+  window.history.replaceState(null, '', '#/workspace/youtube/external-456');
+  const {sessionRequests, pending} = installTrackedSessionsFetch();
+  render(<App/>);
+  await flush();
+
+  const sourceRequest = requestFor(pending, url => url === '/media-sources/external-456');
+  expect(sessionRequests).toHaveLength(0);
+  await resolveRequest(sourceRequest, {
+    sourceId: 'external-456', title: 'Hydrated video', duration: 120000, thumb: '',
+    _sourceType: 'youtube',
+  });
+  expect(screen.getByText('Hydrated video')).toBeInTheDocument();
+  expect(pending.some(request => request.url.startsWith('/library/source'))).toBe(false);
+  expect(window.location.hash).toBe('#/workspace/youtube/external-456');
+});
+
+test('external render payload uses sourceId instead of Plex identifiers', () => {
+  expect(buildRenderJobRequest({
+    sourceId: 'external-789', _sourceType: 'youtube', ratingKey: 'ignored',
+    Media: [{Part: [{id: 'ignored'}]}],
+  }, 1000, 5000, -1, 'standard', 0, 'source-native')).toEqual({
+    externalSourceId: 'external-789', fromMs: 1000, toMs: 5000, subtitleIndex: -1,
+    audioMode: 'standard', subtitleOffsetMs: 0, resolution: 'source-native',
+  });
 });
 
 test('library search shows loading, then results with title, context, year, duration, and quality', async () => {
