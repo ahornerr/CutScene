@@ -211,6 +211,9 @@ type Application struct {
 	ownerUUID         string
 	subtitleCache     *subtitleCache
 	ffmpegLimiter     *ffmpegLimiter
+	youtubeSources    *youtubeSourceRegistry
+	youtubeRunner     youtubeCommandRunner
+	ffmpegRunner      func(FfmpegParams) (string, error)
 	subtitleBulkGate  chan struct{}
 	renderJobs        *renderJobManager
 	clipStore         *clipStore
@@ -238,6 +241,7 @@ func NewApplication(config Config) (*Application, error) {
 		),
 		subtitleCache:    newSubtitleCache(128),
 		ffmpegLimiter:    newFFmpegLimiter(config.Ffmpeg.Concurrency),
+		youtubeSources:   newYouTubeSourceRegistry(lifetime, config.YouTube.Retention),
 		subtitleBulkGate: make(chan struct{}, bulkGateCapacity),
 		lifetime:         lifetime,
 		cancelLifetime:   cancelLifetime,
@@ -363,6 +367,9 @@ func (a *Application) Close() error {
 			if err := a.mediaProxy.Close(); err != nil && a.closeErr == nil {
 				a.closeErr = err
 			}
+		}
+		if a.youtubeSources != nil {
+			a.youtubeSources.close()
 		}
 	})
 	return a.closeErr

@@ -96,6 +96,14 @@ BASE=http://127.0.0.1:8080
 curl -sS -b "$COOKIE" "$BASE/sessions"
 ```
 
+### YouTube sources
+
+Install `yt-dlp` in the CutScene host or container and set `youtube.executable`
+when it is not on `PATH`. `POST /media-sources` accepts one HTTPS YouTube video
+URL, downloads it into expiring transient storage, and returns a `sourceId`.
+Use that ID in a render request as `externalSourceId`; external sources are
+owned by the authenticated user and are never resolved through Plex.
+
 Use an active session's `ratingKey` and media/part ID as `mediaId` to create a job. The request must be JSON:
 
 ```sh

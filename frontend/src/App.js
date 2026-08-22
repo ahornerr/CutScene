@@ -46,6 +46,28 @@ function libraryResultToSession(result) {
   }
 }
 
+// External media uses the same workspace/session shape as Plex so the existing
+// trim, subtitle, preview, and player components can be reused. Render request
+// construction still keys off _sourceType and sends sourceId as an external ID.
+function externalSourceToSession(source) {
+  const sourceId = source?.sourceId == null ? '' : String(source.sourceId).trim()
+  if (!sourceId) return null
+  return {
+    ...source,
+    sourceId,
+    title: source.title || 'YouTube video',
+    type: source.type || 'movie',
+    duration: Number(source.duration) || 0,
+    viewOffset: 0,
+    thumb: source.thumb || source.artwork || '',
+    // Compatibility fields for the existing workspace data flow. They are not
+    // used by the external render request, which deliberately omits Plex IDs.
+    ratingKey: source.ratingKey || `youtube:${sourceId}`,
+    Media: source.Media || [{Part: [{id: String(source.mediaId || sourceId)}]}],
+    _sourceType: 'youtube',
+  }
+}
+
 // Build the optional `&partId=` query segment for explicit library sources.
 // Active sessions return null here so the legacy request shape is preserved.
 function partIdParam(session) {
@@ -89,6 +111,17 @@ function viewFromHash(hash) {
   if (hash === '#/clips') return {name: 'library'}
   if (hash === '#/subtitle-search') return {name: 'subtitleSearch'}
 
+  const externalWorkspaceMatch = hash.match(/^#\/workspace\/(youtube|external)\/([^/?#]+)$/)
+  if (externalWorkspaceMatch) {
+    try {
+      const sourceId = decodeURIComponent(externalWorkspaceMatch[2])
+      if (sourceId) return {name: 'workspace', sourceType: externalWorkspaceMatch[1] === 'youtube' ? 'youtube' : 'external', sourceId}
+    } catch {
+      // Fall through to the canonical home route for malformed escapes.
+    }
+    return {name: 'home'}
+  }
+
   const workspaceMatch = hash.match(/^#\/workspace\/([^/?#]+)\?mediaId=([1-9]\d*)(?:&partId=([1-9]\d*))?$/)
   if (workspaceMatch) {
     try {
@@ -125,6 +158,9 @@ function hashForView(view) {
   if (view.name === 'library') return '#/clips'
   if (view.name === 'subtitleSearch') return '#/subtitle-search'
   if (view.name === 'clip' && view.clipId) return `#/clips/${encodeURIComponent(view.clipId)}`
+  if (view.name === 'workspace' && view.sourceId) {
+    return `#/workspace/${view.sourceType === 'youtube' ? 'youtube' : 'external'}/${encodeURIComponent(view.sourceId)}`
+  }
   if (view.name === 'workspace' && view.ratingKey && isPositiveSafeInteger(view.mediaId)) {
     const partParam = view.partId != null && isPositiveSafeInteger(view.partId) ? `&partId=${view.partId}` : ''
     return `#/workspace/${encodeURIComponent(view.ratingKey)}?mediaId=${view.mediaId}${partParam}`
@@ -133,6 +169,10 @@ function hashForView(view) {
 }
 
 function workspaceViewForSession(session) {
+  if (session?._sourceType === 'youtube') {
+    const sourceId = String(session.sourceId || '').trim()
+    return sourceId ? {name: 'workspace', sourceType: 'youtube', sourceId} : null
+  }
   const ratingKey = session?.ratingKey
   const mediaId = Number(session?.Media?.[0]?.Part?.[0]?.id)
   if (typeof ratingKey !== 'string' || !ratingKey || !isPositiveSafeInteger(mediaId)) return null
@@ -146,6 +186,9 @@ function workspaceViewForSession(session) {
 }
 
 function sessionMatchesWorkspace(session, workspace) {
+  if (workspace?.sourceId) {
+    return session?._sourceType === 'youtube' && String(session.sourceId) === String(workspace.sourceId)
+  }
   if (!session || !workspace || String(session.ratingKey) !== workspace.ratingKey) return false
   const mediaId = Number(session?.Media?.[0]?.Part?.[0]?.id)
   if (mediaId !== workspace.mediaId) return false
@@ -1124,6 +1167,21 @@ const handleSelectLibraryResult = useCallback((result) => {
   navigateTo(workspaceViewForSession(session))
 }, [navigateTo, stopSessionRefresh])
 
+const handleSelectExternalSource = useCallback((result) => {
+  const source = externalSourceToSession(result?.source || result)
+  if (!source) {
+    console.warn('Rejected malformed external source:', result)
+    return
+  }
+  stopSessionRefresh()
+  setSelectedSubtitle(-1)
+  setSubtitleEntries([])
+  setSubtitlesLoading(false)
+  setSubtitlesError(null)
+  setSelectedSession(source)
+  navigateTo(workspaceViewForSession(source))
+}, [navigateTo, stopSessionRefresh])
+
 // Stable auth-required handler for the library search panel. setNeedsAuth is
 // stable (useState setter), so this callback keeps a stable identity across
 // session-poll re-renders — paired with the panel's ref capture it guarantees
@@ -1135,25 +1193,37 @@ const handleLibraryAuthRequired = useCallback(() => setNeedsAuth(true), [])
   // state intentionally stay in React state rather than becoming shareable
   // URL state. Reuse an already-selected matching source when navigating back
   // to a workspace; otherwise hydrate it from the authoritative backend lane.
+  const hydrationViewName = view.name
+  const hydrationViewSourceId = view.sourceId
+  const hydrationViewRatingKey = view.ratingKey
+  const hydrationViewMediaId = view.mediaId
+  const hydrationViewPartId = view.partId
   useEffect(() => {
     workspaceHydrationControllerRef.current?.abort()
     workspaceHydrationControllerRef.current = null
+    const hydrationView = {
+      name: hydrationViewName,
+      sourceId: hydrationViewSourceId,
+      ratingKey: hydrationViewRatingKey,
+      mediaId: hydrationViewMediaId,
+      partId: hydrationViewPartId,
+    }
 
-    if (view.name !== 'workspace') return undefined
+    if (hydrationView.name !== 'workspace') return undefined
     if (
       activeJobRef.current &&
       selectedSession &&
-      !sessionMatchesWorkspace(selectedSession, view)
+      !sessionMatchesWorkspace(selectedSession, hydrationView)
     ) {
       const canonicalView = workspaceViewForSession(selectedSession)
       if (canonicalView) navigateTo(canonicalView, true)
       return undefined
     }
-    if (selectedSession && sessionMatchesWorkspace(selectedSession, view)) {
+    if (selectedSession && sessionMatchesWorkspace(selectedSession, hydrationView)) {
       stopSessionRefresh()
       return undefined
     }
-    if (selectedSession && !sessionMatchesWorkspace(selectedSession, view)) {
+    if (selectedSession && !sessionMatchesWorkspace(selectedSession, hydrationView)) {
       // Clear source-bound subtitle state before the hydrated source is
       // installed. This prevents the subtitle effect from combining the new
       // route with the previous session's selected track for one render.
@@ -1181,13 +1251,25 @@ const handleLibraryAuthRequired = useCallback(() => setNeedsAuth(true), [])
     const hydrate = async () => {
       try {
         let session
-        if (view.partId == null) {
+        if (hydrationView.sourceId) {
+          const response = await fetch(`/media-sources/${encodeURIComponent(hydrationView.sourceId)}`, {redirect: 'manual', signal: controller.signal})
+          if (response.type === 'opaqueredirect' || response.status === 401 || response.status === 403) {
+            throw authRequiredError()
+          }
+          if (!response.ok) throw new Error(`Could not load this external source (${response.status}).`)
+          const result = await response.json()
+          if (!result || String(result.sourceId) !== String(hydrationView.sourceId)) {
+            throw new Error('The requested external source is no longer available.')
+          }
+          session = externalSourceToSession(result)
+          if (!session) throw new Error('The requested external source is malformed.')
+        } else if (hydrationView.partId == null) {
           const liveSessions = await fetchWorkspaceSessions(controller.signal)
-          session = liveSessions.find(candidate => sessionMatchesWorkspace(candidate, view))
+          session = liveSessions.find(candidate => sessionMatchesWorkspace(candidate, hydrationView))
           if (!session) throw new Error('The active session is no longer available.')
         } else {
           const response = await fetch(
-            `/library/source/${encodeURIComponent(view.ratingKey)}?mediaId=${view.mediaId}&partId=${view.partId}`,
+            `/library/source/${encodeURIComponent(hydrationView.ratingKey)}?mediaId=${hydrationView.mediaId}&partId=${hydrationView.partId}`,
             {redirect: 'manual', signal: controller.signal}
           )
           if (response.type === 'opaqueredirect' || response.status === 401 || response.status === 403) {
@@ -1198,9 +1280,9 @@ const handleLibraryAuthRequired = useCallback(() => setNeedsAuth(true), [])
           const validationError = validateLibraryResult(result)
           if (validationError) throw new Error(validationError)
           if (
-            String(result.ratingKey) !== view.ratingKey ||
-            Number(result.mediaId) !== view.mediaId ||
-            Number(result.partId) !== view.partId
+            String(result.ratingKey) !== hydrationView.ratingKey ||
+            Number(result.mediaId) !== hydrationView.mediaId ||
+            Number(result.partId) !== hydrationView.partId
           ) {
             throw new Error('The requested library source is no longer available.')
           }
@@ -1229,7 +1311,7 @@ const handleLibraryAuthRequired = useCallback(() => setNeedsAuth(true), [])
     }
   }, [
     navigateTo, selectedSession, stopSessionRefresh,
-    view.name, view.ratingKey, view.mediaId, view.partId,
+    hydrationViewName, hydrationViewRatingKey, hydrationViewMediaId, hydrationViewPartId, hydrationViewSourceId,
   ])
 
   // ---------------------------------------------------------------- clip library navigation
@@ -1369,6 +1451,7 @@ const handleLibraryAuthRequired = useCallback(() => setNeedsAuth(true), [])
               </Box>
               <LibrarySearchPanel
                 onSelect={handleSelectLibraryResult}
+                onSelectExternalSource={handleSelectExternalSource}
                 selectedKey={selectedSession?.ratingKey}
                 onAuthRequired={handleLibraryAuthRequired}
                 sessions={sessions}
