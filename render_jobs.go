@@ -77,6 +77,7 @@ type renderJobSpec struct {
 	MediaID               int64
 	PartID                int64
 	PartKey               string
+	PartFile              string // resolved local filesystem path, empty if not available
 	Title                 string
 	FromMs                int64
 	ToMs                  int64
@@ -1085,6 +1086,7 @@ func (a *API) createRenderJob(ctx fiber.Ctx) error {
 	var selection previewSessionSelection
 	userScoped := request.PartID != nil
 	var metadataItem *components.Metadata
+	var resolvedPart *components.Part
 	if userScoped {
 		metadataItem, err = a.app.getMetadataItem(ctx.UserContext(), request.RatingKey, true)
 		if err == nil {
@@ -1092,6 +1094,7 @@ func (a *API) createRenderJob(ctx fiber.Ctx) error {
 			if sourceErr != nil {
 				err = sourceErr
 			} else {
+				resolvedPart = part
 				selection = previewSessionSelection{mediaID: media.ID, partID: part.ID, duration: mediaDurationFromSource(media, part), selected: part.ID}
 			}
 		}
@@ -1122,6 +1125,22 @@ func (a *API) createRenderJob(ctx fiber.Ctx) error {
 	spec, err := validateRenderJobRequestWithMetadataAndItem(request, *user, sessions, metadataItem.Media, selection, metadataItem)
 	if err != nil {
 		return renderAPIErrorCode(ctx, http.StatusUnprocessableEntity, "validation_error", err.Error())
+	}
+	// Populate the local filesystem path so the render worker can bypass Plex
+	// HTTP streaming when the media file is directly accessible on disk.
+	if resolvedPart != nil {
+		spec.PartFile, _ = a.app.resolveLocalPartFile(resolvedPart)
+	} else {
+		// Session path: find the matching part by ID in the session list.
+		for _, session := range sessions {
+			for _, media := range session.Media {
+				for _, part := range media.Part {
+					if sessionValueMatchesID(part.ID, spec.PartID) {
+						spec.PartFile, _ = a.app.resolveLocalSessionPartFile(part.File)
+					}
+				}
+			}
+		}
 	}
 	var callerAccess *PlexAccess
 	if userScoped {
@@ -1649,6 +1668,11 @@ func (a *Application) executeRenderSpec(ctx context.Context, spec renderJobSpec,
 		defer capabilityRelease()
 	} else {
 		sourceURL = fmt.Sprintf("%s%s?X-Plex-Token=%s", a.config.Plex.Host, spec.PartKey, a.config.Plex.Token)
+	}
+	// Prefer the local filesystem path over a Plex HTTP URL when available.
+	// configureFFmpegHTTPRecovery is a no-op for local paths so no cleanup is needed.
+	if spec.PartFile != "" {
+		sourceURL = spec.PartFile
 	}
 	from := formatRenderTimestamp(spec.FromMs)
 	to := formatRenderTimestamp(spec.ToMs)

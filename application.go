@@ -1324,15 +1324,15 @@ func (a *Application) GetSubtitleEntriesForSource(ctx context.Context, ratingKey
 	return entries, nil
 }
 
-// resolveLocalPartFile attempts to resolve a local filesystem path for part,
-// applying any configured path mappings. If the resolved path exists as a regular
-// file on disk, it returns the path and true, allowing FFmpeg to read directly
-// from disk rather than streaming over HTTP.
-func (a *Application) resolveLocalPartFile(part *components.Part) (string, bool) {
-	if part == nil || part.File == nil || strings.TrimSpace(*part.File) == "" {
+// resolveLocalRawPath applies any configured path mappings to rawPath and
+// returns the resolved candidate. It stat-checks the candidate first, then
+// falls back to the unmapped rawPath if a mapping was applied. Returns the
+// accessible local path and true when a regular file is found.
+func (a *Application) resolveLocalRawPath(rawPath string) (string, bool) {
+	if strings.TrimSpace(rawPath) == "" {
 		return "", false
 	}
-	rawPath := strings.TrimSpace(*part.File)
+	rawPath = strings.TrimSpace(rawPath)
 	candidate := rawPath
 	if len(a.config.Plex.PathMappings) > 0 {
 		prefixes := make([]string, 0, len(a.config.Plex.PathMappings))
@@ -1364,6 +1364,24 @@ func (a *Application) resolveLocalPartFile(part *components.Part) (string, bool)
 		}
 	}
 	return "", false
+}
+
+// resolveLocalPartFile attempts to resolve a local filesystem path for part,
+// applying any configured path mappings. If the resolved path exists as a regular
+// file on disk, it returns the path and true, allowing FFmpeg to read directly
+// from disk rather than streaming over HTTP.
+func (a *Application) resolveLocalPartFile(part *components.Part) (string, bool) {
+	if part == nil || part.File == nil {
+		return "", false
+	}
+	return a.resolveLocalRawPath(*part.File)
+}
+
+// resolveLocalSessionPartFile is the session-metadata counterpart to
+// resolveLocalPartFile. sessionPart.File is a plain string (not a pointer),
+// so this convenience wrapper handles the nil-like empty-string check.
+func (a *Application) resolveLocalSessionPartFile(file string) (string, bool) {
+	return a.resolveLocalRawPath(file)
 }
 
 func (a *Application) downloadSubtitle(ctx context.Context, streamKey, codec string) ([]SubtitleEntry, error) {
