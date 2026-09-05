@@ -415,7 +415,7 @@ func (a *API) Shutdown() error {
 func (a *API) getSessions(ctx fiber.Ctx) error {
 	sessions, err := a.app.GetSessions(ctx.UserContext())
 	if err != nil {
-		return err
+		return renderAPIErrorCode(ctx, http.StatusServiceUnavailable, "sessions_unavailable", "could not retrieve active sessions")
 	}
 
 	return ctx.JSON(sessions)
@@ -609,7 +609,7 @@ func renderSourceAPIError(ctx fiber.Ctx, err error) error {
 func (a *API) getSubtitleEntries(ctx fiber.Ctx) error {
 	ratingKeyStr := ctx.Params("ratingKey")
 	if ratingKeyStr == "" || len(ratingKeyStr) > 512 {
-		return fmt.Errorf("ratingKey not specified")
+		return renderAPIErrorCode(ctx, http.StatusUnprocessableEntity, "validation_error", "ratingKey is required")
 	}
 
 	mediaIdStr := ctx.Query("mediaId")
@@ -621,7 +621,7 @@ func (a *API) getSubtitleEntries(ctx fiber.Ctx) error {
 	subtitleIndexStr := ctx.Query("subtitle", "-1")
 	subtitleIndex, err := strconv.Atoi(subtitleIndexStr)
 	if err != nil {
-		return fmt.Errorf("subtitle not an integer")
+		return renderAPIErrorCode(ctx, http.StatusUnprocessableEntity, "validation_error", "subtitle not an integer")
 	}
 
 	if subtitleIndex < 0 {
@@ -688,13 +688,16 @@ func (a *API) clip(ctx fiber.Ctx) error {
 
 func (a *API) thumb(ctx fiber.Ctx) error {
 	path := ctx.Query("path")
-	if path == "" {
-		return fmt.Errorf("path not specified")
+	if strings.TrimSpace(path) == "" {
+		return renderAPIErrorCode(ctx, http.StatusBadRequest, "validation_error", "path is required")
 	}
 
 	respBody, contentType, err := a.app.Thumb(ctx.UserContext(), path)
 	if err != nil {
-		return err
+		if errors.Is(err, errThumbValidation) {
+			return renderAPIErrorCode(ctx, http.StatusBadRequest, "validation_error", err.Error())
+		}
+		return renderAPIErrorCode(ctx, http.StatusServiceUnavailable, "thumbnail_unavailable", "thumbnail is unavailable")
 	}
 
 	defer respBody.Close()
@@ -1371,7 +1374,7 @@ func plexGetPin(ctx context.Context, product string, strong bool, clientID strin
 	req.Header.Set("X-Plex-Product", product)
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := plexTVHTTPClient.Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -1408,7 +1411,7 @@ func plexGetToken(ctx context.Context, pinID int64, clientID string) (*plexToken
 	}
 	req.Header.Set("X-Plex-Client-Identifier", clientID)
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := plexTVHTTPClient.Do(req)
 	if err != nil {
 		return nil, err
 	}

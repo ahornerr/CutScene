@@ -263,10 +263,6 @@ func NewApplication(config Config) (*Application, error) {
 			return nil, searchErr
 		}
 		app.subtitleSearch = searchStore
-		if err := app.subtitleJobs.recoverPersistedJobs(); err != nil {
-			app.subtitleSearch.close()
-			return nil, err
-		}
 	}
 
 	identity, err := app.plexAdmin.General.GetIdentity(context.Background())
@@ -280,6 +276,13 @@ func NewApplication(config Config) (*Application, error) {
 	// remains usable, while untrusted advertised alternatives remain rejected.
 	if err := app.plexResources.DiscoverTrustedOrigins(context.Background(), config.Plex.Token, app.machineIdentifier); err != nil {
 		log.Printf("Plex trusted-origin discovery unavailable: %s", redactedDiagnostic(err))
+	}
+
+	if config.SemanticSearch.Enabled {
+		if err := app.subtitleJobs.recoverPersistedJobs(); err != nil {
+			app.subtitleSearch.close()
+			return nil, err
+		}
 	}
 
 	tokenDetails, err := app.plexAdmin.Authentication.GetTokenDetails(context.Background(), operations.GetTokenDetailsRequest{})
@@ -783,7 +786,7 @@ func (a *Application) plexSourceToken(ctx context.Context, userScoped bool) stri
 }
 
 func (a *Application) GetValidatedUser(ctx context.Context) (*User, error) {
-	user, err := NewPlexTV(*AuthTokenFromContext(ctx)).getUser()
+	user, err := NewPlexTV(*AuthTokenFromContext(ctx)).getUserContext(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -793,7 +796,7 @@ func (a *Application) GetValidatedUser(ctx context.Context) (*User, error) {
 	}
 
 	// Check if user is an invited user on this server
-	users, err := a.plexTv.getUsers()
+	users, err := a.plexTv.getUsersContext(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("could not get server users: %w", err)
 	}
@@ -806,7 +809,11 @@ func (a *Application) GetValidatedUser(ctx context.Context) (*User, error) {
 }
 
 func (a *Application) GetSessions(ctx context.Context) ([]sessionMetadata, error) {
-	sessionsURL := fmt.Sprintf("%s/status/sessions", a.config.Plex.Host)
+	baseOrigin, err := validatePlexOrigin(a.config.Plex.Host)
+	if err != nil {
+		return nil, fmt.Errorf("configured Plex origin is invalid: %w", err)
+	}
+	sessionsURL := fmt.Sprintf("%s/status/sessions", baseOrigin.String())
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, sessionsURL, nil)
 	if err != nil {
@@ -815,15 +822,31 @@ func (a *Application) GetSessions(ctx context.Context) ([]sessionMetadata, error
 	req.Header.Set("X-Plex-Token", a.config.Plex.Token)
 	req.Header.Set("Accept", "application/json")
 
-	resp, err := http.DefaultClient.Do(req)
+	client := &http.Client{
+		Timeout: librarySearchTimeout,
+		CheckRedirect: func(next *http.Request, via []*http.Request) error {
+			if len(via) == 0 {
+				return nil
+			}
+			if !samePlexOrigin(baseOrigin, next.URL) {
+				return errors.New("sessions redirect leaves configured Plex origin")
+			}
+			return nil
+		},
+	}
+
+	resp, err := client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("could not get sessions: %w", err)
 	}
 	defer resp.Body.Close()
 
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("could not read sessions response: %w", err)
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxLibraryResponseBytes+1))
+	if err != nil || len(body) > maxLibraryResponseBytes {
+		if err != nil {
+			return nil, fmt.Errorf("could not read sessions response: %w", err)
+		}
+		return nil, errors.New("sessions response exceeds size limit")
 	}
 
 	if resp.StatusCode != http.StatusOK {
@@ -1273,9 +1296,14 @@ func (a *Application) GetSubtitleEntriesForSource(ctx context.Context, ratingKey
 	if err != nil {
 		return nil, fmt.Errorf("could not acquire encoder: %w", err)
 	}
-	tmpFile, err := ExtractSubtitleFullContext(operationCtx, fileURL, source.EmbeddedIndex)
+	tmpFile, err := extractSubtitleFullContextFn(operationCtx, fileURL, source.EmbeddedIndex)
 	release()
 	if err != nil {
+		if errors.Is(err, ErrNoUsableSubtitleCues) {
+			entries = []SubtitleEntry{}
+			a.subtitleCache.setForCaller(cacheKey, entries, callerID)
+			return entries, nil
+		}
 		return nil, fmt.Errorf("could not extract subtitle: %w", err)
 	}
 	defer os.Remove(tmpFile)
@@ -1322,18 +1350,44 @@ func (a *Application) downloadSubtitleWithAccess(ctx context.Context, streamKey,
 }
 
 func (a *Application) downloadSubtitleWithToken(ctx context.Context, streamKey, codec, token string) ([]SubtitleEntry, error) {
-	streamURL := fmt.Sprintf("%s%s?X-Plex-Token=%s",
-		a.config.Plex.Host,
-		streamKey,
-		token,
-	)
+	if strings.TrimSpace(streamKey) == "" {
+		return nil, errors.New("subtitle stream key is required")
+	}
+	if strings.HasPrefix(streamKey, "//") {
+		return nil, errors.New("scheme-relative subtitle stream path is not allowed")
+	}
+	parsed, err := url.Parse(streamKey)
+	if err != nil || parsed.User != nil || parsed.IsAbs() || !strings.HasPrefix(parsed.Path, "/") {
+		return nil, errors.New("subtitle stream path is invalid")
+	}
+	baseOrigin, err := validatePlexOrigin(a.config.Plex.Host)
+	if err != nil {
+		return nil, fmt.Errorf("configured Plex origin is invalid: %w", err)
+	}
+	streamURL := fmt.Sprintf("%s%s", baseOrigin.String(), parsed.RequestURI())
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, streamURL, nil)
 	if err != nil {
 		return nil, err
 	}
+	if token != "" {
+		req.Header.Set("X-Plex-Token", token)
+	}
 
-	resp, err := http.DefaultClient.Do(req)
+	client := &http.Client{
+		Timeout: 15 * time.Second,
+		CheckRedirect: func(next *http.Request, via []*http.Request) error {
+			if len(via) == 0 {
+				return nil
+			}
+			if !samePlexOrigin(baseOrigin, next.URL) {
+				return errors.New("subtitle redirect leaves configured Plex origin")
+			}
+			return nil
+		},
+	}
+
+	resp, err := client.Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -1343,34 +1397,15 @@ func (a *Application) downloadSubtitleWithToken(ctx context.Context, streamKey, 
 		return nil, fmt.Errorf("subtitle download returned status %d", resp.StatusCode)
 	}
 
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, err
-	}
-
-	switch strings.ToLower(strings.TrimSpace(codec)) {
-	case "webvtt":
-		return ParseWebVTT(body)
-	case "ass", "ssa":
-		return ParseASS(body)
-	case "srt", "subrip", "text":
-		tmpFile, err := os.CreateTemp("", "cutscene_sub_*.srt")
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxLibraryResponseBytes+1))
+	if err != nil || len(body) > maxLibraryResponseBytes {
 		if err != nil {
 			return nil, err
 		}
-		tmpFilePath := tmpFile.Name()
-		defer os.Remove(tmpFilePath)
-		if _, err := tmpFile.Write(body); err != nil {
-			_ = tmpFile.Close()
-			return nil, err
-		}
-		if err := tmpFile.Close(); err != nil {
-			return nil, err
-		}
-		return ParseSRT(tmpFilePath)
-	default:
-		return nil, fmt.Errorf("unsupported native subtitle codec %q", codec)
+		return nil, errors.New("subtitle response exceeds size limit")
 	}
+
+	return parseSubtitleBody(body, codec)
 }
 
 func parseSubtitleBody(body []byte, codec string) ([]SubtitleEntry, error) {
@@ -1504,9 +1539,15 @@ func (a *Application) Clip(ctx context.Context, ratingKeyStr, mediaIdStr, from, 
 			}
 			subtitleFile, err = a.prepareExternalSubtitle(ctx, source, fromMs, toMs)
 			if err != nil {
-				return "", err
+				if errors.Is(err, ErrNoUsableSubtitleCues) {
+					subtitleFile = ""
+				} else {
+					return "", err
+				}
 			}
-			defer os.Remove(subtitleFile)
+			if subtitleFile != "" {
+				defer os.Remove(subtitleFile)
+			}
 		} else if source.PGS {
 			subtitleIdxForFFmpeg = source.EmbeddedIndex
 		} else {
@@ -1514,29 +1555,53 @@ func (a *Application) Clip(ctx context.Context, ratingKeyStr, mediaIdStr, from, 
 			if acquireErr != nil {
 				return "", fmt.Errorf("could not acquire encoder: %w", acquireErr)
 			}
-			subtitleFile, err = ExtractSubtitleContext(ctx, fileURL, from, to, source.EmbeddedIndex)
+			subtitleFile, err = extractSubtitleContextFn(ctx, fileURL, from, to, source.EmbeddedIndex)
 			release()
 			if err != nil {
-				return "", fmt.Errorf("could not extract subtitle: %w", err)
+				if errors.Is(err, ErrNoUsableSubtitleCues) {
+					subtitleFile = ""
+				} else {
+					return "", fmt.Errorf("could not extract subtitle: %w", err)
+				}
 			}
-			defer os.Remove(subtitleFile)
+			if subtitleFile != "" {
+				defer os.Remove(subtitleFile)
+			}
 		}
 	}
 
 	var fileName string
 	if metadata.Type == "episode" {
-		fileName = fmt.Sprintf("%s S%02dE%02d %s (%s - %s).mp4",
-			*metadata.GrandparentTitle,
-			*metadata.ParentIndex,
-			*metadata.Index,
+		season := 0
+		if metadata.ParentIndex != nil {
+			season = *metadata.ParentIndex
+		}
+		episode := 0
+		if metadata.Index != nil {
+			episode = *metadata.Index
+		}
+		showTitle := ""
+		if metadata.GrandparentTitle != nil && *metadata.GrandparentTitle != "" {
+			showTitle = *metadata.GrandparentTitle + " "
+		}
+		fileName = fmt.Sprintf("%sS%02dE%02d %s (%s - %s).mp4",
+			showTitle,
+			season,
+			episode,
 			metadata.Title,
 			from,
 			to,
 		)
-	} else {
+	} else if metadata.Year != nil {
 		fileName = fmt.Sprintf("%s (%d) (%s - %s).mp4",
 			metadata.Title,
 			*metadata.Year,
+			from,
+			to,
+		)
+	} else {
+		fileName = fmt.Sprintf("%s (%s - %s).mp4",
+			metadata.Title,
 			from,
 			to,
 		)
@@ -1575,24 +1640,78 @@ func (a *Application) Clip(ctx context.Context, ratingKeyStr, mediaIdStr, from, 
 		return "", fmt.Errorf("could not acquire encoder: %w", err)
 	}
 	defer release()
-	return DoFfmpeg(params)
+	return doFfmpegFn(params)
 }
 
+var errThumbValidation = errors.New("invalid thumbnail path")
+
+const thumbnailProxyTimeout = 15 * time.Second
+
 func (a *Application) Thumb(ctx context.Context, thumb string) (io.ReadCloser, string, error) {
+	if strings.TrimSpace(thumb) == "" {
+		return nil, "", fmt.Errorf("%w: path is required", errThumbValidation)
+	}
+	if strings.HasPrefix(thumb, "//") {
+		return nil, "", fmt.Errorf("%w: scheme-relative thumbnail URL is not allowed", errThumbValidation)
+	}
+	parsed, err := url.Parse(thumb)
+	if err != nil {
+		return nil, "", fmt.Errorf("%w: %v", errThumbValidation, err)
+	}
+	if parsed.User != nil {
+		return nil, "", fmt.Errorf("%w: userinfo is not allowed", errThumbValidation)
+	}
+
+	baseOrigin, err := validatePlexOrigin(a.config.Plex.Host)
+	if err != nil {
+		return nil, "", fmt.Errorf("configured Plex origin is invalid: %w", err)
+	}
+
+	var targetPath string
+	if parsed.IsAbs() {
+		if !samePlexOrigin(baseOrigin, parsed) {
+			return nil, "", fmt.Errorf("%w: thumbnail is not hosted by configured Plex", errThumbValidation)
+		}
+		targetPath = parsed.RequestURI()
+	} else {
+		if !strings.HasPrefix(parsed.Path, "/") {
+			return nil, "", fmt.Errorf("%w: path must begin with /", errThumbValidation)
+		}
+		targetPath = parsed.RequestURI()
+	}
+	if !strings.HasPrefix(targetPath, "/") || strings.HasPrefix(targetPath, "//") {
+		return nil, "", fmt.Errorf("%w: invalid path structure", errThumbValidation)
+	}
+
 	token := a.plexSourceToken(ctx, AuthTokenFromContext(ctx) != nil)
-	transcodeURL := fmt.Sprintf("%s/photo/:/transcode?width=320&height=320&url=%s&X-Plex-Token=%s",
-		a.config.Plex.Host,
-		url.QueryEscape(thumb),
-		token,
+	transcodeURL := fmt.Sprintf("%s/photo/:/transcode?width=320&height=320&url=%s",
+		baseOrigin.String(),
+		url.QueryEscape(targetPath),
 	)
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, transcodeURL, nil)
 	if err != nil {
 		return nil, "", err
 	}
+	if token != "" {
+		req.Header.Set("X-Plex-Token", token)
+	}
 	req.Header.Set("Accept", "image/*")
 
-	resp, err := http.DefaultClient.Do(req)
+	client := &http.Client{
+		Timeout: thumbnailProxyTimeout,
+		CheckRedirect: func(next *http.Request, via []*http.Request) error {
+			if len(via) == 0 {
+				return nil
+			}
+			if !samePlexOrigin(baseOrigin, next.URL) {
+				return errors.New("thumbnail redirect leaves configured Plex origin")
+			}
+			return nil
+		},
+	}
+
+	resp, err := client.Do(req)
 	if err != nil {
 		return nil, "", err
 	}

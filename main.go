@@ -34,12 +34,17 @@ type Config struct {
 }
 
 type SemanticSearchConfig struct {
-	PostgresDSN        string `mapstructure:"postgres_dsn"`
-	EmbeddingsURL      string `mapstructure:"embeddings_url"`
-	EmbeddingsProvider string `mapstructure:"embeddings_provider"`
-	EmbeddingsAPIKey   string `mapstructure:"embeddings_api_key"`
-	Enabled            bool   `mapstructure:"enabled"`
-	SharedCorpus       bool   `mapstructure:"shared_corpus"`
+	PostgresDSN        string  `mapstructure:"postgres_dsn"`
+	EmbeddingsURL      string  `mapstructure:"embeddings_url"`
+	EmbeddingsProvider string  `mapstructure:"embeddings_provider"`
+	EmbeddingsAPIKey   string  `mapstructure:"embeddings_api_key"`
+	EmbeddingsModel    string  `mapstructure:"embeddings_model"`
+	Dimensions         int     `mapstructure:"dimensions"`
+	BatchSize          int     `mapstructure:"batch_size"`
+	Concurrency        int     `mapstructure:"concurrency"`
+	QueryInstruction   *string `mapstructure:"query_instruction"`
+	Enabled            bool    `mapstructure:"enabled"`
+	SharedCorpus       bool    `mapstructure:"shared_corpus"`
 }
 
 func loadConfig() (*Config, error) {
@@ -47,6 +52,9 @@ func loadConfig() (*Config, error) {
 	viper.SetConfigName("config")
 	viper.AddConfigPath(".")
 	viper.SetDefault("ffmpeg.concurrency", defaultFFmpegConcurrency)
+	viper.SetDefault("semantic_search.dimensions", 0)
+	viper.SetDefault("semantic_search.batch_size", defaultSubtitleEmbeddingBatchSize)
+	viper.SetDefault("semantic_search.concurrency", defaultSubtitleEmbeddingConcurrency)
 	if err := viper.ReadInConfig(); err != nil {
 		return nil, fmt.Errorf("reading config file: %w", err)
 	}
@@ -55,6 +63,8 @@ func loadConfig() (*Config, error) {
 		return nil, fmt.Errorf("unmarshal config file: %w", err)
 	}
 	cfg.Ffmpeg.Concurrency = normalizeFFmpegConcurrency(cfg.Ffmpeg.Concurrency)
+	cfg.SemanticSearch.BatchSize = normalizeSubtitleEmbeddingBatchSize(cfg.SemanticSearch.BatchSize)
+	cfg.SemanticSearch.Concurrency = normalizeSubtitleEmbeddingConcurrency(cfg.SemanticSearch.Concurrency)
 	cfg.SemanticSearch.EmbeddingsProvider, err = normalizeEmbeddingsProvider(cfg.SemanticSearch.EmbeddingsProvider)
 	if err != nil {
 		return nil, fmt.Errorf("semantic_search.embeddings_provider: %w", err)

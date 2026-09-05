@@ -686,7 +686,14 @@ func (r *PlexResourceResolver) doPlexRequestOnceWithClient(ctx context.Context, 
 	if requestErr != nil {
 		return nil, requestErr
 	}
-	return client.Do(refreshedRequest)
+	response, err = client.Do(refreshedRequest)
+	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, ctxErr
+		}
+		return nil, fmt.Errorf("%w: PMS request failed", errPlexAvailability)
+	}
+	return response, nil
 }
 
 func requestWithAccess(original *http.Request, access *PlexAccess) (*http.Request, error) {

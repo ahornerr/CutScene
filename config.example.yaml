@@ -28,6 +28,14 @@ semantic_search:
   postgres_dsn: postgresql://cutscene:cutscene-poc@postgres:5432/cutscene?sslmode=disable
   embeddings_provider: tei
   embeddings_url: http://tei:80
+  # Batch size sent to embedding service per request (default: 32).
+  # batch_size: 32
+  # Concurrency for parallel embedding requests across workers (default: 2).
+  # Higher values take advantage of GPU continuous dynamic batching in TEI.
+  # concurrency: 2
+  # Optional query instruction prefix for retrieval models (e.g. BGE).
+  # Defaults to BGE prefix for BGE models, or empty for Qwen/OpenAI.
+  # query_instruction: ""
   # AMD alternative: use the AMD overlay instead, then change the two lines
   # above to:
   # embeddings_provider: openai

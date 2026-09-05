@@ -1703,7 +1703,7 @@ func (a *Application) executeRenderSpec(ctx context.Context, spec renderJobSpec,
 				var subtitleErr error
 				subtitleFile, subtitleErr = func() (string, error) {
 					defer releaseFFmpeg()
-					return ExtractSubtitleContext(ctx, subtitleURL, from, to, embeddedIndex, spec.SubtitleOffsetMs)
+					return extractSubtitleContextFn(ctx, subtitleURL, from, to, embeddedIndex, spec.SubtitleOffsetMs)
 				}()
 				if subtitleErr != nil {
 					if errors.Is(subtitleErr, ErrNoUsableSubtitleCues) {
@@ -1720,10 +1720,14 @@ func (a *Application) executeRenderSpec(ctx context.Context, spec renderJobSpec,
 			}
 			subtitleFile, err = func() (string, error) {
 				defer release()
-				return ExtractSubtitleContext(ctx, sourceURL, from, to, embeddedIndex, spec.SubtitleOffsetMs)
+				return extractSubtitleContextFn(ctx, sourceURL, from, to, embeddedIndex, spec.SubtitleOffsetMs)
 			}()
 			if err != nil {
-				return classifyRenderStageError("subtitle", err)
+				if errors.Is(err, ErrNoUsableSubtitleCues) {
+					subtitleFile = ""
+				} else {
+					return classifyRenderStageError("subtitle", err)
+				}
 			}
 		}
 	subtitleReady:
@@ -1746,7 +1750,7 @@ func (a *Application) executeRenderSpec(ctx context.Context, spec renderJobSpec,
 	if err != nil {
 		return classifyRenderStageError("encoder", err)
 	}
-	_, err = DoFfmpeg(params)
+	_, err = doFfmpegFn(params)
 	release()
 	if err != nil {
 		return classifyRenderError(err)

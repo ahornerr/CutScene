@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -433,3 +434,86 @@ func TestPlexResolverCacheCapacityIsBounded(t *testing.T) {
 		t.Fatalf("cache size = %d, want %d", size, maxPlexAccessEntries)
 	}
 }
+
+func TestDoPlexRequestOnceWithClientRetryErrorHandling(t *testing.T) {
+	var server *httptest.Server
+	server = httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/resources":
+			_ = json.NewEncoder(w).Encode([]PlexResource{{
+				ClientIdentifier: "machine",
+				Provides:         "server",
+				AccessToken:      "refreshed-token",
+				Connections: []PlexConnection{
+					{URI: server.URL, Protocol: "https"},
+				},
+			}})
+		case "/identity":
+			_, _ = w.Write([]byte(`{"MediaContainer":{"machineIdentifier":"machine"}}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	resolver, err := NewPlexResourceResolver(server.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolver.client = server.Client()
+	resolver.resourcesURL = server.URL + "/resources"
+	if err := resolver.SetTrustedOrigins("machine", []string{server.URL}); err != nil {
+		t.Fatal(err)
+	}
+
+	access := &PlexAccess{
+		baseOrigin:        server.URL,
+		secretToken:       "old-token",
+		accountToken:      "account-secret",
+		callerUUID:        "caller",
+		machineIdentifier: "machine",
+	}
+
+	t.Run("retry network failure wraps errPlexAvailability", func(t *testing.T) {
+		var attempts atomic.Int32
+		client := &http.Client{
+			Transport: plexRoundTripFunc(func(r *http.Request) (*http.Response, error) {
+				if attempts.Add(1) == 1 {
+					return &http.Response{StatusCode: http.StatusUnauthorized, Body: http.NoBody, Header: make(http.Header), Request: r}, nil
+				}
+				return nil, errors.New("connection reset by peer")
+			}),
+		}
+		req, _ := newPlexRequest(context.Background(), access, http.MethodGet, "/library/metadata/1")
+		_, err := resolver.doPlexRequestOnceWithClient(context.Background(), access, req, client)
+		if err == nil {
+			t.Fatal("expected retry failure")
+		}
+		if !errors.Is(err, errPlexAvailability) {
+			t.Fatalf("expected errPlexAvailability wrapper, got: %v", err)
+		}
+	})
+
+	t.Run("retry context canceled returns context error", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		var attempts atomic.Int32
+		client := &http.Client{
+			Transport: plexRoundTripFunc(func(r *http.Request) (*http.Response, error) {
+				if attempts.Add(1) == 1 {
+					return &http.Response{StatusCode: http.StatusUnauthorized, Body: http.NoBody, Header: make(http.Header), Request: r}, nil
+				}
+				cancel()
+				return nil, ctx.Err()
+			}),
+		}
+		req, _ := newPlexRequest(ctx, access, http.MethodGet, "/library/metadata/1")
+		_, err := resolver.doPlexRequestOnceWithClient(ctx, access, req, client)
+		if err == nil {
+			t.Fatal("expected retry failure")
+		}
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("expected context.Canceled, got: %v", err)
+		}
+	})
+}
+

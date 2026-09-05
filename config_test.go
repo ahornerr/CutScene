@@ -118,3 +118,37 @@ func TestNewFFmpegLimiterNormalizesNonPositiveConcurrency(t *testing.T) {
 		}
 	}
 }
+
+func TestSemanticSearchConfigDefaultsAndOverrides(t *testing.T) {
+	t.Run("defaults", func(t *testing.T) {
+		cfg := loadConfigForTest(t, "plex:\n  host: http://plex\n")
+		if cfg.SemanticSearch.BatchSize != defaultSubtitleEmbeddingBatchSize {
+			t.Fatalf("expected default batch size %d, got %d", defaultSubtitleEmbeddingBatchSize, cfg.SemanticSearch.BatchSize)
+		}
+		if cfg.SemanticSearch.Concurrency != defaultSubtitleEmbeddingConcurrency {
+			t.Fatalf("expected default concurrency %d, got %d", defaultSubtitleEmbeddingConcurrency, cfg.SemanticSearch.Concurrency)
+		}
+		if cfg.SemanticSearch.QueryInstruction != nil {
+			t.Fatalf("expected nil QueryInstruction by default, got %v", *cfg.SemanticSearch.QueryInstruction)
+		}
+	})
+
+	t.Run("overrides", func(t *testing.T) {
+		cfg := loadConfigForTest(t, `plex:
+  host: http://plex
+semantic_search:
+  batch_size: 64
+  concurrency: 4
+  query_instruction: "Instruct: search\nQuery: "
+`)
+		if cfg.SemanticSearch.BatchSize != 64 {
+			t.Fatalf("expected batch size 64, got %d", cfg.SemanticSearch.BatchSize)
+		}
+		if cfg.SemanticSearch.Concurrency != 4 {
+			t.Fatalf("expected concurrency 4, got %d", cfg.SemanticSearch.Concurrency)
+		}
+		if cfg.SemanticSearch.QueryInstruction == nil || *cfg.SemanticSearch.QueryInstruction != "Instruct: search\nQuery: " {
+			t.Fatalf("unexpected query instruction: %v", cfg.SemanticSearch.QueryInstruction)
+		}
+	})
+}

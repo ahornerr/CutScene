@@ -901,8 +901,12 @@ func ExtractSubtitleTracksBatchContext(ctx context.Context, mediaURL string, emb
 	const maxBatchSubtitleCues = 100000
 	for embeddedIndex, path := range paths {
 		info, statErr := os.Stat(path)
-		if statErr != nil || !info.Mode().IsRegular() || info.Size() == 0 || info.Size() > maxBatchSubtitleBytes {
+		if statErr != nil || !info.Mode().IsRegular() || info.Size() > maxBatchSubtitleBytes {
 			return nil, errors.New("batch subtitle output is invalid")
+		}
+		if info.Size() == 0 {
+			result[embeddedIndex] = nil
+			continue
 		}
 		entries, parseErr := ParseSRT(path)
 		if parseErr != nil || len(entries) > maxBatchSubtitleCues {
@@ -916,6 +920,10 @@ func ExtractSubtitleTracksBatchContext(ctx context.Context, mediaURL string, emb
 var subtitleBatchFFmpegCommand = func(ctx context.Context, args ...string) *exec.Cmd {
 	return exec.CommandContext(ctx, "ffmpeg", args...)
 }
+
+var extractSubtitleFullContextFn = ExtractSubtitleFullContext
+var extractSubtitleContextFn = ExtractSubtitleContext
+var doFfmpegFn = DoFfmpeg
 
 func subtitleOffsetArgument(offsets []int64) (int64, error) {
 	if len(offsets) > 1 {
