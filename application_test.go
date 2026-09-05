@@ -1055,8 +1055,8 @@ func TestConfigureFFmpegHTTPRecoveryOnlyAppliesToHTTPInputs(t *testing.T) {
 		"reconnect_streamed":         "1",
 		"reconnect_on_network_error": "1",
 		"reconnect_on_http_error":    "502,503,504",
-		"reconnect_delay_max":        "2",
-		"rw_timeout":                 "15000000",
+		"reconnect_delay_max":        "5",
+		"rw_timeout":                 "60000000",
 	} {
 		if got := remote[key]; got != want {
 			t.Fatalf("remote %s = %v, want %q", key, got, want)

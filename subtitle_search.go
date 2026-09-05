@@ -910,6 +910,9 @@ func (a *Application) subtitleIndexMediaURL(ctx context.Context, part *component
 	if part == nil || strings.TrimSpace(part.Key) == "" {
 		return "", nil, errors.New("subtitle source path is unavailable")
 	}
+	if localPath, ok := a.resolveLocalPartFile(part); ok {
+		return localPath, nil, nil
+	}
 	if AuthTokenFromContext(ctx) != nil {
 		proxy, err := a.ensureMediaProxy()
 		if err != nil {
@@ -967,6 +970,7 @@ func (a *Application) indexSubtitleSource(ctx context.Context, request subtitleS
 	sourceRevision := subtitleSourceRevision(metadata, request.MediaID, request.PartID)
 	result := subtitleSearchIndexResponse{RatingKey: request.RatingKey, MediaID: request.MediaID, PartID: request.PartID, Skipped: []subtitleSearchSkipped{}}
 	changed := make([]subtitleTrackPlan, 0)
+	changedExternal := make([]subtitleTrackPlan, 0)
 	fingerprints := make(map[int]string)
 	dim := 0
 	if a.subtitleSearch != nil {
@@ -1002,13 +1006,27 @@ func (a *Application) indexSubtitleSource(ctx context.Context, request subtitleS
 			continue
 		}
 		if stream.External {
-			result.Skipped = append(result.Skipped, subtitleSearchSkipped{plan.PublicIndex, "external subtitle track"})
-			result.UnsupportedTracks++
-			if a.sharedCorpus {
-				if err := a.recordSharedSubtitleSeen(ctx, request, plan.PublicIndex, fingerprint, 0); err != nil {
-					return result, err
+			if !isEnglishSubtitleStream(stream) {
+				result.Skipped = append(result.Skipped, subtitleSearchSkipped{plan.PublicIndex, "not an English text track"})
+				result.UnsupportedTracks++
+				if a.sharedCorpus {
+					if err := a.recordSharedSubtitleSeen(ctx, request, plan.PublicIndex, fingerprint, 0); err != nil {
+						return result, err
+					}
 				}
+				continue
 			}
+			if stream.Type != "text" {
+				result.Skipped = append(result.Skipped, subtitleSearchSkipped{plan.PublicIndex, "unsupported subtitle format"})
+				result.UnsupportedTracks++
+				if a.sharedCorpus {
+					if err := a.recordSharedSubtitleSeen(ctx, request, plan.PublicIndex, fingerprint, 0); err != nil {
+						return result, err
+					}
+				}
+				continue
+			}
+			changedExternal = append(changedExternal, plan)
 			continue
 		}
 		if stream.Type != "text" {
@@ -1032,6 +1050,39 @@ func (a *Application) indexSubtitleSource(ctx context.Context, request subtitleS
 			continue
 		}
 		changed = append(changed, plan)
+	}
+	for _, plan := range changedExternal {
+		token := a.plexSourceToken(ctx, AuthTokenFromContext(ctx) != nil)
+		entries, downloadErr := a.downloadSubtitleWithToken(ctx, plan.Raw.Key, plan.Stream.Codec, token)
+		if downloadErr != nil {
+			result.FailedTracks++
+			result.Skipped = append(result.Skipped, subtitleSearchSkipped{plan.PublicIndex, "subtitle download failed"})
+			continue
+		}
+		chunks := chunkSubtitleEntries(entries)
+		if len(chunks) == 0 {
+			result.Skipped = append(result.Skipped, subtitleSearchSkipped{plan.PublicIndex, "subtitle contains no searchable text"})
+			result.EmptyTracks++
+			if a.sharedCorpus {
+				if err := a.recordSharedSubtitleSeen(ctx, request, plan.PublicIndex, fingerprints[plan.PublicIndex], 0); err != nil {
+					return result, err
+				}
+			}
+			continue
+		}
+		if a.sharedCorpus {
+			if err := a.persistSharedSubtitleChunks(ctx, request, source, plan.PublicIndex, chunks, castContext, fingerprints[plan.PublicIndex]); err != nil {
+				return result, err
+			}
+		} else if err := a.persistSubtitleChunks(ctx, owner, source, plan.PublicIndex, chunks, castContext); err != nil {
+			return result, err
+		}
+		if !a.sharedCorpus {
+			if err := a.recordSubtitleFingerprint(ctx, owner, request, plan.PublicIndex, fingerprints[plan.PublicIndex], len(chunks)); err != nil {
+				return result, err
+			}
+		}
+		result.Indexed += len(chunks)
 	}
 	if len(changed) == 0 {
 		return result, nil
@@ -1147,7 +1198,7 @@ func (a *Application) indexSubtitleSource(ctx context.Context, request subtitleS
 
 func (a *Application) sharedSubtitleTrackUnchanged(ctx context.Context, request subtitleSearchIndexRequest, subtitleIndex int, fingerprint string) (bool, error) {
 	var stored string
-	err := a.subtitleSearch.pool.QueryRow(ctx, `SELECT src.fingerprint FROM subtitle_shared_sources src JOIN subtitle_shared_sections sec ON sec.machine_identifier=src.machine_identifier AND sec.section_uuid=src.section_uuid AND sec.ready_scan_id=src.scan_id WHERE src.machine_identifier=$1 AND src.section_uuid=$2 AND src.rating_key=$3 AND src.media_id=$4 AND src.part_id=$5 AND src.subtitle_index=$6 AND src.chunk_count > 0`, a.machineIdentifier, request.SectionUUID, request.RatingKey, request.MediaID, request.PartID, subtitleIndex).Scan(&stored)
+	err := a.subtitleSearch.pool.QueryRow(ctx, `SELECT src.fingerprint FROM subtitle_shared_sources src JOIN subtitle_shared_sections sec ON sec.machine_identifier=src.machine_identifier AND sec.section_uuid=src.section_uuid AND (sec.scan_id=src.scan_id OR (sec.ready_scan_id IS NOT NULL AND sec.ready_scan_id=src.scan_id)) WHERE src.machine_identifier=$1 AND src.section_uuid=$2 AND src.rating_key=$3 AND src.media_id=$4 AND src.part_id=$5 AND src.subtitle_index=$6 AND src.chunk_count > 0 LIMIT 1`, a.machineIdentifier, request.SectionUUID, request.RatingKey, request.MediaID, request.PartID, subtitleIndex).Scan(&stored)
 	if err != nil {
 		return false, err
 	}
@@ -1380,7 +1431,10 @@ func (a *Application) persistSharedSubtitleChunks(ctx context.Context, request s
 		return errors.New("could not update shared subtitle index")
 	}
 	defer tx.Rollback(ctx)
-	if _, err := tx.Exec(ctx, `DELETE FROM subtitle_shared_chunks WHERE machine_identifier=$1 AND section_uuid=$2 AND scan_id=$3 AND rating_key=$4 AND media_id=$5 AND part_id=$6 AND subtitle_index=$7`, a.machineIdentifier, request.SectionUUID, request.ScanID, source.RatingKey, source.MediaID, source.PartID, subtitleIndex); err != nil {
+	if _, err := tx.Exec(ctx, `DELETE FROM subtitle_shared_chunks WHERE machine_identifier=$1 AND section_uuid=$2 AND scan_id=$7 AND rating_key=$3 AND media_id=$4 AND part_id=$5 AND subtitle_index=$6`, a.machineIdentifier, request.SectionUUID, source.RatingKey, source.MediaID, source.PartID, subtitleIndex, request.ScanID); err != nil {
+		return errors.New("could not update shared subtitle index")
+	}
+	if _, err := tx.Exec(ctx, `DELETE FROM subtitle_shared_sources WHERE machine_identifier=$1 AND section_uuid=$2 AND scan_id=$7 AND rating_key=$3 AND media_id=$4 AND part_id=$5 AND subtitle_index=$6`, a.machineIdentifier, request.SectionUUID, source.RatingKey, source.MediaID, source.PartID, subtitleIndex, request.ScanID); err != nil {
 		return errors.New("could not update shared subtitle index")
 	}
 
@@ -1412,11 +1466,22 @@ func (a *Application) copySharedSubtitleTrack(ctx context.Context, request subti
 		return errors.New("could not update shared subtitle index")
 	}
 	defer tx.Rollback(ctx)
-	_, err = tx.Exec(ctx, `INSERT INTO subtitle_shared_chunks (machine_identifier, section_uuid, section_key, rating_key, media_id, part_id, subtitle_index, title, show_title, season, episode, year, start_ms, end_ms, text, content_hash, embedding, scan_id) SELECT c.machine_identifier, c.section_uuid, $3, c.rating_key, c.media_id, c.part_id, c.subtitle_index, c.title, c.show_title, c.season, c.episode, c.year, c.start_ms, c.end_ms, c.text, c.content_hash, c.embedding, $2 FROM subtitle_shared_chunks c JOIN subtitle_shared_sections s ON s.machine_identifier=c.machine_identifier AND s.section_uuid=c.section_uuid AND s.ready_scan_id=c.scan_id WHERE c.machine_identifier=$1 AND c.section_uuid=$4 AND c.rating_key=$5 AND c.media_id=$6 AND c.part_id=$7 AND c.subtitle_index=$8`, a.machineIdentifier, request.ScanID, request.SectionKey, request.SectionUUID, request.RatingKey, request.MediaID, request.PartID, subtitleIndex)
+
+	// Avoid duplicate inserts if destination scan already has these chunks (e.g. from prior interrupted scan)
+	var alreadyCopied bool
+	err = tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM subtitle_shared_chunks WHERE machine_identifier=$1 AND section_uuid=$2 AND scan_id=$3 AND rating_key=$4 AND media_id=$5 AND part_id=$6 AND subtitle_index=$7)`, a.machineIdentifier, request.SectionUUID, request.ScanID, request.RatingKey, request.MediaID, request.PartID, subtitleIndex).Scan(&alreadyCopied)
 	if err != nil {
-		return errors.New("could not copy shared subtitle index")
+		return errors.New("could not update shared subtitle index")
 	}
-	_, err = tx.Exec(ctx, `INSERT INTO subtitle_shared_sources (machine_identifier, section_uuid, section_key, rating_key, media_id, part_id, subtitle_index, fingerprint, chunk_count, scan_id, indexed_at) SELECT $1,$2,$3,$4,$5,$6,$7,$8,COUNT(*),$9,NOW() FROM subtitle_shared_chunks WHERE machine_identifier=$1 AND section_uuid=$2 AND scan_id=$9 AND rating_key=$4 AND media_id=$5 AND part_id=$6 AND subtitle_index=$7 GROUP BY machine_identifier, section_uuid, rating_key, media_id, part_id, subtitle_index ON CONFLICT DO NOTHING`, a.machineIdentifier, request.SectionUUID, request.SectionKey, request.RatingKey, request.MediaID, request.PartID, subtitleIndex, fingerprint, request.ScanID)
+
+	if !alreadyCopied {
+		// Copy from the published ready scan (or prior scan) into the in-progress scan without modifying the ready scan's rows
+		_, err = tx.Exec(ctx, `INSERT INTO subtitle_shared_chunks (machine_identifier, section_uuid, section_key, rating_key, media_id, part_id, subtitle_index, title, show_title, season, episode, year, start_ms, end_ms, text, content_hash, embedding, scan_id) SELECT c.machine_identifier, c.section_uuid, $3, c.rating_key, c.media_id, c.part_id, c.subtitle_index, c.title, c.show_title, c.season, c.episode, c.year, c.start_ms, c.end_ms, c.text, c.content_hash, c.embedding, $2 FROM subtitle_shared_chunks c JOIN subtitle_shared_sections s ON s.machine_identifier=c.machine_identifier AND s.section_uuid=c.section_uuid AND (s.ready_scan_id=c.scan_id OR s.scan_id=c.scan_id) WHERE c.machine_identifier=$1 AND c.section_uuid=$4 AND c.rating_key=$5 AND c.media_id=$6 AND c.part_id=$7 AND c.subtitle_index=$8 AND c.scan_id <> $2`, a.machineIdentifier, request.ScanID, request.SectionKey, request.SectionUUID, request.RatingKey, request.MediaID, request.PartID, subtitleIndex)
+		if err != nil {
+			return errors.New("could not copy shared subtitle index")
+		}
+	}
+	_, err = tx.Exec(ctx, `INSERT INTO subtitle_shared_sources (machine_identifier, section_uuid, section_key, rating_key, media_id, part_id, subtitle_index, fingerprint, chunk_count, scan_id, indexed_at) SELECT $1,$2,$3,$4,$5,$6,$7,$8,COUNT(*),$9,NOW() FROM subtitle_shared_chunks WHERE machine_identifier=$1 AND section_uuid=$2 AND scan_id=$9 AND rating_key=$4 AND media_id=$5 AND part_id=$6 AND subtitle_index=$7 GROUP BY machine_identifier, section_uuid, rating_key, media_id, part_id, subtitle_index ON CONFLICT (machine_identifier, section_uuid, scan_id, rating_key, media_id, part_id, subtitle_index) DO UPDATE SET fingerprint=EXCLUDED.fingerprint, chunk_count=EXCLUDED.chunk_count, section_key=EXCLUDED.section_key, indexed_at=EXCLUDED.indexed_at`, a.machineIdentifier, request.SectionUUID, request.SectionKey, request.RatingKey, request.MediaID, request.PartID, subtitleIndex, fingerprint, request.ScanID)
 	if err != nil {
 		return errors.New("could not record shared subtitle source")
 	}
@@ -1950,12 +2015,13 @@ func (a *Application) searchSharedSubtitleIndex(ctx context.Context, query strin
 		return nil
 	}
 	normalized := normalizeSubtitleSearchLiteral(trimmedQuery)
+	const sharedChunksJoin = `FROM subtitle_shared_chunks c JOIN subtitle_shared_sections s ON s.machine_identifier=c.machine_identifier AND s.section_uuid=c.section_uuid AND s.state<>'failed' AND (c.scan_id=s.scan_id OR (s.ready_scan_id IS NOT NULL AND c.scan_id=s.ready_scan_id AND NOT EXISTS (SELECT 1 FROM subtitle_shared_chunks n WHERE n.machine_identifier=c.machine_identifier AND n.section_uuid=c.section_uuid AND n.scan_id=s.scan_id AND n.rating_key=c.rating_key AND n.media_id=c.media_id AND n.part_id=c.part_id AND n.subtitle_index=c.subtitle_index)))`
 	if normalized != "" {
-		if err := load(`SELECT c.machine_identifier, c.section_uuid, c.section_key, c.scan_id, s.section_type, c.rating_key, c.media_id, c.part_id, c.subtitle_index, c.start_ms, c.end_ms, 1.0 AS score FROM subtitle_shared_chunks c JOIN subtitle_shared_sections s ON s.machine_identifier=c.machine_identifier AND s.section_uuid=c.section_uuid AND s.ready_scan_id=c.scan_id AND s.state='ready' WHERE c.machine_identifier=$1 AND c.section_uuid=ANY($2) AND strpos(btrim(regexp_replace(lower(c.text), '[^[:alnum:]]+', ' ', 'g')), $3) > 0 AND EXISTS (SELECT 1 FROM subtitle_shared_sources v WHERE v.machine_identifier=c.machine_identifier AND v.section_uuid=c.section_uuid AND v.scan_id=c.scan_id AND v.rating_key=c.rating_key AND v.media_id=c.media_id AND v.part_id=c.part_id AND v.subtitle_index=c.subtitle_index AND v.chunk_count > 0) ORDER BY c.id LIMIT $4`, []any{a.machineIdentifier, uuidKeys, normalized, maxSharedSubtitleCandidates}, 0); err != nil {
+		if err := load(`SELECT c.machine_identifier, c.section_uuid, c.section_key, c.scan_id, s.section_type, c.rating_key, c.media_id, c.part_id, c.subtitle_index, c.start_ms, c.end_ms, 1.0 AS score `+sharedChunksJoin+` WHERE c.machine_identifier=$1 AND c.section_uuid=ANY($2) AND strpos(btrim(regexp_replace(lower(c.text), '[^[:alnum:]]+', ' ', 'g')), $3) > 0 AND EXISTS (SELECT 1 FROM subtitle_shared_sources v WHERE v.machine_identifier=c.machine_identifier AND v.section_uuid=c.section_uuid AND v.scan_id=c.scan_id AND v.rating_key=c.rating_key AND v.media_id=c.media_id AND v.part_id=c.part_id AND v.subtitle_index=c.subtitle_index AND v.chunk_count > 0) ORDER BY c.id LIMIT $4`, []any{a.machineIdentifier, uuidKeys, normalized, maxSharedSubtitleCandidates}, 0); err != nil {
 			return nil, err
 		}
 	}
-	if err := load(`SELECT c.machine_identifier, c.section_uuid, c.section_key, c.scan_id, s.section_type, c.rating_key, c.media_id, c.part_id, c.subtitle_index, c.start_ms, c.end_ms, ts_rank_cd(c.text_search, phraseto_tsquery('simple', $3)) AS score FROM subtitle_shared_chunks c JOIN subtitle_shared_sections s ON s.machine_identifier=c.machine_identifier AND s.section_uuid=c.section_uuid AND s.ready_scan_id=c.scan_id AND s.state='ready' WHERE c.machine_identifier=$1 AND c.section_uuid=ANY($2) AND c.text_search @@ phraseto_tsquery('simple', $3) AND EXISTS (SELECT 1 FROM subtitle_shared_sources v WHERE v.machine_identifier=c.machine_identifier AND v.section_uuid=c.section_uuid AND v.scan_id=c.scan_id AND v.rating_key=c.rating_key AND v.media_id=c.media_id AND v.part_id=c.part_id AND v.subtitle_index=c.subtitle_index AND v.chunk_count > 0) ORDER BY score DESC, c.id LIMIT $4`, []any{a.machineIdentifier, uuidKeys, trimmedQuery, maxSharedSubtitleCandidates}, 1); err != nil {
+	if err := load(`SELECT c.machine_identifier, c.section_uuid, c.section_key, c.scan_id, s.section_type, c.rating_key, c.media_id, c.part_id, c.subtitle_index, c.start_ms, c.end_ms, ts_rank_cd(c.text_search, phraseto_tsquery('simple', $3)) AS score `+sharedChunksJoin+` WHERE c.machine_identifier=$1 AND c.section_uuid=ANY($2) AND c.text_search @@ phraseto_tsquery('simple', $3) AND EXISTS (SELECT 1 FROM subtitle_shared_sources v WHERE v.machine_identifier=c.machine_identifier AND v.section_uuid=c.section_uuid AND v.scan_id=c.scan_id AND v.rating_key=c.rating_key AND v.media_id=c.media_id AND v.part_id=c.part_id AND v.subtitle_index=c.subtitle_index AND v.chunk_count > 0) ORDER BY score DESC, c.id LIMIT $4`, []any{a.machineIdentifier, uuidKeys, trimmedQuery, maxSharedSubtitleCandidates}, 1); err != nil {
 		return nil, err
 	}
 	embeddings, err := a.subtitleSearch.embeddings.embed(ctx, []string{a.subtitleSearch.queryInput(trimmedQuery)})
@@ -1965,7 +2031,7 @@ func (a *Application) searchSharedSubtitleIndex(ctx context.Context, query strin
 	// This first corpus query is intentionally limited to source identity and
 	// relevance data.  Subtitle text is fetched only after the caller checks
 	// below have completed successfully.
-	if err := load(`SELECT c.machine_identifier, c.section_uuid, c.section_key, c.scan_id, s.section_type, c.rating_key, c.media_id, c.part_id, c.subtitle_index, c.start_ms, c.end_ms, 1-(c.embedding <=> $1) AS score FROM subtitle_shared_chunks c JOIN subtitle_shared_sections s ON s.machine_identifier=c.machine_identifier AND s.section_uuid=c.section_uuid AND s.ready_scan_id=c.scan_id AND s.state='ready' WHERE c.machine_identifier=$2 AND c.section_uuid=ANY($3) AND EXISTS (SELECT 1 FROM subtitle_shared_sources v WHERE v.machine_identifier=c.machine_identifier AND v.section_uuid=c.section_uuid AND v.scan_id=c.scan_id AND v.rating_key=c.rating_key AND v.media_id=c.media_id AND v.part_id=c.part_id AND v.subtitle_index=c.subtitle_index AND v.chunk_count > 0) ORDER BY c.embedding <=> $1 LIMIT $4`, []any{pgvector.NewVector(embeddings[0]), a.machineIdentifier, uuidKeys, maxSharedSubtitleCandidates}, 2); err != nil {
+	if err := load(`SELECT c.machine_identifier, c.section_uuid, c.section_key, c.scan_id, s.section_type, c.rating_key, c.media_id, c.part_id, c.subtitle_index, c.start_ms, c.end_ms, 1-(c.embedding <=> $1) AS score `+sharedChunksJoin+` WHERE c.machine_identifier=$2 AND c.section_uuid=ANY($3) AND EXISTS (SELECT 1 FROM subtitle_shared_sources v WHERE v.machine_identifier=c.machine_identifier AND v.section_uuid=c.section_uuid AND v.scan_id=c.scan_id AND v.rating_key=c.rating_key AND v.media_id=c.media_id AND v.part_id=c.part_id AND v.subtitle_index=c.subtitle_index AND v.chunk_count > 0) ORDER BY c.embedding <=> $1 LIMIT $4`, []any{pgvector.NewVector(embeddings[0]), a.machineIdentifier, uuidKeys, maxSharedSubtitleCandidates}, 2); err != nil {
 		return nil, err
 	}
 	mergedRaw := make([]subtitleSearchCandidate, 0, len(candidates))
@@ -2180,7 +2246,7 @@ func (a *Application) fetchAuthorizedSharedSubtitleHit(ctx context.Context, cand
 	var hit subtitleSearchHit
 	var showTitle sql.NullString
 	var season, episode, year sql.NullInt64
-	err := a.subtitleSearch.pool.QueryRow(ctx, `SELECT c.title, c.show_title, c.season, c.episode, c.year, c.text FROM subtitle_shared_chunks c JOIN subtitle_shared_sections sec ON sec.machine_identifier=c.machine_identifier AND sec.section_uuid=c.section_uuid AND sec.state='ready' AND sec.ready_scan_id=c.scan_id JOIN subtitle_shared_sources src ON src.machine_identifier=c.machine_identifier AND src.section_uuid=c.section_uuid AND src.scan_id=c.scan_id AND src.rating_key=c.rating_key AND src.media_id=c.media_id AND src.part_id=c.part_id AND src.subtitle_index=c.subtitle_index AND src.chunk_count > 0 WHERE c.machine_identifier=$1 AND c.section_uuid=$2 AND c.section_key=$3 AND c.scan_id=$4 AND c.rating_key=$5 AND c.media_id=$6 AND c.part_id=$7 AND c.subtitle_index=$8 AND c.start_ms=$9 AND c.end_ms=$10`, candidate.MachineIdentifier, candidate.SectionUUID, candidate.SectionKey, candidate.ScanID, candidate.RatingKey, candidate.MediaID, candidate.PartID, candidate.SubtitleIndex, candidate.StartMs, candidate.EndMs).Scan(&hit.Title, &showTitle, &season, &episode, &year, &hit.Text)
+	err := a.subtitleSearch.pool.QueryRow(ctx, `SELECT c.title, c.show_title, c.season, c.episode, c.year, c.text FROM subtitle_shared_chunks c JOIN subtitle_shared_sections sec ON sec.machine_identifier=c.machine_identifier AND sec.section_uuid=c.section_uuid AND sec.state<>'failed' AND (sec.scan_id=c.scan_id OR (sec.ready_scan_id IS NOT NULL AND sec.ready_scan_id=c.scan_id)) JOIN subtitle_shared_sources src ON src.machine_identifier=c.machine_identifier AND src.section_uuid=c.section_uuid AND src.scan_id=c.scan_id AND src.rating_key=c.rating_key AND src.media_id=c.media_id AND src.part_id=c.part_id AND src.subtitle_index=c.subtitle_index AND src.chunk_count > 0 WHERE c.machine_identifier=$1 AND c.section_uuid=$2 AND c.section_key=$3 AND c.scan_id=$4 AND c.rating_key=$5 AND c.media_id=$6 AND c.part_id=$7 AND c.subtitle_index=$8 AND c.start_ms=$9 AND c.end_ms=$10`, candidate.MachineIdentifier, candidate.SectionUUID, candidate.SectionKey, candidate.ScanID, candidate.RatingKey, candidate.MediaID, candidate.PartID, candidate.SubtitleIndex, candidate.StartMs, candidate.EndMs).Scan(&hit.Title, &showTitle, &season, &episode, &year, &hit.Text)
 	if err != nil {
 		return subtitleSearchHit{}, err
 	}

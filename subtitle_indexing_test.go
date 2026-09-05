@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -468,6 +470,209 @@ func TestRecoverPersistedJobsRequiresMachineIdentifierForShared(t *testing.T) {
 		t.Fatalf("expected nil error, got: %v", err)
 	}
 }
+
+func TestDiscoverAndIndexSourcesSharedCorpusDoesNotAbortOnItemErrors(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/identity":
+			_, _ = w.Write([]byte(`{"MediaContainer":{"machineIdentifier":"pms-1"}}`))
+		case "/library/sections":
+			_, _ = w.Write([]byte(`{"MediaContainer":{"Directory":[{"key":"1","type":"movie","uuid":"sec-1"}]}}`))
+		case "/library/sections/1/all":
+			_, _ = w.Write([]byte(`{"MediaContainer":{"size":3,"Metadata":[
+				{"ratingKey":"1","type":"movie","title":"Movie 1","duration":60000,"Media":[{"id":10,"duration":60000,"Part":[{"id":20,"duration":60000,"key":"/library/parts/20/file.mp4"}]}]},
+				{"ratingKey":"2","type":"movie","title":"Movie 2","duration":60000,"Media":[{"id":11,"duration":60000,"Part":[{"id":21,"duration":60000,"key":"/library/parts/21/file.mp4"}]}]},
+				{"ratingKey":"3","type":"movie","title":"Movie 3","duration":60000,"Media":[{"id":12,"duration":60000,"Part":[{"id":22,"duration":60000,"key":"/library/parts/22/file.mp4"}]}]}
+			]}}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	resolver, err := NewPlexResourceResolver(server.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resolver.SetTrustedOrigins("pms-1", []string{server.URL})
+
+	app := &Application{
+		plexResources:     resolver,
+		machineIdentifier: "pms-1",
+		sharedCorpus:      true,
+	}
+	app.config.Plex.Host = server.URL
+	app.config.Plex.Token = "server-token"
+
+	now := time.Now().UTC()
+	job := &subtitleIndexJob{
+		id:        "job-shared-test",
+		owner:     "owner-test",
+		state:     "running",
+		startedAt: now,
+		updatedAt: now,
+	}
+
+	ctx := ContextWithUser(ContextWithAuthToken(context.Background(), "user-token"), User{Uuid: "owner-test"})
+	access := &PlexAccess{
+		baseOrigin:        server.URL,
+		secretToken:       "user-token",
+		accountToken:      "user-token",
+		callerUUID:        "owner-test",
+		machineIdentifier: "pms-1",
+	}
+	ctx = ContextWithPlexAccess(ctx, access)
+
+	var indexedCount atomic.Int32
+	var failedCount atomic.Int32
+	err = app.discoverAndIndexSources(ctx, job, func(work subtitleIndexWork) error {
+		if work.source.RatingKey == "2" {
+			job.recordSourceFailure(work.source, subtitleItemFailure(errors.New("ffmpeg extraction failed")), 1)
+			failedCount.Add(1)
+			return nil
+		}
+		indexedCount.Add(1)
+		return nil
+	})
+
+	if err != nil {
+		t.Fatalf("expected nil error (scan should not abort on item failure), got: %v", err)
+	}
+	if indexedCount.Load() != 2 {
+		t.Fatalf("expected 2 successful items indexed, got %d", indexedCount.Load())
+	}
+	if failedCount.Load() != 1 {
+		t.Fatalf("expected 1 failed item recorded, got %d", failedCount.Load())
+	}
+}
+
+func TestRecoverPersistedJobsPreservesSharedState(t *testing.T) {
+	app := &Application{
+		sharedCorpus:      true,
+		machineIdentifier: "pms-1",
+	}
+	mgr := newSubtitleIndexJobManager(app)
+	if err := mgr.recoverPersistedJobs(); err != nil {
+		t.Fatalf("expected nil error, got: %v", err)
+	}
+}
+
+func TestResolveLocalPartFileDirectAndMapped(t *testing.T) {
+	tmpDir := t.TempDir()
+	sampleFile := filepath.Join(tmpDir, "movie.mkv")
+	if err := os.WriteFile(sampleFile, []byte("fake-video"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	app := &Application{}
+	app.config.Plex.PathMappings = map[string]string{
+		"/volume1/media": tmpDir,
+	}
+
+	// 1. Direct match: part.File points to the real file on disk
+	partDirect := &components.Part{
+		File: stringPointer(sampleFile),
+		Key:  "/library/parts/1/file.mkv",
+	}
+	resolved, ok := app.resolveLocalPartFile(partDirect)
+	if !ok || resolved != sampleFile {
+		t.Fatalf("expected direct match %q, got %q (ok=%v)", sampleFile, resolved, ok)
+	}
+
+	// 2. Mapped match: part.File has Plex path /volume1/media/movie.mkv
+	plexPath := "/volume1/media/movie.mkv"
+	partMapped := &components.Part{
+		File: stringPointer(plexPath),
+		Key:  "/library/parts/1/file.mkv",
+	}
+	resolved, ok = app.resolveLocalPartFile(partMapped)
+	if !ok || resolved != sampleFile {
+		t.Fatalf("expected mapped match %q, got %q (ok=%v)", sampleFile, resolved, ok)
+	}
+
+	// 3. Missing file: path does not exist
+	nonExistent := "/volume1/media/missing.mkv"
+	partMissing := &components.Part{
+		File: stringPointer(nonExistent),
+		Key:  "/library/parts/2/file.mkv",
+	}
+	resolved, ok = app.resolveLocalPartFile(partMissing)
+	if ok || resolved != "" {
+		t.Fatalf("expected missing file to return false, got %q (ok=%v)", resolved, ok)
+	}
+
+	// 4. Nil / empty file
+	if _, ok := app.resolveLocalPartFile(nil); ok {
+		t.Fatal("expected nil part to return false")
+	}
+	if _, ok := app.resolveLocalPartFile(&components.Part{Key: "/part/1"}); ok {
+		t.Fatal("expected nil File to return false")
+	}
+}
+
+func TestSubtitleIndexMediaURLPrefersLocalFile(t *testing.T) {
+	tmpDir := t.TempDir()
+	sampleFile := filepath.Join(tmpDir, "sample.mkv")
+	if err := os.WriteFile(sampleFile, []byte("fake-video"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	app := &Application{}
+	app.config.Plex.Host = "http://127.0.0.1:32400"
+	app.config.Plex.Token = "tok"
+
+	// When local file exists on disk, returns local path directly
+	partLocal := &components.Part{
+		File: stringPointer(sampleFile),
+		Key:  "/library/parts/10/file.mkv",
+	}
+	url, release, err := app.subtitleIndexMediaURL(context.Background(), partLocal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if release != nil {
+		t.Fatal("expected nil release for local file")
+	}
+	if url != sampleFile {
+		t.Fatalf("expected local path %q, got %q", sampleFile, url)
+	}
+
+	// When local file does not exist, falls back to Plex HTTP URL
+	partRemote := &components.Part{
+		File: stringPointer("/nonexistent/file.mkv"),
+		Key:  "/library/parts/20/file.mkv",
+	}
+	url, _, err = app.subtitleIndexMediaURL(context.Background(), partRemote)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(url, "http://127.0.0.1:32400/library/parts/20/file.mkv?") {
+		t.Fatalf("expected HTTP fallback url, got %q", url)
+	}
+}
+
+func TestExternalSubtitleTrackPlanIdentification(t *testing.T) {
+	streams := []components.Stream{
+		{
+			StreamType:   3,
+			Codec:        "srt",
+			Key:          "/library/streams/101",
+			LanguageCode: stringPointer("eng"),
+		},
+	}
+	plans := enumerateSubtitleTrackPlans(streams)
+	if len(plans) != 1 {
+		t.Fatalf("expected 1 plan, got %d", len(plans))
+	}
+	if !plans[0].Stream.External {
+		t.Fatalf("expected stream to be identified as external: %+v", plans[0])
+	}
+	if plans[0].Stream.Type != "text" {
+		t.Fatalf("expected stream type text, got %q", plans[0].Stream.Type)
+	}
+}
+
 
 
 

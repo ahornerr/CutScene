@@ -207,8 +207,8 @@ func configureFFmpegHTTPRecovery(inputArgs ffmpeg.KwArgs, rawURL string) {
 	inputArgs["reconnect_streamed"] = "1"
 	inputArgs["reconnect_on_network_error"] = "1"
 	inputArgs["reconnect_on_http_error"] = "502,503,504"
-	inputArgs["reconnect_delay_max"] = "2"
-	inputArgs["rw_timeout"] = "15000000"
+	inputArgs["reconnect_delay_max"] = "5"
+	inputArgs["rw_timeout"] = "60000000"
 }
 
 type FfmpegParamsMetadata struct {
@@ -646,8 +646,12 @@ func ExtractSubtitleFullContext(ctx context.Context, url string, subtitleIndex i
 	tmpFile := fmt.Sprintf("/tmp/cutscene_subfull_%d.srt", time.Now().UnixNano())
 
 	inputArgs := ffmpeg.KwArgs{
-		"hide_banner": "",
-		"loglevel":    "error",
+		"hide_banner":      "",
+		"loglevel":         "error",
+		"probesize":        "1M",
+		"analyzeduration":  "1M",
+		"discard:v":        "all",
+		"discard:a":        "all",
 	}
 
 	outputArgs := ffmpeg.KwArgs{
@@ -879,6 +883,7 @@ func ExtractSubtitleTracksBatchContext(ctx context.Context, mediaURL string, emb
 			args = append(args, "-"+key, fmt.Sprint(value))
 		}
 	}
+	args = append(args, "-probesize", "1M", "-analyzeduration", "1M", "-discard:v", "all", "-discard:a", "all")
 	args = append(args, "-i", mediaURL)
 	paths := make(map[int]string, len(embeddedIndices))
 	for index, embeddedIndex := range embeddedIndices {

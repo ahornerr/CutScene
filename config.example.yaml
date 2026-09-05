@@ -1,6 +1,12 @@
 plex:
   host: https://my.plex.server
   token: replace-with-a-plex-server-token
+  # Optional: Map Plex server paths to local mount paths inside this container.
+  # Enables direct local disk access for subtitle extraction and rendering,
+  # bypassing Plex HTTP streaming for massive speedups.
+  # If mount paths inside the container match Plex paths, no mapping is needed.
+  # path_mappings:
+  #   /volume1/media: /media
 api:
   listen_addr: ":8080"
   # Browser-reachable URL used as the Plex OAuth/PIN authentication forward URL.

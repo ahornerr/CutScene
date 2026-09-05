@@ -207,8 +207,6 @@ func (m *subtitleIndexJobManager) recoverPersistedJobs() error {
 	}
 	if m.app.sharedCorpus && strings.TrimSpace(m.app.machineIdentifier) != "" {
 		_, _ = m.app.subtitleSearch.pool.Exec(ctx, `UPDATE subtitle_shared_sections SET state=CASE WHEN ready THEN 'ready' ELSE 'failed' END, scan_id=COALESCE(ready_scan_id, scan_id) WHERE machine_identifier=$1 AND state='building'`, m.app.machineIdentifier)
-		_, _ = m.app.subtitleSearch.pool.Exec(ctx, `DELETE FROM subtitle_shared_chunks WHERE machine_identifier=$1 AND scan_id NOT IN (SELECT ready_scan_id FROM subtitle_shared_sections WHERE machine_identifier=$1 AND ready=TRUE AND ready_scan_id IS NOT NULL)`, m.app.machineIdentifier)
-		_, _ = m.app.subtitleSearch.pool.Exec(ctx, `DELETE FROM subtitle_shared_sources WHERE machine_identifier=$1 AND scan_id NOT IN (SELECT ready_scan_id FROM subtitle_shared_sections WHERE machine_identifier=$1 AND ready=TRUE AND ready_scan_id IS NOT NULL)`, m.app.machineIdentifier)
 	}
 	return nil
 }
@@ -333,9 +331,6 @@ func (m *subtitleIndexJobManager) run(parent context.Context, job *subtitleIndex
 			_ = m.persistJob(job)
 			if failed <= 3 || failed%100 == 0 {
 				log.Printf("subtitle index-all source failed owner=%s title=%q: %s", job.owner, source.Title, redactedDiagnostic(indexErr))
-			}
-			if m.app.sharedCorpus {
-				return indexErr
 			}
 			return nil
 		}
@@ -624,8 +619,10 @@ func (a *Application) discoverAndIndexSources(ctx context.Context, job *subtitle
 				continue
 			}
 			scanID = uuid.NewString()
-			if _, err := a.subtitleSearch.pool.Exec(ctx, `INSERT INTO subtitle_shared_sections (machine_identifier, section_uuid, section_key, section_type, state, scan_id, ready) VALUES ($1,$2,$3,$4,'building',$5,FALSE) ON CONFLICT (machine_identifier, section_uuid) DO UPDATE SET section_key=EXCLUDED.section_key, section_type=EXCLUDED.section_type, state=CASE WHEN subtitle_shared_sections.ready THEN 'ready' ELSE 'building' END, scan_id=EXCLUDED.scan_id, ready_at=subtitle_shared_sections.ready_at, ready=subtitle_shared_sections.ready`, a.machineIdentifier, section.UUID, section.Key, section.Type, scanID); err != nil {
-				return errors.New("could not start shared subtitle section scan")
+			if a.subtitleSearch != nil && a.subtitleSearch.pool != nil {
+				if _, err := a.subtitleSearch.pool.Exec(ctx, `INSERT INTO subtitle_shared_sections (machine_identifier, section_uuid, section_key, section_type, state, scan_id, ready) VALUES ($1,$2,$3,$4,'building',$5,FALSE) ON CONFLICT (machine_identifier, section_uuid) DO UPDATE SET section_key=EXCLUDED.section_key, section_type=EXCLUDED.section_type, state=CASE WHEN subtitle_shared_sections.ready THEN 'ready' ELSE 'building' END, scan_id=EXCLUDED.scan_id, ready_at=subtitle_shared_sections.ready_at, ready=subtitle_shared_sections.ready`, a.machineIdentifier, section.UUID, section.Key, section.Type, scanID); err != nil {
+					return errors.New("could not start shared subtitle section scan")
+				}
 			}
 		}
 		sectionCtx, cancelSection := context.WithCancel(ctx)
@@ -634,8 +631,11 @@ func (a *Application) discoverAndIndexSources(ctx context.Context, job *subtitle
 		var workers sync.WaitGroup
 		var workerMu sync.Mutex
 		var workerErr error
-		itemFailed := false
-		for i := 0; i < subtitleBulkWorkers; i++ {
+		numWorkers := subtitleBulkWorkers
+		if a.config.Ffmpeg.Concurrency > numWorkers {
+			numWorkers = a.config.Ffmpeg.Concurrency
+		}
+		for i := 0; i < numWorkers; i++ {
 			workers.Add(1)
 			go func() {
 				defer workers.Done()
@@ -645,9 +645,7 @@ func (a *Application) discoverAndIndexSources(ctx context.Context, job *subtitle
 					}
 					if err := index(source); err != nil {
 						workerMu.Lock()
-						if errors.Is(err, errSubtitleIndexItem) {
-							itemFailed = true
-						} else if workerErr == nil {
+						if workerErr == nil {
 							workerErr = err
 							cancelSection()
 						}
@@ -707,7 +705,6 @@ func (a *Application) discoverAndIndexSources(ctx context.Context, job *subtitle
 		cancelSection()
 		workerMu.Lock()
 		currentWorkerErr := workerErr
-		currentItemFailed := itemFailed
 		workerMu.Unlock()
 		if currentWorkerErr != nil {
 			if a.sharedCorpus {
@@ -729,29 +726,23 @@ func (a *Application) discoverAndIndexSources(ctx context.Context, job *subtitle
 			}
 			return pageErr
 		}
-		if currentItemFailed {
-			if a.sharedCorpus {
-				if err := a.abortSharedSubtitleScan(ctx, section.UUID, scanID); err != nil {
-					return err
-				}
-			}
-			continue
-		}
 		if a.sharedCorpus {
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
-			if _, err := a.subtitleSearch.pool.Exec(ctx, `UPDATE subtitle_shared_sections SET state='ready', ready_at=NOW(), ready=TRUE, ready_scan_id=scan_id WHERE machine_identifier=$1 AND section_uuid=$2 AND scan_id=$3`, a.machineIdentifier, section.UUID, scanID); err != nil {
-				return errors.New("could not publish shared subtitle section")
-			}
-			if _, err := a.subtitleSearch.pool.Exec(ctx, `DELETE FROM subtitle_shared_chunks c WHERE c.machine_identifier=$1 AND c.section_uuid=$2 AND c.scan_id=$3 AND NOT EXISTS (SELECT 1 FROM subtitle_shared_sources s WHERE s.machine_identifier=c.machine_identifier AND s.section_uuid=c.section_uuid AND s.scan_id=c.scan_id AND s.rating_key=c.rating_key AND s.media_id=c.media_id AND s.part_id=c.part_id AND s.subtitle_index=c.subtitle_index)`, a.machineIdentifier, section.UUID, scanID); err != nil {
-				return errors.New("could not prune shared subtitle chunks")
-			}
-			if _, err := a.subtitleSearch.pool.Exec(ctx, `DELETE FROM subtitle_shared_chunks WHERE machine_identifier=$1 AND section_uuid=$2 AND scan_id <> $3`, a.machineIdentifier, section.UUID, scanID); err != nil {
-				return errors.New("could not prune shared subtitle chunks")
-			}
-			if _, err := a.subtitleSearch.pool.Exec(ctx, `DELETE FROM subtitle_shared_sources WHERE machine_identifier=$1 AND section_uuid=$2 AND scan_id <> $3`, a.machineIdentifier, section.UUID, scanID); err != nil {
-				return errors.New("could not prune shared subtitle sources")
+			if a.subtitleSearch != nil && a.subtitleSearch.pool != nil {
+				if _, err := a.subtitleSearch.pool.Exec(ctx, `UPDATE subtitle_shared_sections SET state='ready', ready_at=NOW(), ready=TRUE, ready_scan_id=scan_id WHERE machine_identifier=$1 AND section_uuid=$2 AND scan_id=$3`, a.machineIdentifier, section.UUID, scanID); err != nil {
+					return errors.New("could not publish shared subtitle section")
+				}
+				if _, err := a.subtitleSearch.pool.Exec(ctx, `DELETE FROM subtitle_shared_chunks c WHERE c.machine_identifier=$1 AND c.section_uuid=$2 AND c.scan_id=$3 AND NOT EXISTS (SELECT 1 FROM subtitle_shared_sources s WHERE s.machine_identifier=c.machine_identifier AND s.section_uuid=c.section_uuid AND s.scan_id=c.scan_id AND s.rating_key=c.rating_key AND s.media_id=c.media_id AND s.part_id=c.part_id AND s.subtitle_index=c.subtitle_index)`, a.machineIdentifier, section.UUID, scanID); err != nil {
+					return errors.New("could not prune shared subtitle chunks")
+				}
+				if _, err := a.subtitleSearch.pool.Exec(ctx, `DELETE FROM subtitle_shared_chunks WHERE machine_identifier=$1 AND section_uuid=$2 AND scan_id <> $3`, a.machineIdentifier, section.UUID, scanID); err != nil {
+					return errors.New("could not prune shared subtitle chunks")
+				}
+				if _, err := a.subtitleSearch.pool.Exec(ctx, `DELETE FROM subtitle_shared_sources WHERE machine_identifier=$1 AND section_uuid=$2 AND scan_id <> $3`, a.machineIdentifier, section.UUID, scanID); err != nil {
+					return errors.New("could not prune shared subtitle sources")
+				}
 			}
 		}
 	}
