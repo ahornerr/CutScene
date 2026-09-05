@@ -35,7 +35,13 @@ const (
 	subtitleEmbeddingDimensions            = defaultSubtitleEmbeddingDimensions
 	minSubtitleEmbeddingDimensions         = 1
 	maxSubtitleEmbeddingDimensions         = 2000
-	subtitleEmbeddingBatchSize             = 32
+	defaultSubtitleEmbeddingBatchSize      = 32
+	minSubtitleEmbeddingBatchSize          = 1
+	maxSubtitleEmbeddingBatchSize          = 512
+	defaultSubtitleEmbeddingConcurrency    = 2
+	minSubtitleEmbeddingConcurrency        = 1
+	maxSubtitleEmbeddingConcurrency        = 32
+	subtitleEmbeddingBatchSize             = defaultSubtitleEmbeddingBatchSize
 	maxSharedSubtitleCandidates            = 200
 	maxSharedSubtitleSourceChecks          = 100
 	maxSharedSubtitleAuthorizedHits        = 50
@@ -47,8 +53,10 @@ const (
 	maxSubtitleSemanticCandidates          = 200
 	// Keep result windows focused enough to open directly as short clips.
 	// Subtitle timing still determines the exact duration.
-	subtitleChunkMaxRunes = 400
-	bgeQueryInstruction   = "Represent this sentence for searching relevant passages: "
+	subtitleChunkMaxRunes      = 400
+	subtitleChunkMaxGapMs      int64 = 15 * 1000
+	subtitleChunkMaxDurationMs int64 = 60 * 1000
+	bgeQueryInstruction        = "Represent this sentence for searching relevant passages: "
 )
 
 var errSubtitleSearchDisabled = errors.New("semantic subtitle search is disabled")
@@ -98,13 +106,16 @@ func releaseSubtitleSemaphore(semaphore chan struct{}) {
 // constructed when semantic_search.enabled is false, so existing deployments
 // do not need PostgreSQL or TEI.
 type subtitleSearchStore struct {
-	pool           *pgxpool.Pool
-	embeddings     *teiClient
-	dimensions     int
-	bulkEmbeddings chan struct{}
-	bulkWrites     chan struct{}
-	trackLocks     keyedSubtitleLocks
-	jobMu          sync.Mutex
+	pool             *pgxpool.Pool
+	embeddings       *teiClient
+	dimensions       int
+	batchSize        int
+	concurrency      int
+	queryInstruction string
+	bulkEmbeddings   chan struct{}
+	bulkWrites       chan struct{}
+	trackLocks       keyedSubtitleLocks
+	jobMu            sync.Mutex
 }
 
 type keyedSubtitleLocks struct {
@@ -324,7 +335,7 @@ func migrateSubtitleEmbeddingDimensions(ctx context.Context, pool *pgxpool.Pool,
 	return nil
 }
 
-const subtitleSearchIndexVersion = "subtitle-index-v4-chunk-400-cast-clean-text"
+const subtitleSearchIndexVersion = "subtitle-index-v5-chunk-400-gap-15s-cast-clean-text"
 
 func newSubtitleSearchStore(ctx context.Context, cfg SemanticSearchConfig) (*subtitleSearchStore, error) {
 	provider, err := normalizeEmbeddingsProvider(cfg.EmbeddingsProvider)
@@ -416,12 +427,19 @@ func newSubtitleSearchStore(ctx context.Context, cfg SemanticSearchConfig) (*sub
 		pool.Close()
 		return nil, errors.New("could not connect to semantic search database")
 	}
+	batchSize := normalizeSubtitleEmbeddingBatchSize(cfg.BatchSize)
+	concurrency := normalizeSubtitleEmbeddingConcurrency(cfg.Concurrency)
+	queryInstruction := resolveQueryInstruction(cfg, dimensions)
+
 	return &subtitleSearchStore{
-		pool:           pool,
-		embeddings:     embeddings,
-		dimensions:     dimensions,
-		bulkEmbeddings: make(chan struct{}, 1),
-		bulkWrites:     make(chan struct{}, 1),
+		pool:             pool,
+		embeddings:       embeddings,
+		dimensions:       dimensions,
+		batchSize:        batchSize,
+		concurrency:      concurrency,
+		queryInstruction: queryInstruction,
+		bulkEmbeddings:   make(chan struct{}, concurrency),
+		bulkWrites:       make(chan struct{}, 1),
 	}, nil
 }
 
@@ -485,17 +503,29 @@ func chunkSubtitleEntries(entries []SubtitleEntry) []subtitleChunk {
 			continue
 		}
 		entryRunes := utf8.RuneCountInString(text)
-		if currentRunes > 0 && currentRunes+1+entryRunes > subtitleChunkMaxRunes {
-			flush()
+		if currentRunes > 0 {
+			isRuneLimit := currentRunes+1+entryRunes > subtitleChunkMaxRunes
+			isGapLimit := entry.Start > current.End && (entry.Start-current.End) > subtitleChunkMaxGapMs
+			candidateEnd := current.End
+			if entry.End > candidateEnd {
+				candidateEnd = entry.End
+			}
+			isDurationLimit := (candidateEnd - current.Start) > subtitleChunkMaxDurationMs
+			isOutOfOrder := entry.Start < current.Start
+			if isRuneLimit || isGapLimit || isDurationLimit || isOutOfOrder {
+				flush()
+			}
 		}
 		if currentRunes == 0 {
 			current.Start = entry.Start
+			current.End = entry.End
+		} else if entry.End > current.End {
+			current.End = entry.End
 		}
 		if current.Text != "" {
 			current.Text += "\n"
 		}
 		current.Text += text
-		current.End = entry.End
 		currentRunes += entryRunes + 1
 		// A single pathological cue is split without inventing timestamps.
 		for utf8.RuneCountInString(current.Text) > subtitleChunkMaxRunes {
@@ -538,6 +568,53 @@ func normalizeEmbeddingsProvider(value string) (string, error) {
 	default:
 		return "", fmt.Errorf("unsupported embeddings provider %q (want tei or openai)", provider)
 	}
+}
+
+func normalizeSubtitleEmbeddingBatchSize(value int) int {
+	if value <= 0 {
+		return defaultSubtitleEmbeddingBatchSize
+	}
+	if value < minSubtitleEmbeddingBatchSize {
+		return minSubtitleEmbeddingBatchSize
+	}
+	if value > maxSubtitleEmbeddingBatchSize {
+		return maxSubtitleEmbeddingBatchSize
+	}
+	return value
+}
+
+func normalizeSubtitleEmbeddingConcurrency(value int) int {
+	if value <= 0 {
+		return defaultSubtitleEmbeddingConcurrency
+	}
+	if value < minSubtitleEmbeddingConcurrency {
+		return minSubtitleEmbeddingConcurrency
+	}
+	if value > maxSubtitleEmbeddingConcurrency {
+		return maxSubtitleEmbeddingConcurrency
+	}
+	return value
+}
+
+func resolveQueryInstruction(cfg SemanticSearchConfig, dimensions int) string {
+	if cfg.QueryInstruction != nil {
+		return *cfg.QueryInstruction
+	}
+	modelLower := strings.ToLower(strings.TrimSpace(cfg.EmbeddingsModel))
+	if strings.Contains(modelLower, "bge") {
+		return bgeQueryInstruction
+	}
+	if modelLower == "" && cfg.EmbeddingsProvider != embeddingsProviderOpenAI && dimensions == defaultSubtitleEmbeddingDimensions {
+		return bgeQueryInstruction
+	}
+	return ""
+}
+
+func (s *subtitleSearchStore) queryInput(query string) string {
+	if s != nil && s.queryInstruction != "" {
+		return s.queryInstruction + query
+	}
+	return query
 }
 
 func newEmbeddingClient(rawURL, provider, apiKey, model string, dimensions int) (*teiClient, error) {
@@ -1204,9 +1281,13 @@ func (a *Application) persistSubtitleChunks(ctx context.Context, owner string, s
 			return err
 		}
 	}
+	batchSize := defaultSubtitleEmbeddingBatchSize
+	if a.subtitleSearch != nil && a.subtitleSearch.batchSize > 0 {
+		batchSize = a.subtitleSearch.batchSize
+	}
 	embeddings := make([][]float32, 0, len(chunks))
-	for start := 0; start < len(inputs); start += subtitleEmbeddingBatchSize {
-		end := start + subtitleEmbeddingBatchSize
+	for start := 0; start < len(inputs); start += batchSize {
+		end := start + batchSize
 		if end > len(inputs) {
 			end = len(inputs)
 		}
@@ -1268,9 +1349,13 @@ func (a *Application) persistSharedSubtitleChunks(ctx context.Context, request s
 			return err
 		}
 	}
+	batchSize := defaultSubtitleEmbeddingBatchSize
+	if a.subtitleSearch != nil && a.subtitleSearch.batchSize > 0 {
+		batchSize = a.subtitleSearch.batchSize
+	}
 	embeddings := make([][]float32, 0, len(chunks))
-	for start := 0; start < len(inputs); start += subtitleEmbeddingBatchSize {
-		end := start + subtitleEmbeddingBatchSize
+	for start := 0; start < len(inputs); start += batchSize {
+		end := start + batchSize
 		if end > len(inputs) {
 			end = len(inputs)
 		}
@@ -1792,7 +1877,7 @@ func (a *Application) searchSubtitleIndex(ctx context.Context, query string) ([]
 	if err := load(`SELECT rating_key, media_id, part_id, subtitle_index, title, show_title, season, episode, year, start_ms, end_ms, text, ts_rank_cd(text_search, phraseto_tsquery('simple', $2)) AS score FROM subtitle_chunks WHERE owner_uuid=$1 AND text_search @@ phraseto_tsquery('simple', $2) ORDER BY score DESC, id LIMIT $3`, []any{owner, trimmedQuery, maxSubtitleLexicalCandidates}, 1); err != nil {
 		return nil, err
 	}
-	embeddings, err := a.subtitleSearch.embeddings.embed(ctx, []string{bgeQueryInstruction + trimmedQuery})
+	embeddings, err := a.subtitleSearch.embeddings.embed(ctx, []string{a.subtitleSearch.queryInput(trimmedQuery)})
 	if err != nil {
 		return nil, err
 	}
@@ -1809,6 +1894,9 @@ func (a *Application) searchSubtitleIndex(ctx context.Context, query string) ([]
 }
 
 func (a *Application) searchSharedSubtitleIndex(ctx context.Context, query string) ([]subtitleSearchHit, error) {
+	if a.subtitleSearch == nil {
+		return nil, errSubtitleSearchDisabled
+	}
 	if a.plexResources == nil || strings.TrimSpace(a.machineIdentifier) == "" {
 		return nil, errors.New("shared subtitle search is unavailable")
 	}
@@ -1870,7 +1958,7 @@ func (a *Application) searchSharedSubtitleIndex(ctx context.Context, query strin
 	if err := load(`SELECT c.machine_identifier, c.section_uuid, c.section_key, c.scan_id, s.section_type, c.rating_key, c.media_id, c.part_id, c.subtitle_index, c.start_ms, c.end_ms, ts_rank_cd(c.text_search, phraseto_tsquery('simple', $3)) AS score FROM subtitle_shared_chunks c JOIN subtitle_shared_sections s ON s.machine_identifier=c.machine_identifier AND s.section_uuid=c.section_uuid AND s.ready_scan_id=c.scan_id AND s.state='ready' WHERE c.machine_identifier=$1 AND c.section_uuid=ANY($2) AND c.text_search @@ phraseto_tsquery('simple', $3) AND EXISTS (SELECT 1 FROM subtitle_shared_sources v WHERE v.machine_identifier=c.machine_identifier AND v.section_uuid=c.section_uuid AND v.scan_id=c.scan_id AND v.rating_key=c.rating_key AND v.media_id=c.media_id AND v.part_id=c.part_id AND v.subtitle_index=c.subtitle_index AND v.chunk_count > 0) ORDER BY score DESC, c.id LIMIT $4`, []any{a.machineIdentifier, uuidKeys, trimmedQuery, maxSharedSubtitleCandidates}, 1); err != nil {
 		return nil, err
 	}
-	embeddings, err := a.subtitleSearch.embeddings.embed(ctx, []string{bgeQueryInstruction + trimmedQuery})
+	embeddings, err := a.subtitleSearch.embeddings.embed(ctx, []string{a.subtitleSearch.queryInput(trimmedQuery)})
 	if err != nil {
 		return nil, err
 	}

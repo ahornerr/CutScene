@@ -812,3 +812,225 @@ func TestSubtitleSourceFingerprintDimensionSensitivity(t *testing.T) {
 	}
 }
 
+func TestChunkSubtitleEntriesTimingBoundaries(t *testing.T) {
+	t.Run("cues with gap within 15s are merged", func(t *testing.T) {
+		entries := []SubtitleEntry{
+			{Start: 1000, End: 5000, Text: "first sentence"},
+			{Start: 15000, End: 19000, Text: "second sentence"}, // gap: 15000 - 5000 = 10000ms (10s <= 15s)
+		}
+		chunks := chunkSubtitleEntries(entries)
+		if len(chunks) != 1 {
+			t.Fatalf("expected 1 chunk, got %d: %+v", len(chunks), chunks)
+		}
+		if chunks[0].Start != 1000 || chunks[0].End != 19000 || chunks[0].Text != "first sentence\nsecond sentence" {
+			t.Fatalf("unexpected chunk content: %+v", chunks[0])
+		}
+	})
+
+	t.Run("cues with gap exceeding 15s are split", func(t *testing.T) {
+		entries := []SubtitleEntry{
+			{Start: 1000, End: 5000, Text: "first sentence"},
+			{Start: 21000, End: 25000, Text: "second sentence"}, // gap: 21000 - 5000 = 16000ms (16s > 15s)
+		}
+		chunks := chunkSubtitleEntries(entries)
+		if len(chunks) != 2 {
+			t.Fatalf("expected 2 chunks, got %d: %+v", len(chunks), chunks)
+		}
+		if chunks[0].Start != 1000 || chunks[0].End != 5000 || chunks[0].Text != "first sentence" {
+			t.Fatalf("unexpected first chunk: %+v", chunks[0])
+		}
+		if chunks[1].Start != 21000 || chunks[1].End != 25000 || chunks[1].Text != "second sentence" {
+			t.Fatalf("unexpected second chunk: %+v", chunks[1])
+		}
+	})
+
+	t.Run("cues within 60s total duration are merged", func(t *testing.T) {
+		entries := []SubtitleEntry{
+			{Start: 0, End: 10000, Text: "cue 1"},
+			{Start: 12000, End: 22000, Text: "cue 2"},
+			{Start: 24000, End: 34000, Text: "cue 3"},
+			{Start: 36000, End: 46000, Text: "cue 4"},
+			{Start: 48000, End: 58000, Text: "cue 5"}, // span 0 to 58000ms (58s <= 60s)
+		}
+		chunks := chunkSubtitleEntries(entries)
+		if len(chunks) != 1 {
+			t.Fatalf("expected 1 chunk, got %d: %+v", len(chunks), chunks)
+		}
+		if chunks[0].Start != 0 || chunks[0].End != 58000 {
+			t.Fatalf("unexpected chunk timing: start=%d end=%d", chunks[0].Start, chunks[0].End)
+		}
+	})
+
+	t.Run("cues exceeding 60s total duration are split", func(t *testing.T) {
+		entries := []SubtitleEntry{
+			{Start: 0, End: 20000, Text: "cue 1"},
+			{Start: 25000, End: 45000, Text: "cue 2"}, // total span: 45s <= 60s
+			{Start: 50000, End: 65000, Text: "cue 3"}, // gap is 5s, but total span from start 0 would be 65s > 60s
+		}
+		chunks := chunkSubtitleEntries(entries)
+		if len(chunks) != 2 {
+			t.Fatalf("expected 2 chunks due to 60s duration limit, got %d: %+v", len(chunks), chunks)
+		}
+		if chunks[0].Start != 0 || chunks[0].End != 45000 || chunks[0].Text != "cue 1\ncue 2" {
+			t.Fatalf("unexpected first chunk: %+v", chunks[0])
+		}
+		if chunks[1].Start != 50000 || chunks[1].End != 65000 || chunks[1].Text != "cue 3" {
+			t.Fatalf("unexpected second chunk: %+v", chunks[1])
+		}
+	})
+
+	t.Run("single long cue exceeding 60s is preserved without synthetic timestamps", func(t *testing.T) {
+		entries := []SubtitleEntry{
+			{Start: 0, End: 90000, Text: "single long descriptive cue spanning 90 seconds"},
+		}
+		chunks := chunkSubtitleEntries(entries)
+		if len(chunks) != 1 {
+			t.Fatalf("expected 1 chunk for single cue, got %d", len(chunks))
+		}
+		if chunks[0].Start != 0 || chunks[0].End != 90000 {
+			t.Fatalf("unexpected chunk boundaries: %+v", chunks[0])
+		}
+	})
+
+	t.Run("overlapping cues preserve maximum end timestamp", func(t *testing.T) {
+		entries := []SubtitleEntry{
+			{Start: 1000, End: 8000, Text: "primary line"},
+			{Start: 2000, End: 6000, Text: "overlapping shorter line"},
+		}
+		chunks := chunkSubtitleEntries(entries)
+		if len(chunks) != 1 {
+			t.Fatalf("expected 1 chunk, got %d: %+v", len(chunks), chunks)
+		}
+		if chunks[0].Start != 1000 || chunks[0].End != 8000 {
+			t.Fatalf("unexpected chunk boundaries for overlapping cues: %+v", chunks[0])
+		}
+	})
+}
+
+func TestResolveQueryInstruction(t *testing.T) {
+	custom := "Instruct: search\nQuery: "
+	empty := ""
+
+	tests := []struct {
+		name       string
+		cfg        SemanticSearchConfig
+		dimensions int
+		want       string
+	}{
+		{
+			name: "explicit custom instruction",
+			cfg: SemanticSearchConfig{
+				QueryInstruction: &custom,
+				EmbeddingsModel:  "BAAI/bge-base-en-v1.5",
+			},
+			dimensions: 768,
+			want:       custom,
+		},
+		{
+			name: "explicit empty instruction disables prefix even for bge",
+			cfg: SemanticSearchConfig{
+				QueryInstruction: &empty,
+				EmbeddingsModel:  "BAAI/bge-base-en-v1.5",
+			},
+			dimensions: 768,
+			want:       "",
+		},
+		{
+			name: "implicit bge model defaults to bge instruction",
+			cfg: SemanticSearchConfig{
+				EmbeddingsModel: "BAAI/bge-base-en-v1.5",
+			},
+			dimensions: 768,
+			want:       bgeQueryInstruction,
+		},
+		{
+			name: "implicit qwen model defaults to empty instruction",
+			cfg: SemanticSearchConfig{
+				EmbeddingsModel: "Qwen/Qwen3-Embedding-0.6B",
+			},
+			dimensions: 1024,
+			want:       "",
+		},
+		{
+			name: "implicit default tei with 768 dimensions defaults to bge instruction",
+			cfg: SemanticSearchConfig{
+				EmbeddingsProvider: "tei",
+			},
+			dimensions: 768,
+			want:       bgeQueryInstruction,
+		},
+		{
+			name: "implicit default tei with 1024 dimensions defaults to empty instruction",
+			cfg: SemanticSearchConfig{
+				EmbeddingsProvider: "tei",
+			},
+			dimensions: 1024,
+			want:       "",
+		},
+		{
+			name: "openai provider with non-bge model defaults to empty instruction",
+			cfg: SemanticSearchConfig{
+				EmbeddingsProvider: "openai",
+				EmbeddingsModel:    "text-embedding-3-small",
+			},
+			dimensions: 1536,
+			want:       "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := resolveQueryInstruction(tt.cfg, tt.dimensions)
+			if got != tt.want {
+				t.Fatalf("resolveQueryInstruction() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestNormalizeSubtitleEmbeddingBatchSizeAndConcurrency(t *testing.T) {
+	if got := normalizeSubtitleEmbeddingBatchSize(0); got != defaultSubtitleEmbeddingBatchSize {
+		t.Fatalf("expected default batch size %d, got %d", defaultSubtitleEmbeddingBatchSize, got)
+	}
+	if got := normalizeSubtitleEmbeddingBatchSize(-5); got != defaultSubtitleEmbeddingBatchSize {
+		t.Fatalf("expected default batch size %d, got %d", defaultSubtitleEmbeddingBatchSize, got)
+	}
+	if got := normalizeSubtitleEmbeddingBatchSize(64); got != 64 {
+		t.Fatalf("expected batch size 64, got %d", got)
+	}
+	if got := normalizeSubtitleEmbeddingBatchSize(1000); got != maxSubtitleEmbeddingBatchSize {
+		t.Fatalf("expected capped batch size %d, got %d", maxSubtitleEmbeddingBatchSize, got)
+	}
+
+	if got := normalizeSubtitleEmbeddingConcurrency(0); got != defaultSubtitleEmbeddingConcurrency {
+		t.Fatalf("expected default concurrency %d, got %d", defaultSubtitleEmbeddingConcurrency, got)
+	}
+	if got := normalizeSubtitleEmbeddingConcurrency(-2); got != defaultSubtitleEmbeddingConcurrency {
+		t.Fatalf("expected default concurrency %d, got %d", defaultSubtitleEmbeddingConcurrency, got)
+	}
+	if got := normalizeSubtitleEmbeddingConcurrency(4); got != 4 {
+		t.Fatalf("expected concurrency 4, got %d", got)
+	}
+	if got := normalizeSubtitleEmbeddingConcurrency(100); got != maxSubtitleEmbeddingConcurrency {
+		t.Fatalf("expected capped concurrency %d, got %d", maxSubtitleEmbeddingConcurrency, got)
+	}
+}
+
+func TestSubtitleSearchStoreQueryInput(t *testing.T) {
+	var nilStore *subtitleSearchStore
+	if got := nilStore.queryInput("test"); got != "test" {
+		t.Fatalf("expected %q, got %q", "test", got)
+	}
+
+	emptyStore := &subtitleSearchStore{queryInstruction: ""}
+	if got := emptyStore.queryInput("test"); got != "test" {
+		t.Fatalf("expected %q, got %q", "test", got)
+	}
+
+	bgeStore := &subtitleSearchStore{queryInstruction: bgeQueryInstruction}
+	want := bgeQueryInstruction + "test"
+	if got := bgeStore.queryInput("test"); got != want {
+		t.Fatalf("expected %q, got %q", want, got)
+	}
+}
+
