@@ -18,7 +18,11 @@ func TestSubtitleBatchHelperProcess(t *testing.T) {
 	args := os.Args
 	for i := 0; i+2 < len(args); i++ {
 		if args[i] == "-c:s" && args[i+1] == "srt" {
-			if err := os.WriteFile(args[i+2], []byte("1\n00:00:01,000 --> 00:00:02,000\nhello\n"), 0600); err != nil {
+			data := []byte("1\n00:00:01,000 --> 00:00:02,000\nhello\n")
+			if os.Getenv("CUTSCENE_BATCH_HELPER_EMPTY_FIRST") == "1" && strings.Contains(args[i+2], "track_000") {
+				data = []byte("")
+			}
+			if err := os.WriteFile(args[i+2], data, 0600); err != nil {
 				os.Exit(2)
 			}
 		}
@@ -84,3 +88,29 @@ func TestExtractSubtitleTracksBatchCleansOutputsOnCommandFailure(t *testing.T) {
 		t.Fatalf("failed batch output was not cleaned up: %v", err)
 	}
 }
+
+func TestExtractSubtitleTracksBatchAllowsZeroByteTrack(t *testing.T) {
+	original := subtitleBatchFFmpegCommand
+	t.Cleanup(func() { subtitleBatchFFmpegCommand = original })
+	subtitleBatchFFmpegCommand = func(ctx context.Context, args ...string) *exec.Cmd {
+		cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=TestSubtitleBatchHelperProcess", "--")
+		cmd.Env = append(os.Environ(), "CUTSCENE_BATCH_HELPER=1", "CUTSCENE_BATCH_HELPER_EMPTY_FIRST=1")
+		cmd.Args = append(cmd.Args, args...)
+		return cmd
+	}
+
+	entries, err := ExtractSubtitleTracksBatchContext(context.Background(), "http://127.0.0.1/media", []int{10, 20})
+	if err != nil {
+		t.Fatalf("batch extraction with 0-byte track failed: %v", err)
+	}
+	if len(entries) != 2 {
+		t.Fatalf("entries count = %d, want 2", len(entries))
+	}
+	if entries[10] != nil {
+		t.Fatalf("expected nil entries for 0-byte track 10, got: %+v", entries[10])
+	}
+	if len(entries[20]) != 1 {
+		t.Fatalf("expected 1 cue for track 20, got: %+v", entries[20])
+	}
+}
+

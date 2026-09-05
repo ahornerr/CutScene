@@ -2,14 +2,21 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"encoding/xml"
 	"fmt"
+	"io"
 	"net/http"
 	"strconv"
+	"time"
 
 	"github.com/google/uuid"
 )
+
+var plexTVHTTPClient = &http.Client{
+	Timeout: 10 * time.Second,
+}
 
 type PlexTV struct {
 	token      string
@@ -57,17 +64,33 @@ func (u Users) HasUser(userId string, machineId string) bool {
 }
 
 func (p *PlexTV) getUsers() (*Users, error) {
-	url := fmt.Sprintf("https://plex.tv/api/users?X-Plex-Token=%s&X-Plex-Client-Identifier=%s", p.token, p.identifier)
+	return p.getUsersContext(context.Background())
+}
 
-	resp, err := http.Get(url)
+func (p *PlexTV) getUsersContext(ctx context.Context) (*Users, error) {
+	reqUrl := "https://plex.tv/api/users"
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqUrl, nil)
 	if err != nil {
 		return nil, err
 	}
+	req.Header.Set("X-Plex-Token", p.token)
+	if p.identifier != "" {
+		req.Header.Set("X-Plex-Client-Identifier", p.identifier)
+	}
 
+	resp, err := plexTVHTTPClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
 	defer resp.Body.Close()
 
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return nil, fmt.Errorf("plex.tv users returned status %d: %s", resp.StatusCode, string(body))
+	}
+
 	var users Users
-	if err := xml.NewDecoder(resp.Body).Decode(&users); err != nil {
+	if err := xml.NewDecoder(io.LimitReader(resp.Body, 8<<20)).Decode(&users); err != nil {
 		return nil, err
 	}
 
@@ -142,7 +165,11 @@ type GetUserResp struct {
 }
 
 func (p *PlexTV) getUser() (*User, error) {
-	req, err := http.NewRequest(http.MethodGet, "https://plex.tv/users/account.json", nil)
+	return p.getUserContext(context.Background())
+}
+
+func (p *PlexTV) getUserContext(ctx context.Context) (*User, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://plex.tv/users/account.json", nil)
 	if err != nil {
 		return nil, err
 	}
@@ -151,15 +178,19 @@ func (p *PlexTV) getUser() (*User, error) {
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := plexTVHTTPClient.Do(req)
 	if err != nil {
 		return nil, err
 	}
-
 	defer resp.Body.Close()
 
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return nil, fmt.Errorf("plex.tv account returned status %d: %s", resp.StatusCode, string(body))
+	}
+
 	var userResp GetUserResp
-	if err := json.NewDecoder(resp.Body).Decode(&userResp); err != nil {
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&userResp); err != nil {
 		return nil, err
 	}
 

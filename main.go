@@ -38,6 +38,8 @@ type SemanticSearchConfig struct {
 	EmbeddingsURL      string `mapstructure:"embeddings_url"`
 	EmbeddingsProvider string `mapstructure:"embeddings_provider"`
 	EmbeddingsAPIKey   string `mapstructure:"embeddings_api_key"`
+	EmbeddingsModel    string `mapstructure:"embeddings_model"`
+	Dimensions         int    `mapstructure:"dimensions"`
 	Enabled            bool   `mapstructure:"enabled"`
 	SharedCorpus       bool   `mapstructure:"shared_corpus"`
 }
@@ -47,6 +49,7 @@ func loadConfig() (*Config, error) {
 	viper.SetConfigName("config")
 	viper.AddConfigPath(".")
 	viper.SetDefault("ffmpeg.concurrency", defaultFFmpegConcurrency)
+	viper.SetDefault("semantic_search.dimensions", 0)
 	if err := viper.ReadInConfig(); err != nil {
 		return nil, fmt.Errorf("reading config file: %w", err)
 	}

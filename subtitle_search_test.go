@@ -212,15 +212,24 @@ func TestHybridSubtitleTitleContextKeepsEpisodesSeparate(t *testing.T) {
 
 func TestValidateEmbeddings(t *testing.T) {
 	good := [][]float32{make([]float32, subtitleEmbeddingDimensions)}
-	if err := validateEmbeddings(good, 1); err != nil {
+	if err := validateEmbeddings(good, 1, subtitleEmbeddingDimensions); err != nil {
 		t.Fatalf("valid embedding rejected: %v", err)
 	}
-	if err := validateEmbeddings(good, 2); err == nil {
+	if err := validateEmbeddings(good, 2, subtitleEmbeddingDimensions); err == nil {
 		t.Fatal("mismatched count accepted")
 	}
 	bad := [][]float32{make([]float32, subtitleEmbeddingDimensions-1)}
-	if err := validateEmbeddings(bad, 1); err == nil {
+	if err := validateEmbeddings(bad, 1, subtitleEmbeddingDimensions); err == nil {
 		t.Fatal("wrong dimension accepted")
+	}
+
+	// Verify 1024 dimensions (e.g. Qwen/Qwen3-Embedding-0.6B)
+	good1024 := [][]float32{make([]float32, 1024)}
+	if err := validateEmbeddings(good1024, 1, 1024); err != nil {
+		t.Fatalf("valid 1024-dim embedding rejected: %v", err)
+	}
+	if err := validateEmbeddings(good1024, 1, 768); err == nil {
+		t.Fatal("1024-dim vector accepted when expecting 768")
 	}
 }
 
@@ -279,7 +288,7 @@ func TestOpenAIEmbeddingClientSendsVLLMRequestAndOrdersResults(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client, err := newEmbeddingClient(server.URL, embeddingsProviderOpenAI, "test-key")
+	client, err := newEmbeddingClient(server.URL, embeddingsProviderOpenAI, "test-key", "", subtitleEmbeddingDimensions)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -298,7 +307,7 @@ func TestOpenAIEmbeddingClientRejectsWrongDimension(t *testing.T) {
 		_ = json.NewEncoder(w).Encode(openAIEmbeddingResponse{Data: []openAIEmbeddingItem{{Index: 0, Embedding: bad}}})
 	}))
 	defer server.Close()
-	client, err := newEmbeddingClient(server.URL, embeddingsProviderOpenAI, "")
+	client, err := newEmbeddingClient(server.URL, embeddingsProviderOpenAI, "", "", subtitleEmbeddingDimensions)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -711,3 +720,95 @@ func TestScanSharedSubtitleCandidateDoesNotDecodeSubtitleText(t *testing.T) {
 		t.Fatalf("candidate=%+v err=%v", candidate, err)
 	}
 }
+
+func TestTEIProbeDimensions1024(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/embed" {
+			t.Fatalf("unexpected path: %q", r.URL.Path)
+		}
+		// Return 1024-dim vector for Qwen3
+		vec := make([]string, 1024)
+		for i := range vec {
+			vec[i] = "0.0"
+		}
+		_, _ = w.Write([]byte("[[" + strings.Join(vec, ",") + "]]"))
+	}))
+	defer server.Close()
+
+	client, err := newEmbeddingClient(server.URL, embeddingsProviderTEI, "", "", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dim, err := client.probeDimensions(context.Background())
+	if err != nil {
+		t.Fatalf("probe failed: %v", err)
+	}
+	if dim != 1024 {
+		t.Fatalf("probed dimension = %d, want 1024", dim)
+	}
+}
+
+func TestOpenAIClientCustomModelAnd1024Dimensions(t *testing.T) {
+	const customModel = "Qwen/Qwen3-Embedding-0.6B"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Model string   `json:"model"`
+			Input []string `json:"input"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatal(err)
+		}
+		if req.Model != customModel {
+			t.Fatalf("model = %q, want %q", req.Model, customModel)
+		}
+		vec := make([]float32, 1024)
+		vec[0] = 0.42
+		_ = json.NewEncoder(w).Encode(openAIEmbeddingResponse{
+			Data: []openAIEmbeddingItem{{Index: 0, Embedding: vec}},
+		})
+	}))
+	defer server.Close()
+
+	client, err := newEmbeddingClient(server.URL, embeddingsProviderOpenAI, "nas-token", customModel, 1024)
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := client.embed(context.Background(), []string{"test query"})
+	if err != nil {
+		t.Fatalf("embed failed: %v", err)
+	}
+	if len(res) != 1 || len(res[0]) != 1024 {
+		t.Fatalf("expected 1 vector of length 1024, got len=%d", len(res[0]))
+	}
+	if res[0][0] != 0.42 {
+		t.Fatalf("vector[0] = %f, want 0.42", res[0][0])
+	}
+}
+
+func TestSubtitleSearchSchemaGenerationWithDimensions(t *testing.T) {
+	schema768 := subtitleSearchSchema(768)
+	if !strings.Contains(schema768, "embedding vector(768) NOT NULL") {
+		t.Fatal("schema768 does not contain vector(768)")
+	}
+
+	schema1024 := subtitleSearchSchema(1024)
+	if !strings.Contains(schema1024, "embedding vector(1024) NOT NULL") {
+		t.Fatal("schema1024 does not contain vector(1024)")
+	}
+	// Verify both tables have 1024
+	count := strings.Count(schema1024, "embedding vector(1024) NOT NULL")
+	if count != 2 {
+		t.Fatalf("expected 2 vector(1024) columns (chunks + shared_chunks), got %d", count)
+	}
+}
+
+func TestSubtitleSourceFingerprintDimensionSensitivity(t *testing.T) {
+	stream := SubtitleStream{Index: 0, Codec: "srt", Language: "English", Type: "text"}
+	fp768 := subtitleSourceFingerprintWithDimensions("movie-1", 1, 2, stream, "context", 768, "rev-1")
+	fp1024 := subtitleSourceFingerprintWithDimensions("movie-1", 1, 2, stream, "context", 1024, "rev-1")
+
+	if fp768 == fp1024 {
+		t.Fatalf("expected fingerprints to differ for different dimensions, both got: %s", fp768)
+	}
+}
+

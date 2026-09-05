@@ -17,14 +17,17 @@ import (
 
 	"github.com/LukeHagar/plexgo/models/components"
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 )
 
 const (
 	indexLibraryPageSize  = 100
-	maxIndexLibraryPages  = 200000
+	maxIndexLibraryPages  = 10000
 	subtitleBulkWorkers   = 3
 	subtitleBulkQueueSize = 6
 )
+
+var errStopPagination = errors.New("stop pagination")
 
 type subtitleIndexJobManager struct {
 	app      *Application
@@ -77,7 +80,11 @@ type subtitleIndexJobStatus struct {
 }
 
 func newSubtitleIndexJobManager(app *Application) *subtitleIndexJobManager {
-	lifetime, cancel := context.WithCancel(app.lifetime)
+	parent := context.Background()
+	if app != nil && app.lifetime != nil {
+		parent = app.lifetime
+	}
+	lifetime, cancel := context.WithCancel(parent)
 	return &subtitleIndexJobManager{app: app, jobs: make(map[string]*subtitleIndexJob), cancel: cancel, lifetime: lifetime}
 }
 
@@ -148,7 +155,7 @@ func (m *subtitleIndexJobManager) loadOrCreatePersistedJob(owner string) (*subti
 	var current, safeError sql.NullString
 	var finished sql.NullTime
 	err := m.app.subtitleSearch.pool.QueryRow(context.Background(), `SELECT id::text, state, discovered, processed, indexed_chunks, skipped, failed, unchanged_tracks, unsupported_tracks, empty_tracks, failed_tracks, current_title, started_at, updated_at, finished_at, error FROM subtitle_index_jobs WHERE owner_uuid=$1 ORDER BY updated_at DESC LIMIT 1`, owner).Scan(&job.id, &job.state, &job.discovered, &job.processed, &job.indexed, &job.skipped, &job.failed, &job.unchangedTracks, &job.unsupportedTracks, &job.emptyTracks, &job.failedTracks, &current, &job.startedAt, &job.updatedAt, &finished, &safeError)
-	if errors.Is(err, sql.ErrNoRows) {
+	if errors.Is(err, pgx.ErrNoRows) || errors.Is(err, sql.ErrNoRows) {
 		job.id, job.owner, job.state, job.startedAt, job.updatedAt = uuid.NewString(), owner, "queued", now, now
 		if _, err := m.app.subtitleSearch.pool.Exec(context.Background(), `INSERT INTO subtitle_index_jobs (id, owner_uuid, state, started_at, updated_at) VALUES ($1,$2,$3,$4,$5)`, job.id, owner, job.state, job.startedAt, job.updatedAt); err != nil {
 			return nil, errors.New("could not create subtitle index job")
@@ -192,6 +199,11 @@ func (m *subtitleIndexJobManager) recoverPersistedJobs() error {
 	_, err := m.app.subtitleSearch.pool.Exec(context.Background(), `UPDATE subtitle_index_jobs SET state='interrupted', updated_at=NOW(), error='indexing interrupted; rescan resumes completed sources' WHERE state IN ('queued','running')`)
 	if err != nil {
 		return errors.New("could not recover subtitle index jobs")
+	}
+	if m.app.sharedCorpus {
+		_, _ = m.app.subtitleSearch.pool.Exec(context.Background(), `UPDATE subtitle_shared_sections SET state=CASE WHEN ready THEN 'ready' ELSE 'failed' END, scan_id=COALESCE(ready_scan_id, scan_id) WHERE state='building'`)
+		_, _ = m.app.subtitleSearch.pool.Exec(context.Background(), `DELETE FROM subtitle_shared_chunks WHERE scan_id NOT IN (SELECT ready_scan_id FROM subtitle_shared_sections WHERE ready=TRUE AND ready_scan_id IS NOT NULL)`)
+		_, _ = m.app.subtitleSearch.pool.Exec(context.Background(), `DELETE FROM subtitle_shared_sources WHERE scan_id NOT IN (SELECT ready_scan_id FROM subtitle_shared_sections WHERE ready=TRUE AND ready_scan_id IS NOT NULL)`)
 	}
 	return nil
 }
@@ -237,7 +249,7 @@ func (m *subtitleIndexJobManager) current(owner string) (*subtitleIndexJob, bool
 	var current, safeError sql.NullString
 	var finished sql.NullTime
 	err := m.app.subtitleSearch.pool.QueryRow(context.Background(), `SELECT id::text, state, discovered, processed, indexed_chunks, skipped, failed, unchanged_tracks, unsupported_tracks, empty_tracks, failed_tracks, current_title, started_at, updated_at, finished_at, error FROM subtitle_index_jobs WHERE owner_uuid=$1 ORDER BY CASE WHEN state IN ('queued','running') THEN 0 ELSE 1 END, updated_at DESC LIMIT 1`, owner).Scan(&job.id, &job.state, &job.discovered, &job.processed, &job.indexed, &job.skipped, &job.failed, &job.unchangedTracks, &job.unsupportedTracks, &job.emptyTracks, &job.failedTracks, &current, &job.startedAt, &job.updatedAt, &finished, &safeError)
-	if errors.Is(err, sql.ErrNoRows) {
+	if errors.Is(err, pgx.ErrNoRows) || errors.Is(err, sql.ErrNoRows) {
 		return nil, false, nil
 	}
 	if err != nil {
@@ -488,13 +500,16 @@ func (a *Application) streamIndexLibrarySectionSources(ctx context.Context, toke
 		return errors.New("caller Plex access is unavailable")
 	}
 	start, previous, pageCount := 0, -1, 0
-	previousPage := ""
+	seenPages := make(map[string]bool)
 	typeValue := map[string]string{"movie": "1", "show": "4"}[sectionType]
 	if typeValue == "" {
 		return errors.New("unsupported Plex section type")
 	}
 	log.Printf("subtitle index-all section started key=%s type=%s", key, sectionType)
 	for {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
 		pageCount++
 		if pageCount > maxIndexLibraryPages {
 			return errors.New("Plex section exceeded pagination safety limit")
@@ -540,22 +555,32 @@ func (a *Application) streamIndexLibrarySectionSources(ctx context.Context, toke
 		if page.MediaContainer.Offset != 0 && page.MediaContainer.Offset != start {
 			return errors.New("Plex section pagination returned an unexpected offset")
 		}
-		pageKey := ""
-		if len(items) > 0 {
-			pageKey = stringValue(items[0].RatingKey) + ":" + stringValue(items[len(items)-1].RatingKey)
-			if pageKey == previousPage {
-				return errors.New("Plex section pagination made no progress")
-			}
+		if len(items) == 0 {
+			log.Printf("subtitle index-all section finished key=%s type=%s pages=%d (empty page)", key, sectionType, pageCount)
+			return nil
 		}
-		previousPage = pageKey
+		pageKey := stringValue(items[0].RatingKey) + ":" + stringValue(items[len(items)-1].RatingKey)
+		if seenPages[pageKey] {
+			log.Printf("subtitle index-all section detected pagination cycle key=%s type=%s page_key=%s", key, sectionType, pageKey)
+			return nil
+		}
+		seenPages[pageKey] = true
 		if err := consume(items); err != nil {
+			if errors.Is(err, errStopPagination) {
+				log.Printf("subtitle index-all section stopped key=%s type=%s pages=%d (stop requested)", key, sectionType, pageCount)
+				return nil
+			}
 			return err
 		}
 		if pageCount == 1 || pageCount%10 == 0 {
 			log.Printf("subtitle index-all section progress key=%s type=%s pages=%d page_items=%d", key, sectionType, pageCount, len(items))
 		}
-		if len(items) == 0 || len(items) < indexLibraryPageSize {
-			log.Printf("subtitle index-all section finished key=%s type=%s pages=%d", key, sectionType, pageCount)
+		if len(items) < indexLibraryPageSize {
+			log.Printf("subtitle index-all section finished key=%s type=%s pages=%d (last page len=%d)", key, sectionType, pageCount, len(items))
+			return nil
+		}
+		if page.MediaContainer.TotalSize > 0 && start+len(items) >= page.MediaContainer.TotalSize {
+			log.Printf("subtitle index-all section reached total size key=%s type=%s total=%d pages=%d", key, sectionType, page.MediaContainer.TotalSize, pageCount)
 			return nil
 		}
 		start += len(items)
@@ -591,6 +616,7 @@ func (a *Application) discoverAndIndexSources(ctx context.Context, job *subtitle
 				return errors.New("could not start shared subtitle section scan")
 			}
 		}
+		sectionCtx, cancelSection := context.WithCancel(ctx)
 		seen := make(map[string]bool)
 		queue := make(chan subtitleIndexWork, subtitleBulkQueueSize)
 		var workers sync.WaitGroup
@@ -602,7 +628,7 @@ func (a *Application) discoverAndIndexSources(ctx context.Context, job *subtitle
 			go func() {
 				defer workers.Done()
 				for source := range queue {
-					if ctx.Err() != nil {
+					if sectionCtx.Err() != nil {
 						continue
 					}
 					if err := index(source); err != nil {
@@ -611,13 +637,16 @@ func (a *Application) discoverAndIndexSources(ctx context.Context, job *subtitle
 							itemFailed = true
 						} else if workerErr == nil {
 							workerErr = err
+							cancelSection()
 						}
 						workerMu.Unlock()
 					}
 				}
 			}()
 		}
-		pageErr := a.streamIndexLibrarySectionSources(ctx, *token, section.Key, section.Type, func(items []components.Metadata) error {
+		consecutiveDuplicatePages := 0
+		pageErr := a.streamIndexLibrarySectionSources(sectionCtx, *token, section.Key, section.Type, func(items []components.Metadata) error {
+			newItemsOnPage := 0
 			for _, item := range items {
 				if item.Type != "movie" && item.Type != "episode" {
 					continue
@@ -639,35 +668,46 @@ func (a *Application) discoverAndIndexSources(ctx context.Context, job *subtitle
 					continue
 				}
 				seen[identity] = true
+				newItemsOnPage++
 				select {
 				case queue <- subtitleIndexWork{source: value, sectionUUID: section.UUID, sectionKey: section.Key, scanID: scanID}:
 					job.mu.Lock()
 					job.discovered++
 					job.updatedAt = time.Now().UTC()
 					job.mu.Unlock()
-				case <-ctx.Done():
-					return ctx.Err()
+				case <-sectionCtx.Done():
+					return sectionCtx.Err()
 				}
+			}
+			if len(items) > 0 && newItemsOnPage == 0 {
+				consecutiveDuplicatePages++
+				if consecutiveDuplicatePages >= 3 {
+					log.Printf("subtitle index-all section detected 3 consecutive duplicate pages key=%s, terminating section pagination", section.Key)
+					return errStopPagination
+				}
+			} else {
+				consecutiveDuplicatePages = 0
 			}
 			return nil
 		})
 		close(queue)
 		workers.Wait()
+		cancelSection()
 		workerMu.Lock()
 		currentWorkerErr := workerErr
 		currentItemFailed := itemFailed
 		workerMu.Unlock()
-		if pageErr != nil {
-			if a.sharedCorpus {
-				a.abortSharedSubtitleScan(ctx, section.UUID, scanID)
-			}
-			return pageErr
-		}
 		if currentWorkerErr != nil {
 			if a.sharedCorpus {
 				a.abortSharedSubtitleScan(ctx, section.UUID, scanID)
 			}
 			return currentWorkerErr
+		}
+		if pageErr != nil {
+			if a.sharedCorpus {
+				a.abortSharedSubtitleScan(ctx, section.UUID, scanID)
+			}
+			return pageErr
 		}
 		if currentItemFailed {
 			if a.sharedCorpus {
