@@ -27,7 +27,10 @@ const (
 	subtitleBulkQueueSize = 6
 )
 
-var errStopPagination = errors.New("stop pagination")
+var (
+	errStopPagination       = errors.New("stop pagination")
+	errPaginationIncomplete = errors.New("section pagination ended prematurely")
+)
 
 type subtitleIndexJobManager struct {
 	app      *Application
@@ -193,17 +196,19 @@ func (m *subtitleIndexJobManager) loadOrCreatePersistedJob(owner string) (*subti
 }
 
 func (m *subtitleIndexJobManager) recoverPersistedJobs() error {
-	if m.app.subtitleSearch == nil {
+	if m == nil || m.app == nil || m.app.subtitleSearch == nil {
 		return nil
 	}
-	_, err := m.app.subtitleSearch.pool.Exec(context.Background(), `UPDATE subtitle_index_jobs SET state='interrupted', updated_at=NOW(), error='indexing interrupted; rescan resumes completed sources' WHERE state IN ('queued','running')`)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	_, err := m.app.subtitleSearch.pool.Exec(ctx, `UPDATE subtitle_index_jobs SET state='interrupted', updated_at=NOW(), error='indexing interrupted; rescan resumes completed sources' WHERE state IN ('queued','running')`)
 	if err != nil {
 		return errors.New("could not recover subtitle index jobs")
 	}
-	if m.app.sharedCorpus {
-		_, _ = m.app.subtitleSearch.pool.Exec(context.Background(), `UPDATE subtitle_shared_sections SET state=CASE WHEN ready THEN 'ready' ELSE 'failed' END, scan_id=COALESCE(ready_scan_id, scan_id) WHERE state='building'`)
-		_, _ = m.app.subtitleSearch.pool.Exec(context.Background(), `DELETE FROM subtitle_shared_chunks WHERE scan_id NOT IN (SELECT ready_scan_id FROM subtitle_shared_sections WHERE ready=TRUE AND ready_scan_id IS NOT NULL)`)
-		_, _ = m.app.subtitleSearch.pool.Exec(context.Background(), `DELETE FROM subtitle_shared_sources WHERE scan_id NOT IN (SELECT ready_scan_id FROM subtitle_shared_sections WHERE ready=TRUE AND ready_scan_id IS NOT NULL)`)
+	if m.app.sharedCorpus && strings.TrimSpace(m.app.machineIdentifier) != "" {
+		_, _ = m.app.subtitleSearch.pool.Exec(ctx, `UPDATE subtitle_shared_sections SET state=CASE WHEN ready THEN 'ready' ELSE 'failed' END, scan_id=COALESCE(ready_scan_id, scan_id) WHERE machine_identifier=$1 AND state='building'`, m.app.machineIdentifier)
+		_, _ = m.app.subtitleSearch.pool.Exec(ctx, `DELETE FROM subtitle_shared_chunks WHERE machine_identifier=$1 AND scan_id NOT IN (SELECT ready_scan_id FROM subtitle_shared_sections WHERE machine_identifier=$1 AND ready=TRUE AND ready_scan_id IS NOT NULL)`, m.app.machineIdentifier)
+		_, _ = m.app.subtitleSearch.pool.Exec(ctx, `DELETE FROM subtitle_shared_sources WHERE machine_identifier=$1 AND scan_id NOT IN (SELECT ready_scan_id FROM subtitle_shared_sections WHERE machine_identifier=$1 AND ready=TRUE AND ready_scan_id IS NOT NULL)`, m.app.machineIdentifier)
 	}
 	return nil
 }
@@ -562,13 +567,19 @@ func (a *Application) streamIndexLibrarySectionSources(ctx context.Context, toke
 		pageKey := stringValue(items[0].RatingKey) + ":" + stringValue(items[len(items)-1].RatingKey)
 		if seenPages[pageKey] {
 			log.Printf("subtitle index-all section detected pagination cycle key=%s type=%s page_key=%s", key, sectionType, pageKey)
-			return nil
+			if page.MediaContainer.TotalSize > 0 && start >= page.MediaContainer.TotalSize {
+				return nil
+			}
+			return errPaginationIncomplete
 		}
 		seenPages[pageKey] = true
 		if err := consume(items); err != nil {
 			if errors.Is(err, errStopPagination) {
 				log.Printf("subtitle index-all section stopped key=%s type=%s pages=%d (stop requested)", key, sectionType, pageCount)
-				return nil
+				if page.MediaContainer.TotalSize > 0 && start+len(items) >= page.MediaContainer.TotalSize {
+					return nil
+				}
+				return errPaginationIncomplete
 			}
 			return err
 		}
@@ -602,6 +613,7 @@ func (a *Application) discoverAndIndexSources(ctx context.Context, job *subtitle
 	if err != nil {
 		return fmt.Errorf("could not discover Plex libraries: %w", err)
 	}
+	hasIncompleteSection := false
 	for _, section := range sections {
 		if section.Type != "movie" && section.Type != "show" {
 			continue
@@ -704,6 +716,14 @@ func (a *Application) discoverAndIndexSources(ctx context.Context, job *subtitle
 			return currentWorkerErr
 		}
 		if pageErr != nil {
+			if errors.Is(pageErr, errPaginationIncomplete) {
+				log.Printf("subtitle index-all section ended prematurely key=%s; skipping publication/pruning to protect index", section.Key)
+				hasIncompleteSection = true
+				if a.sharedCorpus {
+					_ = a.abortSharedSubtitleScan(ctx, section.UUID, scanID)
+				}
+				continue
+			}
 			if a.sharedCorpus {
 				a.abortSharedSubtitleScan(ctx, section.UUID, scanID)
 			}
@@ -739,11 +759,16 @@ func (a *Application) discoverAndIndexSources(ctx context.Context, job *subtitle
 		job.mu.RLock()
 		failed, owner, scanID := job.failed, job.owner, job.scanID
 		job.mu.RUnlock()
-		if failed == 0 {
+		if failed == 0 && !hasIncompleteSection {
 			if err := a.prunePrivateSubtitleSources(ctx, owner, scanID); err != nil {
 				return err
 			}
+		} else if hasIncompleteSection {
+			log.Printf("subtitle index-all private pruning skipped due to incomplete section traversal owner=%s scan_id=%s", owner, scanID)
 		}
+	}
+	if hasIncompleteSection {
+		return errPaginationIncomplete
 	}
 	return nil
 }

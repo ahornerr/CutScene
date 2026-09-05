@@ -263,10 +263,6 @@ func NewApplication(config Config) (*Application, error) {
 			return nil, searchErr
 		}
 		app.subtitleSearch = searchStore
-		if err := app.subtitleJobs.recoverPersistedJobs(); err != nil {
-			app.subtitleSearch.close()
-			return nil, err
-		}
 	}
 
 	identity, err := app.plexAdmin.General.GetIdentity(context.Background())
@@ -280,6 +276,13 @@ func NewApplication(config Config) (*Application, error) {
 	// remains usable, while untrusted advertised alternatives remain rejected.
 	if err := app.plexResources.DiscoverTrustedOrigins(context.Background(), config.Plex.Token, app.machineIdentifier); err != nil {
 		log.Printf("Plex trusted-origin discovery unavailable: %s", redactedDiagnostic(err))
+	}
+
+	if config.SemanticSearch.Enabled {
+		if err := app.subtitleJobs.recoverPersistedJobs(); err != nil {
+			app.subtitleSearch.close()
+			return nil, err
+		}
 	}
 
 	tokenDetails, err := app.plexAdmin.Authentication.GetTokenDetails(context.Background(), operations.GetTokenDetailsRequest{})

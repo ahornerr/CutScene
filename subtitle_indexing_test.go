@@ -237,12 +237,12 @@ func TestStreamIndexLibrarySectionSourcesPaginationCycleTermination(t *testing.T
 	}
 	ctx := ContextWithPlexAccess(context.Background(), access)
 
-	// Stream should detect cycle on second page and terminate cleanly (not loop indefinitely)
+	// Stream should detect cycle on second page and return errPaginationIncomplete
 	err = app.streamIndexLibrarySectionSources(ctx, "user-token", "1", "movie", func(items []components.Metadata) error {
 		return nil
 	})
-	if err != nil {
-		t.Fatalf("expected nil error on cycle termination, got: %v", err)
+	if !errors.Is(err, errPaginationIncomplete) {
+		t.Fatalf("expected errPaginationIncomplete on cycle termination, got: %v", err)
 	}
 	if requestCount.Load() > 5 {
 		t.Fatalf("expected pagination to terminate quickly on cycle, but made %d requests", requestCount.Load())
@@ -340,12 +340,12 @@ func TestStreamIndexLibrarySectionSourcesStopPagination(t *testing.T) {
 	}
 	ctx := ContextWithPlexAccess(context.Background(), access)
 
-	// Returning errStopPagination should stop pagination and return nil
+	// Returning errStopPagination before totalSize is reached should return errPaginationIncomplete
 	err = app.streamIndexLibrarySectionSources(ctx, "user-token", "1", "movie", func(items []components.Metadata) error {
 		return errStopPagination
 	})
-	if err != nil {
-		t.Fatalf("expected nil error on errStopPagination, got: %v", err)
+	if !errors.Is(err, errPaginationIncomplete) {
+		t.Fatalf("expected errPaginationIncomplete on errStopPagination, got: %v", err)
 	}
 	if requestCount.Load() != 1 {
 		t.Fatalf("expected exactly 1 request before stop, got %d", requestCount.Load())
@@ -402,6 +402,71 @@ func TestCallerSectionSourceSetPaginationCycle(t *testing.T) {
 		t.Fatalf("expected %d sources, got %d", indexLibraryPageSize, len(sources))
 	}
 	_ = itemsSeen
+}
+
+func TestDiscoverAndIndexSourcesSkipsPruningOnPaginationCycle(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Path == "/identity" {
+			_, _ = w.Write([]byte(`{"MediaContainer":{"machineIdentifier":"pms-discover-cycle"}}`))
+			return
+		}
+		if r.URL.Path == "/library/sections" {
+			_, _ = w.Write([]byte(`{"MediaContainer":{"Directory":[{"key":"1","type":"movie","title":"Movies","uuid":"sec-1"}]}}`))
+			return
+		}
+		// Returns same page of items to trigger a pagination cycle
+		var items []string
+		for i := 0; i < indexLibraryPageSize; i++ {
+			items = append(items, fmt.Sprintf(`{"ratingKey":"%d","type":"movie","title":"Movie %d","duration":60000,"Media":[{"id":%d,"duration":60000,"Part":[{"id":%d,"duration":60000,"key":"/video.mp4"}]}]}`, i, i, i+10, i+20))
+		}
+		_, _ = w.Write([]byte(fmt.Sprintf(`{"MediaContainer":{"size":%d,"offset":0,"Metadata":[%s]}}`, indexLibraryPageSize, strings.Join(items, ","))))
+	}))
+	defer server.Close()
+
+	resolver, err := NewPlexResourceResolver(server.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resolver.SetTrustedOrigins("pms-discover-cycle", []string{server.URL})
+
+	app := &Application{
+		plexResources:     resolver,
+		machineIdentifier: "pms-discover-cycle",
+	}
+	app.config.Plex.Host = server.URL
+	app.config.Plex.Token = "server-token"
+
+	token := "user-token"
+	ctx := ContextWithAuthToken(context.Background(), token)
+	job := &subtitleIndexJob{
+		owner: "owner-1",
+	}
+
+	var indexedCount atomic.Int32
+	err = app.discoverAndIndexSources(ctx, job, func(work subtitleIndexWork) error {
+		indexedCount.Add(1)
+		return nil
+	})
+
+	// Must return errPaginationIncomplete and not nil
+	if !errors.Is(err, errPaginationIncomplete) {
+		t.Fatalf("expected errPaginationIncomplete, got: %v", err)
+	}
+	if indexedCount.Load() == 0 {
+		t.Fatal("expected items before cycle to be indexed")
+	}
+}
+
+func TestRecoverPersistedJobsRequiresMachineIdentifierForShared(t *testing.T) {
+	app := &Application{
+		sharedCorpus:      true,
+		machineIdentifier: "", // uninitialized machineIdentifier
+	}
+	mgr := newSubtitleIndexJobManager(app)
+	if err := mgr.recoverPersistedJobs(); err != nil {
+		t.Fatalf("expected nil error, got: %v", err)
+	}
 }
 
 
