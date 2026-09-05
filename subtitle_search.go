@@ -1431,10 +1431,10 @@ func (a *Application) persistSharedSubtitleChunks(ctx context.Context, request s
 		return errors.New("could not update shared subtitle index")
 	}
 	defer tx.Rollback(ctx)
-	if _, err := tx.Exec(ctx, `DELETE FROM subtitle_shared_chunks WHERE machine_identifier=$1 AND section_uuid=$2 AND rating_key=$3 AND media_id=$4 AND part_id=$5 AND subtitle_index=$6`, a.machineIdentifier, request.SectionUUID, source.RatingKey, source.MediaID, source.PartID, subtitleIndex); err != nil {
+	if _, err := tx.Exec(ctx, `DELETE FROM subtitle_shared_chunks WHERE machine_identifier=$1 AND section_uuid=$2 AND scan_id=$7 AND rating_key=$3 AND media_id=$4 AND part_id=$5 AND subtitle_index=$6`, a.machineIdentifier, request.SectionUUID, source.RatingKey, source.MediaID, source.PartID, subtitleIndex, request.ScanID); err != nil {
 		return errors.New("could not update shared subtitle index")
 	}
-	if _, err := tx.Exec(ctx, `DELETE FROM subtitle_shared_sources WHERE machine_identifier=$1 AND section_uuid=$2 AND rating_key=$3 AND media_id=$4 AND part_id=$5 AND subtitle_index=$6 AND scan_id <> $7`, a.machineIdentifier, request.SectionUUID, source.RatingKey, source.MediaID, source.PartID, subtitleIndex, request.ScanID); err != nil {
+	if _, err := tx.Exec(ctx, `DELETE FROM subtitle_shared_sources WHERE machine_identifier=$1 AND section_uuid=$2 AND scan_id=$7 AND rating_key=$3 AND media_id=$4 AND part_id=$5 AND subtitle_index=$6`, a.machineIdentifier, request.SectionUUID, source.RatingKey, source.MediaID, source.PartID, subtitleIndex, request.ScanID); err != nil {
 		return errors.New("could not update shared subtitle index")
 	}
 
@@ -1466,11 +1466,16 @@ func (a *Application) copySharedSubtitleTrack(ctx context.Context, request subti
 		return errors.New("could not update shared subtitle index")
 	}
 	defer tx.Rollback(ctx)
-	tag, err := tx.Exec(ctx, `UPDATE subtitle_shared_chunks SET scan_id=$2, section_key=$3 WHERE machine_identifier=$1 AND section_uuid=$4 AND rating_key=$5 AND media_id=$6 AND part_id=$7 AND subtitle_index=$8 AND scan_id <> $2`, a.machineIdentifier, request.ScanID, request.SectionKey, request.SectionUUID, request.RatingKey, request.MediaID, request.PartID, subtitleIndex)
+
+	// Avoid duplicate inserts if destination scan already has these chunks (e.g. from prior interrupted scan)
+	var alreadyCopied bool
+	err = tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM subtitle_shared_chunks WHERE machine_identifier=$1 AND section_uuid=$2 AND scan_id=$3 AND rating_key=$4 AND media_id=$5 AND part_id=$6 AND subtitle_index=$7)`, a.machineIdentifier, request.SectionUUID, request.ScanID, request.RatingKey, request.MediaID, request.PartID, subtitleIndex).Scan(&alreadyCopied)
 	if err != nil {
 		return errors.New("could not update shared subtitle index")
 	}
-	if tag.RowsAffected() == 0 {
+
+	if !alreadyCopied {
+		// Copy from the published ready scan (or prior scan) into the in-progress scan without modifying the ready scan's rows
 		_, err = tx.Exec(ctx, `INSERT INTO subtitle_shared_chunks (machine_identifier, section_uuid, section_key, rating_key, media_id, part_id, subtitle_index, title, show_title, season, episode, year, start_ms, end_ms, text, content_hash, embedding, scan_id) SELECT c.machine_identifier, c.section_uuid, $3, c.rating_key, c.media_id, c.part_id, c.subtitle_index, c.title, c.show_title, c.season, c.episode, c.year, c.start_ms, c.end_ms, c.text, c.content_hash, c.embedding, $2 FROM subtitle_shared_chunks c JOIN subtitle_shared_sections s ON s.machine_identifier=c.machine_identifier AND s.section_uuid=c.section_uuid AND (s.ready_scan_id=c.scan_id OR s.scan_id=c.scan_id) WHERE c.machine_identifier=$1 AND c.section_uuid=$4 AND c.rating_key=$5 AND c.media_id=$6 AND c.part_id=$7 AND c.subtitle_index=$8 AND c.scan_id <> $2`, a.machineIdentifier, request.ScanID, request.SectionKey, request.SectionUUID, request.RatingKey, request.MediaID, request.PartID, subtitleIndex)
 		if err != nil {
 			return errors.New("could not copy shared subtitle index")
