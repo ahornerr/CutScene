@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -553,6 +555,121 @@ func TestRecoverPersistedJobsPreservesSharedState(t *testing.T) {
 	mgr := newSubtitleIndexJobManager(app)
 	if err := mgr.recoverPersistedJobs(); err != nil {
 		t.Fatalf("expected nil error, got: %v", err)
+	}
+}
+
+func TestResolveLocalPartFileDirectAndMapped(t *testing.T) {
+	tmpDir := t.TempDir()
+	sampleFile := filepath.Join(tmpDir, "movie.mkv")
+	if err := os.WriteFile(sampleFile, []byte("fake-video"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	app := &Application{}
+	app.config.Plex.PathMappings = map[string]string{
+		"/volume1/media": tmpDir,
+	}
+
+	// 1. Direct match: part.File points to the real file on disk
+	partDirect := &components.Part{
+		File: stringPointer(sampleFile),
+		Key:  "/library/parts/1/file.mkv",
+	}
+	resolved, ok := app.resolveLocalPartFile(partDirect)
+	if !ok || resolved != sampleFile {
+		t.Fatalf("expected direct match %q, got %q (ok=%v)", sampleFile, resolved, ok)
+	}
+
+	// 2. Mapped match: part.File has Plex path /volume1/media/movie.mkv
+	plexPath := "/volume1/media/movie.mkv"
+	partMapped := &components.Part{
+		File: stringPointer(plexPath),
+		Key:  "/library/parts/1/file.mkv",
+	}
+	resolved, ok = app.resolveLocalPartFile(partMapped)
+	if !ok || resolved != sampleFile {
+		t.Fatalf("expected mapped match %q, got %q (ok=%v)", sampleFile, resolved, ok)
+	}
+
+	// 3. Missing file: path does not exist
+	nonExistent := "/volume1/media/missing.mkv"
+	partMissing := &components.Part{
+		File: stringPointer(nonExistent),
+		Key:  "/library/parts/2/file.mkv",
+	}
+	resolved, ok = app.resolveLocalPartFile(partMissing)
+	if ok || resolved != "" {
+		t.Fatalf("expected missing file to return false, got %q (ok=%v)", resolved, ok)
+	}
+
+	// 4. Nil / empty file
+	if _, ok := app.resolveLocalPartFile(nil); ok {
+		t.Fatal("expected nil part to return false")
+	}
+	if _, ok := app.resolveLocalPartFile(&components.Part{Key: "/part/1"}); ok {
+		t.Fatal("expected nil File to return false")
+	}
+}
+
+func TestSubtitleIndexMediaURLPrefersLocalFile(t *testing.T) {
+	tmpDir := t.TempDir()
+	sampleFile := filepath.Join(tmpDir, "sample.mkv")
+	if err := os.WriteFile(sampleFile, []byte("fake-video"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	app := &Application{}
+	app.config.Plex.Host = "http://127.0.0.1:32400"
+	app.config.Plex.Token = "tok"
+
+	// When local file exists on disk, returns local path directly
+	partLocal := &components.Part{
+		File: stringPointer(sampleFile),
+		Key:  "/library/parts/10/file.mkv",
+	}
+	url, release, err := app.subtitleIndexMediaURL(context.Background(), partLocal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if release != nil {
+		t.Fatal("expected nil release for local file")
+	}
+	if url != sampleFile {
+		t.Fatalf("expected local path %q, got %q", sampleFile, url)
+	}
+
+	// When local file does not exist, falls back to Plex HTTP URL
+	partRemote := &components.Part{
+		File: stringPointer("/nonexistent/file.mkv"),
+		Key:  "/library/parts/20/file.mkv",
+	}
+	url, _, err = app.subtitleIndexMediaURL(context.Background(), partRemote)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(url, "http://127.0.0.1:32400/library/parts/20/file.mkv?") {
+		t.Fatalf("expected HTTP fallback url, got %q", url)
+	}
+}
+
+func TestExternalSubtitleTrackPlanIdentification(t *testing.T) {
+	streams := []components.Stream{
+		{
+			StreamType:   3,
+			Codec:        "srt",
+			Key:          "/library/streams/101",
+			LanguageCode: stringPointer("eng"),
+		},
+	}
+	plans := enumerateSubtitleTrackPlans(streams)
+	if len(plans) != 1 {
+		t.Fatalf("expected 1 plan, got %d", len(plans))
+	}
+	if !plans[0].Stream.External {
+		t.Fatalf("expected stream to be identified as external: %+v", plans[0])
+	}
+	if plans[0].Stream.Type != "text" {
+		t.Fatalf("expected stream type text, got %q", plans[0].Stream.Type)
 	}
 }
 

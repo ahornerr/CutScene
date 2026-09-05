@@ -16,6 +16,8 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -1286,9 +1288,13 @@ func (a *Application) GetSubtitleEntriesForSource(ctx context.Context, ratingKey
 		}
 		defer releaseCapability()
 	} else {
-		fileURL, err = a.buildPlexSourceURL(part.Key, a.plexSourceToken(operationCtx, false))
-		if err != nil {
-			return nil, err
+		if localPath, ok := a.resolveLocalPartFile(part); ok {
+			fileURL = localPath
+		} else {
+			fileURL, err = a.buildPlexSourceURL(part.Key, a.plexSourceToken(operationCtx, false))
+			if err != nil {
+				return nil, err
+			}
 		}
 	}
 
@@ -1316,6 +1322,48 @@ func (a *Application) GetSubtitleEntriesForSource(ctx context.Context, ratingKey
 	a.subtitleCache.setForCaller(cacheKey, entries, callerID)
 
 	return entries, nil
+}
+
+// resolveLocalPartFile attempts to resolve a local filesystem path for part,
+// applying any configured path mappings. If the resolved path exists as a regular
+// file on disk, it returns the path and true, allowing FFmpeg to read directly
+// from disk rather than streaming over HTTP.
+func (a *Application) resolveLocalPartFile(part *components.Part) (string, bool) {
+	if part == nil || part.File == nil || strings.TrimSpace(*part.File) == "" {
+		return "", false
+	}
+	rawPath := strings.TrimSpace(*part.File)
+	candidate := rawPath
+	if len(a.config.Plex.PathMappings) > 0 {
+		prefixes := make([]string, 0, len(a.config.Plex.PathMappings))
+		for from := range a.config.Plex.PathMappings {
+			prefixes = append(prefixes, from)
+		}
+		sort.Slice(prefixes, func(i, j int) bool {
+			return len(prefixes[i]) > len(prefixes[j])
+		})
+		for _, from := range prefixes {
+			to := a.config.Plex.PathMappings[from]
+			from = strings.TrimSpace(from)
+			to = strings.TrimSpace(to)
+			if from != "" && to != "" && strings.HasPrefix(candidate, from) {
+				rel := strings.TrimPrefix(candidate, from)
+				rel = strings.TrimPrefix(rel, "/")
+				candidate = filepath.Join(to, rel)
+				break
+			}
+		}
+	}
+	info, err := os.Stat(candidate)
+	if err == nil && info.Mode().IsRegular() {
+		return candidate, true
+	}
+	if candidate != rawPath {
+		if rawInfo, rawErr := os.Stat(rawPath); rawErr == nil && rawInfo.Mode().IsRegular() {
+			return rawPath, true
+		}
+	}
+	return "", false
 }
 
 func (a *Application) downloadSubtitle(ctx context.Context, streamKey, codec string) ([]SubtitleEntry, error) {

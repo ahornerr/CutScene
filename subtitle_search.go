@@ -910,6 +910,9 @@ func (a *Application) subtitleIndexMediaURL(ctx context.Context, part *component
 	if part == nil || strings.TrimSpace(part.Key) == "" {
 		return "", nil, errors.New("subtitle source path is unavailable")
 	}
+	if localPath, ok := a.resolveLocalPartFile(part); ok {
+		return localPath, nil, nil
+	}
 	if AuthTokenFromContext(ctx) != nil {
 		proxy, err := a.ensureMediaProxy()
 		if err != nil {
@@ -967,6 +970,7 @@ func (a *Application) indexSubtitleSource(ctx context.Context, request subtitleS
 	sourceRevision := subtitleSourceRevision(metadata, request.MediaID, request.PartID)
 	result := subtitleSearchIndexResponse{RatingKey: request.RatingKey, MediaID: request.MediaID, PartID: request.PartID, Skipped: []subtitleSearchSkipped{}}
 	changed := make([]subtitleTrackPlan, 0)
+	changedExternal := make([]subtitleTrackPlan, 0)
 	fingerprints := make(map[int]string)
 	dim := 0
 	if a.subtitleSearch != nil {
@@ -1002,13 +1006,27 @@ func (a *Application) indexSubtitleSource(ctx context.Context, request subtitleS
 			continue
 		}
 		if stream.External {
-			result.Skipped = append(result.Skipped, subtitleSearchSkipped{plan.PublicIndex, "external subtitle track"})
-			result.UnsupportedTracks++
-			if a.sharedCorpus {
-				if err := a.recordSharedSubtitleSeen(ctx, request, plan.PublicIndex, fingerprint, 0); err != nil {
-					return result, err
+			if !isEnglishSubtitleStream(stream) {
+				result.Skipped = append(result.Skipped, subtitleSearchSkipped{plan.PublicIndex, "not an English text track"})
+				result.UnsupportedTracks++
+				if a.sharedCorpus {
+					if err := a.recordSharedSubtitleSeen(ctx, request, plan.PublicIndex, fingerprint, 0); err != nil {
+						return result, err
+					}
 				}
+				continue
 			}
+			if stream.Type != "text" {
+				result.Skipped = append(result.Skipped, subtitleSearchSkipped{plan.PublicIndex, "unsupported subtitle format"})
+				result.UnsupportedTracks++
+				if a.sharedCorpus {
+					if err := a.recordSharedSubtitleSeen(ctx, request, plan.PublicIndex, fingerprint, 0); err != nil {
+						return result, err
+					}
+				}
+				continue
+			}
+			changedExternal = append(changedExternal, plan)
 			continue
 		}
 		if stream.Type != "text" {
@@ -1032,6 +1050,39 @@ func (a *Application) indexSubtitleSource(ctx context.Context, request subtitleS
 			continue
 		}
 		changed = append(changed, plan)
+	}
+	for _, plan := range changedExternal {
+		token := a.plexSourceToken(ctx, AuthTokenFromContext(ctx) != nil)
+		entries, downloadErr := a.downloadSubtitleWithToken(ctx, plan.Raw.Key, plan.Stream.Codec, token)
+		if downloadErr != nil {
+			result.FailedTracks++
+			result.Skipped = append(result.Skipped, subtitleSearchSkipped{plan.PublicIndex, "subtitle download failed"})
+			continue
+		}
+		chunks := chunkSubtitleEntries(entries)
+		if len(chunks) == 0 {
+			result.Skipped = append(result.Skipped, subtitleSearchSkipped{plan.PublicIndex, "subtitle contains no searchable text"})
+			result.EmptyTracks++
+			if a.sharedCorpus {
+				if err := a.recordSharedSubtitleSeen(ctx, request, plan.PublicIndex, fingerprints[plan.PublicIndex], 0); err != nil {
+					return result, err
+				}
+			}
+			continue
+		}
+		if a.sharedCorpus {
+			if err := a.persistSharedSubtitleChunks(ctx, request, source, plan.PublicIndex, chunks, castContext, fingerprints[plan.PublicIndex]); err != nil {
+				return result, err
+			}
+		} else if err := a.persistSubtitleChunks(ctx, owner, source, plan.PublicIndex, chunks, castContext); err != nil {
+			return result, err
+		}
+		if !a.sharedCorpus {
+			if err := a.recordSubtitleFingerprint(ctx, owner, request, plan.PublicIndex, fingerprints[plan.PublicIndex], len(chunks)); err != nil {
+				return result, err
+			}
+		}
+		result.Indexed += len(chunks)
 	}
 	if len(changed) == 0 {
 		return result, nil

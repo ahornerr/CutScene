@@ -631,7 +631,11 @@ func (a *Application) discoverAndIndexSources(ctx context.Context, job *subtitle
 		var workers sync.WaitGroup
 		var workerMu sync.Mutex
 		var workerErr error
-		for i := 0; i < subtitleBulkWorkers; i++ {
+		numWorkers := subtitleBulkWorkers
+		if a.config.Ffmpeg.Concurrency > numWorkers {
+			numWorkers = a.config.Ffmpeg.Concurrency
+		}
+		for i := 0; i < numWorkers; i++ {
 			workers.Add(1)
 			go func() {
 				defer workers.Done()

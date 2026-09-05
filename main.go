@@ -12,8 +12,9 @@ import (
 
 type Config struct {
 	Plex struct {
-		Host  string `mapstructure:"host"`
-		Token string `mapstructure:"token"`
+		Host         string            `mapstructure:"host"`
+		Token        string            `mapstructure:"token"`
+		PathMappings map[string]string `mapstructure:"path_mappings"`
 	}
 	API struct {
 		ListenAddr string `mapstructure:"listen_addr"`

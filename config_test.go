@@ -152,3 +152,21 @@ semantic_search:
 		}
 	})
 }
+
+func TestPlexPathMappingsConfig(t *testing.T) {
+	cfg := loadConfigForTest(t, `plex:
+  host: http://plex
+  path_mappings:
+    /volume1/media: /media
+    /volume2/shows: /shows
+`)
+	if len(cfg.Plex.PathMappings) != 2 {
+		t.Fatalf("expected 2 path mappings, got %d", len(cfg.Plex.PathMappings))
+	}
+	if cfg.Plex.PathMappings["/volume1/media"] != "/media" {
+		t.Fatalf("expected /media, got %q", cfg.Plex.PathMappings["/volume1/media"])
+	}
+	if cfg.Plex.PathMappings["/volume2/shows"] != "/shows" {
+		t.Fatalf("expected /shows, got %q", cfg.Plex.PathMappings["/volume2/shows"])
+	}
+}
