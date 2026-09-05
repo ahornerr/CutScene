@@ -1034,3 +1034,41 @@ func TestSubtitleSearchStoreQueryInput(t *testing.T) {
 	}
 }
 
+func TestSharedSubtitleCandidateIdentityDeduplication(t *testing.T) {
+	c1 := sharedSubtitleCandidate{
+		MachineIdentifier: "pms-1",
+		SectionUUID:       "sec-1",
+		ScanID:            "scan-1",
+		RatingKey:         "movie-1",
+		MediaID:           10,
+		PartID:            20,
+		SubtitleIndex:     0,
+		StartMs:           1000,
+		EndMs:             2000,
+		Tier:              2,
+		Rank:              1,
+	}
+	c2 := sharedSubtitleCandidate{
+		MachineIdentifier: "pms-1",
+		SectionUUID:       "sec-1",
+		ScanID:            "scan-2",
+		RatingKey:         "movie-1",
+		MediaID:           10,
+		PartID:            20,
+		SubtitleIndex:     0,
+		StartMs:           1000,
+		EndMs:             2000,
+		Tier:              0,
+		Rank:              0,
+	}
+	raw := []subtitleSearchCandidate{
+		{Shared: c1, IsShared: true, Tier: c1.Tier, Rank: c1.Rank},
+		{Shared: c2, IsShared: true, Tier: c2.Tier, Rank: c2.Rank},
+	}
+	merged := mergeSubtitleSearchCandidates(raw)
+	if len(merged) == 0 || merged[0].Tier != 0 {
+		t.Fatalf("expected merged candidates to prioritize Tier 0, got %+v", merged)
+	}
+}
+
+
