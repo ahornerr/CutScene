@@ -1177,11 +1177,17 @@ func (a *API) previewStream(ctx fiber.Ctx) error {
 
 	fileURL := ""
 	var callerAccess *PlexAccess
+	// Resolve a local filesystem path once so all FFmpeg calls in this handler
+	// can bypass Plex HTTP streaming when the file is directly accessible.
+	localPartFile, hasLocalFile := a.app.resolveLocalPartFile(previewPart)
 	if userScoped {
 		var accessErr error
 		callerAccess, _, accessErr = a.app.callerPlexAccess(operationCtx, "")
 		if accessErr != nil {
 			return newPreviewUpstreamFailure("caller Plex access is unavailable", accessErr)
+		}
+		if hasLocalFile {
+			fileURL = localPartFile
 		}
 	} else {
 		fileURL = fmt.Sprintf("%s%s?X-Plex-Token=%s",
@@ -1189,6 +1195,9 @@ func (a *API) previewStream(ctx fiber.Ctx) error {
 			previewPart.Key,
 			a.app.plexSourceToken(operationCtx, false),
 		)
+		if hasLocalFile {
+			fileURL = localPartFile
+		}
 	}
 
 	// Extract subtitle to temp file if requested. For text subtitles, either use
@@ -1247,7 +1256,9 @@ func (a *API) previewStream(ctx fiber.Ctx) error {
 					defer release()
 					inputURL := fileURL
 					var releaseCapability func()
-					if userScoped {
+					// Use the local path for embedded subtitle extraction when
+					// available; otherwise fall back to the Plex capability proxy.
+					if userScoped && !hasLocalFile {
 						proxy, proxyErr := a.app.ensureMediaProxy()
 						if proxyErr != nil {
 							return "", proxyErr
@@ -1278,7 +1289,10 @@ func (a *API) previewStream(ctx fiber.Ctx) error {
 	// with an explicit bound instead of capturing ctx or ctx.UserContext().
 	streamCtx, streamCancel := context.WithTimeout(operationCtx, renderPreviewTimeout)
 	var capabilityRelease func()
-	if userScoped {
+	// For userScoped requests without a local path, issue a timed proxy
+	// capability for the streaming render. When a local path is available,
+	// fileURL is already set and no proxy capability is needed.
+	if userScoped && !hasLocalFile {
 		proxy, proxyErr := a.app.ensureMediaProxy()
 		if proxyErr != nil {
 			streamCancel()
