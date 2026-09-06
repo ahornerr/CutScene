@@ -53,10 +53,10 @@ const (
 	maxSubtitleSemanticCandidates          = 200
 	// Keep result windows focused enough to open directly as short clips.
 	// Subtitle timing still determines the exact duration.
-	subtitleChunkMaxRunes      = 400
+	subtitleChunkMaxRunes            = 400
 	subtitleChunkMaxGapMs      int64 = 15 * 1000
 	subtitleChunkMaxDurationMs int64 = 60 * 1000
-	bgeQueryInstruction        = "Represent this sentence for searching relevant passages: "
+	bgeQueryInstruction              = "Represent this sentence for searching relevant passages: "
 )
 
 var errSubtitleSearchDisabled = errors.New("semantic subtitle search is disabled")
@@ -164,6 +164,7 @@ func subtitleSearchSchema(dimensions int) string {
 	}
 	return fmt.Sprintf(`
 CREATE EXTENSION IF NOT EXISTS vector;
+CREATE EXTENSION IF NOT EXISTS pg_trgm;
 CREATE TABLE IF NOT EXISTS subtitle_chunks (
     id BIGSERIAL PRIMARY KEY,
     owner_uuid TEXT NOT NULL,
@@ -185,6 +186,8 @@ CREATE TABLE IF NOT EXISTS subtitle_chunks (
     UNIQUE (owner_uuid, rating_key, media_id, part_id, subtitle_index, start_ms, end_ms, content_hash)
 );
 CREATE INDEX IF NOT EXISTS subtitle_chunks_text_search_idx ON subtitle_chunks USING GIN (text_search);
+CREATE INDEX IF NOT EXISTS subtitle_chunks_owner_idx ON subtitle_chunks (owner_uuid);
+CREATE INDEX IF NOT EXISTS subtitle_chunks_normalized_text_trgm_idx ON subtitle_chunks USING GIN (btrim(regexp_replace(lower(text), '[^[:alnum:]]+', ' ', 'g')) gin_trgm_ops);
 CREATE INDEX IF NOT EXISTS subtitle_chunks_embedding_hnsw_idx ON subtitle_chunks USING hnsw (embedding vector_cosine_ops);
 CREATE TABLE IF NOT EXISTS subtitle_index_jobs (
     id UUID PRIMARY KEY,
@@ -275,6 +278,8 @@ CREATE TABLE IF NOT EXISTS subtitle_shared_chunks (
     UNIQUE (machine_identifier, section_uuid, scan_id, rating_key, media_id, part_id, subtitle_index, start_ms, end_ms, content_hash)
 );
 CREATE INDEX IF NOT EXISTS subtitle_shared_chunks_text_idx ON subtitle_shared_chunks USING GIN (text_search);
+CREATE INDEX IF NOT EXISTS subtitle_shared_chunks_machine_section_scan_idx ON subtitle_shared_chunks (machine_identifier, section_uuid, scan_id);
+CREATE INDEX IF NOT EXISTS subtitle_shared_chunks_normalized_text_trgm_idx ON subtitle_shared_chunks USING GIN (btrim(regexp_replace(lower(text), '[^[:alnum:]]+', ' ', 'g')) gin_trgm_ops);
 CREATE INDEX IF NOT EXISTS subtitle_shared_chunks_embedding_idx ON subtitle_shared_chunks USING hnsw (embedding vector_cosine_ops);
 ALTER TABLE subtitle_shared_sections ADD COLUMN IF NOT EXISTS ready BOOLEAN NOT NULL DEFAULT FALSE;
 `, dimensions, dimensions)
@@ -1935,7 +1940,7 @@ func (a *Application) searchSubtitleIndex(ctx context.Context, query string) ([]
 		return nil
 	}
 	if normalized != "" {
-		if err := load(`SELECT rating_key, media_id, part_id, subtitle_index, title, show_title, season, episode, year, start_ms, end_ms, text, 1.0 AS score FROM subtitle_chunks WHERE owner_uuid=$1 AND strpos(btrim(regexp_replace(lower(text), '[^[:alnum:]]+', ' ', 'g')), $2) > 0 ORDER BY id LIMIT $3`, []any{owner, normalized, maxSubtitleLexicalCandidates}, 0); err != nil {
+		if err := load(`SELECT rating_key, media_id, part_id, subtitle_index, title, show_title, season, episode, year, start_ms, end_ms, text, 1.0 AS score FROM subtitle_chunks WHERE owner_uuid=$1 AND btrim(regexp_replace(lower(text), '[^[:alnum:]]+', ' ', 'g')) LIKE '%' || $2 || '%' ORDER BY id LIMIT $3`, []any{owner, normalized, maxSubtitleLexicalCandidates}, 0); err != nil {
 			return nil, err
 		}
 	}
@@ -2017,7 +2022,7 @@ func (a *Application) searchSharedSubtitleIndex(ctx context.Context, query strin
 	normalized := normalizeSubtitleSearchLiteral(trimmedQuery)
 	const sharedChunksJoin = `FROM subtitle_shared_chunks c JOIN subtitle_shared_sections s ON s.machine_identifier=c.machine_identifier AND s.section_uuid=c.section_uuid AND s.state<>'failed' AND (c.scan_id=s.scan_id OR (s.ready_scan_id IS NOT NULL AND c.scan_id=s.ready_scan_id AND NOT EXISTS (SELECT 1 FROM subtitle_shared_chunks n WHERE n.machine_identifier=c.machine_identifier AND n.section_uuid=c.section_uuid AND n.scan_id=s.scan_id AND n.rating_key=c.rating_key AND n.media_id=c.media_id AND n.part_id=c.part_id AND n.subtitle_index=c.subtitle_index)))`
 	if normalized != "" {
-		if err := load(`SELECT c.machine_identifier, c.section_uuid, c.section_key, c.scan_id, s.section_type, c.rating_key, c.media_id, c.part_id, c.subtitle_index, c.start_ms, c.end_ms, 1.0 AS score `+sharedChunksJoin+` WHERE c.machine_identifier=$1 AND c.section_uuid=ANY($2) AND strpos(btrim(regexp_replace(lower(c.text), '[^[:alnum:]]+', ' ', 'g')), $3) > 0 AND EXISTS (SELECT 1 FROM subtitle_shared_sources v WHERE v.machine_identifier=c.machine_identifier AND v.section_uuid=c.section_uuid AND v.scan_id=c.scan_id AND v.rating_key=c.rating_key AND v.media_id=c.media_id AND v.part_id=c.part_id AND v.subtitle_index=c.subtitle_index AND v.chunk_count > 0) ORDER BY c.id LIMIT $4`, []any{a.machineIdentifier, uuidKeys, normalized, maxSharedSubtitleCandidates}, 0); err != nil {
+		if err := load(`SELECT c.machine_identifier, c.section_uuid, c.section_key, c.scan_id, s.section_type, c.rating_key, c.media_id, c.part_id, c.subtitle_index, c.start_ms, c.end_ms, 1.0 AS score `+sharedChunksJoin+` WHERE c.machine_identifier=$1 AND c.section_uuid=ANY($2) AND btrim(regexp_replace(lower(c.text), '[^[:alnum:]]+', ' ', 'g')) LIKE '%' || $3 || '%' AND EXISTS (SELECT 1 FROM subtitle_shared_sources v WHERE v.machine_identifier=c.machine_identifier AND v.section_uuid=c.section_uuid AND v.scan_id=c.scan_id AND v.rating_key=c.rating_key AND v.media_id=c.media_id AND v.part_id=c.part_id AND v.subtitle_index=c.subtitle_index AND v.chunk_count > 0) ORDER BY c.id LIMIT $4`, []any{a.machineIdentifier, uuidKeys, normalized, maxSharedSubtitleCandidates}, 0); err != nil {
 			return nil, err
 		}
 	}
