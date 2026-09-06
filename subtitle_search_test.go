@@ -802,18 +802,57 @@ func TestSubtitleSearchSchemaGenerationWithDimensions(t *testing.T) {
 	}
 }
 
-func TestSubtitleSearchSchemaIncludesBoundedLiteralSearchIndexes(t *testing.T) {
+func TestSubtitleSearchSchemaOmitsBackgroundLiteralSearchIndexes(t *testing.T) {
 	schema := subtitleSearchSchema(768)
-	wants := []string{
-		"CREATE EXTENSION IF NOT EXISTS pg_trgm;",
-		"CREATE INDEX IF NOT EXISTS subtitle_chunks_owner_idx ON subtitle_chunks (owner_uuid);",
-		"CREATE INDEX IF NOT EXISTS subtitle_shared_chunks_machine_section_scan_idx ON subtitle_shared_chunks (machine_identifier, section_uuid, scan_id);",
-		"CREATE INDEX IF NOT EXISTS subtitle_chunks_normalized_text_trgm_idx ON subtitle_chunks USING GIN (btrim(regexp_replace(lower(text), '[^[:alnum:]]+', ' ', 'g')) gin_trgm_ops);",
-		"CREATE INDEX IF NOT EXISTS subtitle_shared_chunks_normalized_text_trgm_idx ON subtitle_shared_chunks USING GIN (btrim(regexp_replace(lower(text), '[^[:alnum:]]+', ' ', 'g')) gin_trgm_ops);",
+	for _, forbidden := range []string{
+		"pg_trgm",
+		"subtitle_chunks_owner_idx",
+		"subtitle_chunks_normalized_text_trgm_idx",
+		"subtitle_shared_chunks_machine_section_scan_idx",
+		"subtitle_shared_chunks_normalized_text_trgm_idx",
+	} {
+		if strings.Contains(schema, forbidden) {
+			t.Errorf("base schema unexpectedly contains background migration DDL %q", forbidden)
+		}
 	}
-	for _, want := range wants {
-		if !strings.Contains(schema, want) {
-			t.Errorf("schema does not contain %q", want)
+
+	wantStatements := []string{
+		"CREATE EXTENSION IF NOT EXISTS pg_trgm",
+		"CREATE INDEX CONCURRENTLY IF NOT EXISTS subtitle_chunks_owner_idx ON subtitle_chunks (owner_uuid)",
+		"CREATE INDEX CONCURRENTLY IF NOT EXISTS subtitle_chunks_normalized_text_trgm_idx ON subtitle_chunks USING GIN (btrim(regexp_replace(lower(text), '[^[:alnum:]]+', ' ', 'g')) gin_trgm_ops)",
+		"CREATE INDEX CONCURRENTLY IF NOT EXISTS subtitle_shared_chunks_machine_section_scan_idx ON subtitle_shared_chunks (machine_identifier, section_uuid, scan_id)",
+		"CREATE INDEX CONCURRENTLY IF NOT EXISTS subtitle_shared_chunks_normalized_text_trgm_idx ON subtitle_shared_chunks USING GIN (btrim(regexp_replace(lower(text), '[^[:alnum:]]+', ' ', 'g')) gin_trgm_ops)",
+	}
+	if len(subtitleSearchIndexMigrationStatements) != len(wantStatements) {
+		t.Fatalf("migration statement count = %d, want %d", len(subtitleSearchIndexMigrationStatements), len(wantStatements))
+	}
+	for index, statement := range subtitleSearchIndexMigrationStatements {
+		if statement.sql != wantStatements[index] {
+			t.Errorf("migration statement %d = %q, want %q", index, statement.sql, wantStatements[index])
+		}
+		if strings.HasPrefix(statement.sql, "CREATE INDEX") && !strings.Contains(statement.sql, "CREATE INDEX CONCURRENTLY IF NOT EXISTS") {
+			t.Errorf("index migration is not concurrent and idempotent: %q", statement.sql)
+		}
+		if strings.Contains(statement.sql, "BEGIN") || strings.Contains(statement.sql, "COMMIT") {
+			t.Errorf("index migration statement contains transaction control: %q", statement.sql)
+		}
+	}
+}
+
+func TestSubtitleSearchInvalidIndexRecoveryContract(t *testing.T) {
+	if !strings.Contains(subtitleSearchInvalidIndexQuery, "pg_index") ||
+		!strings.Contains(subtitleSearchInvalidIndexQuery, "to_regclass($1)") ||
+		!strings.Contains(subtitleSearchInvalidIndexQuery, "NOT indisvalid") {
+		t.Fatalf("invalid-index query does not inspect pg_index validity: %q", subtitleSearchInvalidIndexQuery)
+	}
+
+	for _, statement := range subtitleSearchIndexMigrationStatements {
+		if statement.name == "" {
+			continue
+		}
+		want := "DROP INDEX CONCURRENTLY IF EXISTS " + statement.name
+		if got := subtitleSearchDropInvalidIndexSQL(statement.name); got != want {
+			t.Errorf("drop SQL for %s = %q, want %q", statement.name, got, want)
 		}
 	}
 }

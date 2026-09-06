@@ -201,27 +201,29 @@ type sessionStream struct {
 }
 
 type Application struct {
-	config            Config
-	plexAdmin         *plexgo.PlexAPI
-	plexUser          *plexgo.PlexAPI
-	plexTv            *PlexTV
-	plexResources     *PlexResourceResolver
-	mediaProxy        *plexCapabilityProxy
-	sharedCorpus      bool
-	machineIdentifier string
-	ownerEmail        string
-	ownerUUID         string
-	subtitleCache     *subtitleCache
-	ffmpegLimiter     *ffmpegLimiter
-	subtitleBulkGate  chan struct{}
-	renderJobs        *renderJobManager
-	clipStore         *clipStore
-	lifetime          context.Context
-	cancelLifetime    context.CancelFunc
-	closeOnce         sync.Once
-	closeErr          error
-	subtitleSearch    *subtitleSearchStore
-	subtitleJobs      *subtitleIndexJobManager
+	config                             Config
+	plexAdmin                          *plexgo.PlexAPI
+	plexUser                           *plexgo.PlexAPI
+	plexTv                             *PlexTV
+	plexResources                      *PlexResourceResolver
+	mediaProxy                         *plexCapabilityProxy
+	sharedCorpus                       bool
+	machineIdentifier                  string
+	ownerEmail                         string
+	ownerUUID                          string
+	subtitleCache                      *subtitleCache
+	ffmpegLimiter                      *ffmpegLimiter
+	subtitleBulkGate                   chan struct{}
+	renderJobs                         *renderJobManager
+	clipStore                          *clipStore
+	lifetime                           context.Context
+	cancelLifetime                     context.CancelFunc
+	closeOnce                          sync.Once
+	closeErr                           error
+	subtitleSearch                     *subtitleSearchStore
+	subtitleJobs                       *subtitleIndexJobManager
+	subtitleSearchIndexMigrationCancel context.CancelFunc
+	subtitleSearchIndexMigrationWait   sync.WaitGroup
 }
 
 func NewApplication(config Config) (*Application, error) {
@@ -340,6 +342,9 @@ func NewApplication(config Config) (*Application, error) {
 		_ = app.clipStore.close()
 		return nil, fmt.Errorf("could not initialize render jobs: %w", err)
 	}
+	if app.subtitleSearch != nil {
+		app.startSubtitleSearchIndexMigration()
+	}
 
 	return app, nil
 }
@@ -352,6 +357,10 @@ func (a *Application) Close() error {
 	}
 	a.closeOnce.Do(func() {
 		a.stopWork()
+		if a.subtitleSearchIndexMigrationCancel != nil {
+			a.subtitleSearchIndexMigrationCancel()
+			a.subtitleSearchIndexMigrationWait.Wait()
+		}
 		if a.clipStore != nil {
 			if err := a.clipStore.close(); err != nil {
 				a.closeErr = err
@@ -371,6 +380,21 @@ func (a *Application) Close() error {
 		}
 	})
 	return a.closeErr
+}
+
+func (a *Application) startSubtitleSearchIndexMigration() {
+	if a == nil || a.subtitleSearch == nil || a.lifetime == nil {
+		return
+	}
+	migrationContext, cancel := context.WithCancel(a.lifetime)
+	a.subtitleSearchIndexMigrationCancel = cancel
+	a.subtitleSearchIndexMigrationWait.Add(1)
+	go func() {
+		defer a.subtitleSearchIndexMigrationWait.Done()
+		if err := migrateSubtitleSearchIndexes(migrationContext, a.subtitleSearch.pool); err != nil && migrationContext.Err() == nil {
+			log.Printf("subtitle search index migration unavailable: %s", redactedDiagnostic(err))
+		}
+	}()
 }
 
 const maxClipArtworkBytes int64 = 8 << 20
@@ -1376,7 +1400,6 @@ func (a *Application) resolveLocalPartFile(part *components.Part) (string, bool)
 	}
 	return a.resolveLocalRawPath(*part.File)
 }
-
 
 func (a *Application) downloadSubtitle(ctx context.Context, streamKey, codec string) ([]SubtitleEntry, error) {
 	if AuthTokenFromContext(ctx) != nil {

@@ -158,13 +158,40 @@ const (
 	openAIEmbeddingModel     = "BAAI/bge-base-en-v1.5"
 )
 
+const subtitleSearchIndexMigrationLockKey int64 = 748238519
+
+type subtitleSearchIndexMigrationStatement struct {
+	name string
+	sql  string
+}
+
+var subtitleSearchIndexMigrationStatements = []subtitleSearchIndexMigrationStatement{
+	{sql: "CREATE EXTENSION IF NOT EXISTS pg_trgm"},
+	{name: "subtitle_chunks_owner_idx", sql: "CREATE INDEX CONCURRENTLY IF NOT EXISTS subtitle_chunks_owner_idx ON subtitle_chunks (owner_uuid)"},
+	{name: "subtitle_chunks_normalized_text_trgm_idx", sql: "CREATE INDEX CONCURRENTLY IF NOT EXISTS subtitle_chunks_normalized_text_trgm_idx ON subtitle_chunks USING GIN (btrim(regexp_replace(lower(text), '[^[:alnum:]]+', ' ', 'g')) gin_trgm_ops)"},
+	{name: "subtitle_shared_chunks_machine_section_scan_idx", sql: "CREATE INDEX CONCURRENTLY IF NOT EXISTS subtitle_shared_chunks_machine_section_scan_idx ON subtitle_shared_chunks (machine_identifier, section_uuid, scan_id)"},
+	{name: "subtitle_shared_chunks_normalized_text_trgm_idx", sql: "CREATE INDEX CONCURRENTLY IF NOT EXISTS subtitle_shared_chunks_normalized_text_trgm_idx ON subtitle_shared_chunks USING GIN (btrim(regexp_replace(lower(text), '[^[:alnum:]]+', ' ', 'g')) gin_trgm_ops)"},
+}
+
+const subtitleSearchInvalidIndexQuery = `
+SELECT EXISTS (
+    SELECT 1
+    FROM pg_index
+    WHERE indexrelid = to_regclass($1)
+      AND NOT indisvalid
+)
+`
+
+func subtitleSearchDropInvalidIndexSQL(name string) string {
+	return "DROP INDEX CONCURRENTLY IF EXISTS " + name
+}
+
 func subtitleSearchSchema(dimensions int) string {
 	if dimensions <= 0 {
 		dimensions = defaultSubtitleEmbeddingDimensions
 	}
 	return fmt.Sprintf(`
 CREATE EXTENSION IF NOT EXISTS vector;
-CREATE EXTENSION IF NOT EXISTS pg_trgm;
 CREATE TABLE IF NOT EXISTS subtitle_chunks (
     id BIGSERIAL PRIMARY KEY,
     owner_uuid TEXT NOT NULL,
@@ -186,8 +213,6 @@ CREATE TABLE IF NOT EXISTS subtitle_chunks (
     UNIQUE (owner_uuid, rating_key, media_id, part_id, subtitle_index, start_ms, end_ms, content_hash)
 );
 CREATE INDEX IF NOT EXISTS subtitle_chunks_text_search_idx ON subtitle_chunks USING GIN (text_search);
-CREATE INDEX IF NOT EXISTS subtitle_chunks_owner_idx ON subtitle_chunks (owner_uuid);
-CREATE INDEX IF NOT EXISTS subtitle_chunks_normalized_text_trgm_idx ON subtitle_chunks USING GIN (btrim(regexp_replace(lower(text), '[^[:alnum:]]+', ' ', 'g')) gin_trgm_ops);
 CREATE INDEX IF NOT EXISTS subtitle_chunks_embedding_hnsw_idx ON subtitle_chunks USING hnsw (embedding vector_cosine_ops);
 CREATE TABLE IF NOT EXISTS subtitle_index_jobs (
     id UUID PRIMARY KEY,
@@ -278,11 +303,44 @@ CREATE TABLE IF NOT EXISTS subtitle_shared_chunks (
     UNIQUE (machine_identifier, section_uuid, scan_id, rating_key, media_id, part_id, subtitle_index, start_ms, end_ms, content_hash)
 );
 CREATE INDEX IF NOT EXISTS subtitle_shared_chunks_text_idx ON subtitle_shared_chunks USING GIN (text_search);
-CREATE INDEX IF NOT EXISTS subtitle_shared_chunks_machine_section_scan_idx ON subtitle_shared_chunks (machine_identifier, section_uuid, scan_id);
-CREATE INDEX IF NOT EXISTS subtitle_shared_chunks_normalized_text_trgm_idx ON subtitle_shared_chunks USING GIN (btrim(regexp_replace(lower(text), '[^[:alnum:]]+', ' ', 'g')) gin_trgm_ops);
 CREATE INDEX IF NOT EXISTS subtitle_shared_chunks_embedding_idx ON subtitle_shared_chunks USING hnsw (embedding vector_cosine_ops);
 ALTER TABLE subtitle_shared_sections ADD COLUMN IF NOT EXISTS ready BOOLEAN NOT NULL DEFAULT FALSE;
 `, dimensions, dimensions)
+}
+
+func migrateSubtitleSearchIndexes(ctx context.Context, pool *pgxpool.Pool) error {
+	conn, err := pool.Acquire(ctx)
+	if err != nil {
+		return fmt.Errorf("could not acquire subtitle search index migration connection: %w", err)
+	}
+	defer conn.Release()
+
+	if _, err := conn.Exec(ctx, "SELECT pg_advisory_lock($1)", subtitleSearchIndexMigrationLockKey); err != nil {
+		return fmt.Errorf("could not acquire subtitle search index migration lock: %w", err)
+	}
+	defer func() {
+		if _, err := conn.Exec(context.Background(), "SELECT pg_advisory_unlock($1)", subtitleSearchIndexMigrationLockKey); err != nil {
+			log.Printf("subtitle search index migration lock release failed: %s", redactedDiagnostic(err))
+		}
+	}()
+
+	for _, statement := range subtitleSearchIndexMigrationStatements {
+		if statement.name != "" {
+			var invalid bool
+			if err := conn.QueryRow(ctx, subtitleSearchInvalidIndexQuery, statement.name).Scan(&invalid); err != nil {
+				return fmt.Errorf("could not inspect subtitle search index %s: %w", statement.name, err)
+			}
+			if invalid {
+				if _, err := conn.Exec(ctx, subtitleSearchDropInvalidIndexSQL(statement.name)); err != nil {
+					return fmt.Errorf("could not drop invalid subtitle search index %s: %w", statement.name, err)
+				}
+			}
+		}
+		if _, err := conn.Exec(ctx, statement.sql); err != nil {
+			return fmt.Errorf("could not create subtitle search index: %w", err)
+		}
+	}
+	return nil
 }
 
 func migrateSubtitleEmbeddingDimensions(ctx context.Context, pool *pgxpool.Pool, targetDimensions int) error {
