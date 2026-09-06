@@ -802,6 +802,22 @@ func TestSubtitleSearchSchemaGenerationWithDimensions(t *testing.T) {
 	}
 }
 
+func TestSubtitleSearchSchemaIncludesBoundedLiteralSearchIndexes(t *testing.T) {
+	schema := subtitleSearchSchema(768)
+	wants := []string{
+		"CREATE EXTENSION IF NOT EXISTS pg_trgm;",
+		"CREATE INDEX IF NOT EXISTS subtitle_chunks_owner_idx ON subtitle_chunks (owner_uuid);",
+		"CREATE INDEX IF NOT EXISTS subtitle_shared_chunks_machine_section_scan_idx ON subtitle_shared_chunks (machine_identifier, section_uuid, scan_id);",
+		"CREATE INDEX IF NOT EXISTS subtitle_chunks_normalized_text_trgm_idx ON subtitle_chunks USING GIN (btrim(regexp_replace(lower(text), '[^[:alnum:]]+', ' ', 'g')) gin_trgm_ops);",
+		"CREATE INDEX IF NOT EXISTS subtitle_shared_chunks_normalized_text_trgm_idx ON subtitle_shared_chunks USING GIN (btrim(regexp_replace(lower(text), '[^[:alnum:]]+', ' ', 'g')) gin_trgm_ops);",
+	}
+	for _, want := range wants {
+		if !strings.Contains(schema, want) {
+			t.Errorf("schema does not contain %q", want)
+		}
+	}
+}
+
 func TestSubtitleSourceFingerprintDimensionSensitivity(t *testing.T) {
 	stream := SubtitleStream{Index: 0, Codec: "srt", Language: "English", Type: "text"}
 	fp768 := subtitleSourceFingerprintWithDimensions("movie-1", 1, 2, stream, "context", 768, "rev-1")
@@ -1070,5 +1086,3 @@ func TestSharedSubtitleCandidateIdentityDeduplication(t *testing.T) {
 		t.Fatalf("expected merged candidates to prioritize Tier 0, got %+v", merged)
 	}
 }
-
-
