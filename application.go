@@ -1377,12 +1377,6 @@ func (a *Application) resolveLocalPartFile(part *components.Part) (string, bool)
 	return a.resolveLocalRawPath(*part.File)
 }
 
-// resolveLocalSessionPartFile is the session-metadata counterpart to
-// resolveLocalPartFile. sessionPart.File is a plain string (not a pointer),
-// so this convenience wrapper handles the nil-like empty-string check.
-func (a *Application) resolveLocalSessionPartFile(file string) (string, bool) {
-	return a.resolveLocalRawPath(file)
-}
 
 func (a *Application) downloadSubtitle(ctx context.Context, streamKey, codec string) ([]SubtitleEntry, error) {
 	if AuthTokenFromContext(ctx) != nil {

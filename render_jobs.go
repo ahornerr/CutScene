@@ -1131,13 +1131,14 @@ func (a *API) createRenderJob(ctx fiber.Ctx) error {
 	if resolvedPart != nil {
 		spec.PartFile, _ = a.app.resolveLocalPartFile(resolvedPart)
 	} else {
-		// Session path: find the matching part by ID in the session list.
-		for _, session := range sessions {
-			for _, media := range session.Media {
-				for _, part := range media.Part {
-					if sessionValueMatchesID(part.ID, spec.PartID) {
-						spec.PartFile, _ = a.app.resolveLocalSessionPartFile(part.File)
-					}
+		// Session path: sessions often omit Part.File metadata. The library
+		// metadata item is always fetched on this path and carries the full
+		// Part.File, so resolve from there using the validated part ID.
+		for i := range metadataItem.Media {
+			for j := range metadataItem.Media[i].Part {
+				if metadataItem.Media[i].Part[j].ID == spec.PartID {
+					spec.PartFile, _ = a.app.resolveLocalPartFile(&metadataItem.Media[i].Part[j])
+					break
 				}
 			}
 		}
@@ -1710,7 +1711,7 @@ func (a *Application) executeRenderSpec(ctx context.Context, spec renderJobSpec,
 			if embeddedIndex < 0 {
 				embeddedIndex = spec.SubtitleIndex
 			}
-			if callerScoped {
+			if callerScoped && spec.PartFile == "" {
 				proxy, proxyErr := a.ensureMediaProxy()
 				if proxyErr != nil {
 					return newRenderStageFailure("subtitle", "subtitle_unavailable", proxyErr)
