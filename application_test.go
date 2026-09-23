@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -248,6 +249,58 @@ real text
 	}
 	if entries[0].Text != "real text" {
 		t.Errorf("font-only lines not collapsed: %q", entries[0].Text)
+	}
+}
+
+func TestExtractSubtitleContextZeroOffsetNormalizesRawSRT(t *testing.T) {
+	origRaw := extractSubtitleContextRawFn
+	t.Cleanup(func() { extractSubtitleContextRawFn = origRaw })
+
+	srtContent := `1
+00:00:01,000 --> 00:00:02,500
+<font face="Verdana" size="18">Hello</font> <font size="24">world</font>
+
+2
+00:00:03,000 --> 00:00:04,000
+<i>Stay</i> <FONT FACE="Arial" SIZE="12">styled</FONT>
+`
+	rawFile := filepath.Join(t.TempDir(), "raw.srt")
+	if err := os.WriteFile(rawFile, []byte(srtContent), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	var capturedFrom, capturedTo string
+	extractSubtitleContextRawFn = func(ctx context.Context, url, from, to string, subtitleIndex int) (string, error) {
+		capturedFrom, capturedTo = from, to
+		return rawFile, nil
+	}
+
+	path, err := ExtractSubtitleContext(context.Background(), "http://media.example/file.mkv", "00:01:00.000", "00:01:10.000", 2)
+	if err != nil {
+		t.Fatalf("ExtractSubtitleContext error: %v", err)
+	}
+	defer os.Remove(path)
+
+	if capturedFrom != "00:01:00.000" || capturedTo != "00:01:10.000" {
+		t.Fatalf("raw extraction range = %q..%q, want unchanged seek range", capturedFrom, capturedTo)
+	}
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	written := string(data)
+	if strings.Contains(written, "<font") || strings.Contains(written, "<FONT") {
+		t.Fatalf("font wrappers reached normalized output: %q", written)
+	}
+	if !strings.Contains(written, "Hello world") || !strings.Contains(written, "<i>Stay</i> styled") {
+		t.Fatalf("normalized output lost text or non-font formatting: %q", written)
+	}
+	// Raw extraction timestamps are relative to from (00:01:00.000); rebasing
+	// must preserve them exactly as clip-relative timestamps.
+	if !strings.Contains(written, "00:00:01,000 --> 00:00:02,500") ||
+		!strings.Contains(written, "00:00:03,000 --> 00:00:04,000") {
+		t.Fatalf("timestamp rebasing changed cue timing: %q", written)
 	}
 }
 
