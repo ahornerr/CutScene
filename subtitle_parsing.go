@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"html"
+	"regexp"
 	"strconv"
 	"strings"
 )
@@ -311,6 +312,12 @@ func parseASSTimestamp(value string) (int64, error) {
 	return hours*3600000 + minutes*60000 + seconds*1000 + milliseconds, nil
 }
 
+// legacyFontTagPattern matches legacy HTML-like <font ...>...</font> markup
+// embedded in ASS/SSA dialogue text. Face/size styling from these tags cannot
+// be represented in generated SRT output, so the wrappers are removed while
+// preserving the enclosed text.
+var legacyFontTagPattern = regexp.MustCompile(`(?i)</?font(\s[^>]*)?/?>`)
+
 func cleanASSText(value string) (string, error) {
 	var builder strings.Builder
 	for i := 0; i < len(value); {
@@ -325,7 +332,7 @@ func cleanASSText(value string) (string, error) {
 		}
 		i += end + 2
 	}
-	return strings.NewReplacer(`\N`, "\n", `\n`, "\n", `\h`, " ").Replace(builder.String()), nil
+	return strings.NewReplacer(`\N`, "\n", `\n`, "\n", `\h`, " ").Replace(legacyFontTagPattern.ReplaceAllString(builder.String(), "")), nil
 }
 
 func normalizeSubtitleText(value string) string {

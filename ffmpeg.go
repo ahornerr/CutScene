@@ -738,8 +738,13 @@ func ParseSRT(filename string) ([]SubtitleEntry, error) {
 					})
 				}
 				state = 0
-			} else {
-				textLines = append(textLines, line)
+			} else if stripped := legacyFontTagPattern.ReplaceAllString(line, ""); strings.TrimSpace(stripped) != "" {
+				// Legacy HTML-like <font ...> wrappers carry face/size styling
+				// that cannot survive SRT round-trips; strip the wrappers but
+				// keep the enclosed text and non-font markup (i/b/u). Lines
+				// that contain only font wrappers are dropped without ending
+				// the cue.
+				textLines = append(textLines, stripped)
 			}
 		}
 	}

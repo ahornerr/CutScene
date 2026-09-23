@@ -181,6 +181,76 @@ No trailing newline`
 	}
 }
 
+func TestParseSRTStripsLegacyFontTagsKeepsOtherFormatting(t *testing.T) {
+	srtContent := `1
+00:00:01,000 --> 00:00:02,500
+<font face="Verdana" size="18">Hello</font> <font color="#FF0000" size="24">world</font>
+
+2
+00:00:03,000 --> 00:00:04,000
+<i>Stay</i> <FONT FACE="Arial" SIZE="12">styled</FONT> and <b>bold</b>
+
+3
+00:00:05,000 --> 00:00:06,000
+<u>underline</u> only`
+
+	tmpFile, err := os.CreateTemp("", "cutscene_test_*.srt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(tmpFile.Name())
+	if _, err := tmpFile.WriteString(srtContent); err != nil {
+		t.Fatal(err)
+	}
+	tmpFile.Close()
+
+	entries, err := ParseSRT(tmpFile.Name())
+	if err != nil {
+		t.Fatalf("ParseSRT error: %v", err)
+	}
+	if len(entries) != 3 {
+		t.Fatalf("expected 3 entries, got %d", len(entries))
+	}
+	if entries[0].Text != "Hello world" {
+		t.Errorf("font wrappers leaked into SRT text: %q", entries[0].Text)
+	}
+	if entries[1].Text != "<i>Stay</i> styled and <b>bold</b>" {
+		t.Errorf("non-font formatting not preserved: %q", entries[1].Text)
+	}
+	if entries[2].Text != "<u>underline</u> only" {
+		t.Errorf("unexpected text: %q", entries[2].Text)
+	}
+}
+
+func TestParseSRTFontOnlyLinesDoNotEndCue(t *testing.T) {
+	srtContent := `1
+00:00:01,000 --> 00:00:02,500
+<font face="Verdana" size="18">
+real text
+</font>`
+
+	tmpFile, err := os.CreateTemp("", "cutscene_test_*.srt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(tmpFile.Name())
+	if _, err := tmpFile.WriteString(srtContent); err != nil {
+		t.Fatal(err)
+	}
+	tmpFile.Close()
+
+	entries, err := ParseSRT(tmpFile.Name())
+	if err != nil {
+		t.Fatalf("ParseSRT error: %v", err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("expected 1 entry, got %d", len(entries))
+	}
+	if entries[0].Text != "real text" {
+		t.Errorf("font-only lines not collapsed: %q", entries[0].Text)
+	}
+}
+
 func TestParseSRT_NonSRT(t *testing.T) {
 	// ASS format should produce empty results, not error
 	assContent := `[Script Info]
@@ -302,6 +372,26 @@ Dialogue: 0,0:00:01.00,Hello, world, with commas{\i1}!,0:00:03.00,Default`)
 	}
 	if entry.Text != "Hello, world, with commas!" {
 		t.Errorf("unexpected ASS text: %q", entry.Text)
+	}
+}
+
+func TestParseASSLegacyFontTagsDoNotFlowIntoText(t *testing.T) {
+	data := []byte(`[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+Dialogue: 0,0:00:01.00,0:00:03.00,Default,,0,0,0,,<font face="Verdana" size="18">Hello</font> <font color="#FF0000" size="24">world</font>
+Dialogue: 0,0:00:04.00,0:00:06.00,Default,,0,0,0,,{\i1}Stay {\i0}<FONT FACE="Arial" SIZE="12">styled</FONT>`)
+	entries, err := ParseASS(data)
+	if err != nil {
+		t.Fatalf("ParseASS error: %v", err)
+	}
+	if len(entries) != 2 {
+		t.Fatalf("expected 2 ASS entries, got %d", len(entries))
+	}
+	if entries[0].Text != "Hello world" {
+		t.Errorf("font wrappers leaked into ASS text: %q", entries[0].Text)
+	}
+	if entries[1].Text != "Stay styled" {
+		t.Errorf("font wrappers leaked alongside ASS override tags: %q", entries[1].Text)
 	}
 }
 
