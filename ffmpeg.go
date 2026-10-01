@@ -827,10 +827,6 @@ func ExtractSubtitleContext(ctx context.Context, url, from, to string, subtitleI
 	if err != nil {
 		return "", err
 	}
-	if offset == 0 {
-		return extractSubtitleContextRaw(ctx, url, from, to, subtitleIndex)
-	}
-
 	fromMs, err := ParseTimestampToMs(from)
 	if err != nil {
 		return "", fmt.Errorf("invalid subtitle extraction start: %w", err)
@@ -839,6 +835,20 @@ func ExtractSubtitleContext(ctx context.Context, url, from, to string, subtitleI
 	if err != nil || toMs <= fromMs {
 		return "", fmt.Errorf("invalid subtitle extraction range")
 	}
+
+	if offset == 0 {
+		// Normalized zero-offset extraction. Raw extraction timestamps are
+		// relative to from; rebasing by fromMs makes them source-relative so
+		// the same ParseSRT/WriteClipSRT normalization path as offset
+		// extraction applies (legacy font wrappers and other raw artifacts
+		// cannot reach libass regardless of offset).
+		rawFile, err := extractSubtitleContextRawFn(ctx, url, from, to, subtitleIndex)
+		if err != nil {
+			return "", err
+		}
+		return writeNormalizedExtractedSRT(rawFile, fromMs, toMs, fromMs, 0)
+	}
+
 	// A shifted subtitle in the requested clip comes from this source range.
 	// Avoid passing negative seek times to FFmpeg; entries before source zero
 	// cannot exist and are consequently absent from the result.
@@ -851,21 +861,29 @@ func ExtractSubtitleContext(ctx context.Context, url, from, to string, subtitleI
 		return WriteClipSRT(nil, fromMs, toMs, offset)
 	}
 
-	rawFile, err := extractSubtitleContextRaw(ctx, url, formatRenderTimestamp(extractFrom), formatRenderTimestamp(extractTo), subtitleIndex)
+	rawFile, err := extractSubtitleContextRawFn(ctx, url, formatRenderTimestamp(extractFrom), formatRenderTimestamp(extractTo), subtitleIndex)
 	if err != nil {
 		return "", err
 	}
+	return writeNormalizedExtractedSRT(rawFile, fromMs, toMs, extractFrom, offset)
+}
+
+// writeNormalizedExtractedSRT reparses a raw FFmpeg SRT extraction whose cue
+// timestamps are relative to rebaseMs, converts them back to source time, and
+// writes the normalized clip file so all embedded subtitle paths share the
+// same SRT normalization semantics.
+func writeNormalizedExtractedSRT(rawFile string, fromMs, toMs, rebaseMs, offset int64) (string, error) {
 	defer os.Remove(rawFile)
 	entries, err := ParseSRT(rawFile)
 	if err != nil {
 		return "", fmt.Errorf("could not parse extracted subtitle: %w", err)
 	}
-	// Raw extraction timestamps are relative to extractFrom. Convert them back
+	// Raw extraction timestamps are relative to rebaseMs. Convert them back
 	// to source time, then apply the same clipping path used by external and
-	// cached subtitles. This keeps all subtitle types semantically identical.
+	// cached subtitles.
 	for i := range entries {
-		entries[i].Start = saturatingAddInt64(entries[i].Start, extractFrom)
-		entries[i].End = saturatingAddInt64(entries[i].End, extractFrom)
+		entries[i].Start = saturatingAddInt64(entries[i].Start, rebaseMs)
+		entries[i].End = saturatingAddInt64(entries[i].End, rebaseMs)
 	}
 	return WriteClipSRT(entries, fromMs, toMs, offset)
 }
@@ -933,6 +951,7 @@ var subtitleBatchFFmpegCommand = func(ctx context.Context, args ...string) *exec
 
 var extractSubtitleFullContextFn = ExtractSubtitleFullContext
 var extractSubtitleContextFn = ExtractSubtitleContext
+var extractSubtitleContextRawFn = extractSubtitleContextRaw
 var doFfmpegFn = DoFfmpeg
 
 func subtitleOffsetArgument(offsets []int64) (int64, error) {
