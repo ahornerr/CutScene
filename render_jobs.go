@@ -62,20 +62,23 @@ type RenderJobCreateRequest struct {
 }
 
 type renderJobSpec struct {
-	OwnerUUID             string
-	SourceToken           string
-	CallerScoped          bool
-	RatingKey             string
-	MediaID               int64
-	PartID                int64
-	PartKey               string
-	PartFile              string // resolved local filesystem path, empty if not available
-	Title                 string
-	FromMs                int64
-	ToMs                  int64
-	SubtitleIndex         int
-	SubtitleOffsetMs      int64
-	SubtitlePGS           bool
+	OwnerUUID        string
+	SourceToken      string
+	CallerScoped     bool
+	RatingKey        string
+	MediaID          int64
+	PartID           int64
+	PartKey          string
+	PartFile         string // resolved local filesystem path, empty if not available
+	Title            string
+	FromMs           int64
+	ToMs             int64
+	SubtitleIndex    int
+	SubtitleOffsetMs int64
+	SubtitlePGS      bool
+	// SubtitleSnippet is a short excerpt of the burned-in dialogue, filled in
+	// by the encode once the subtitle has been extracted.
+	SubtitleSnippet       string
 	SubtitleExternal      bool
 	SubtitleStreamKey     string
 	SubtitleCodec         string
@@ -346,7 +349,10 @@ type renderJob struct {
 	shareURL     string
 }
 
-type renderJobExecutor func(context.Context, renderJobSpec, string) error
+// renderJobExecutor encodes one render. It returns a short excerpt of the
+// clip's subtitle dialogue when a subtitle track was burned in, which the
+// manager records on the spec so the download filename can identify the clip.
+type renderJobExecutor func(context.Context, renderJobSpec, string) (string, error)
 
 type ffmpegLimiter struct {
 	slots chan struct{}

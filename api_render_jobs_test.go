@@ -1107,9 +1107,9 @@ func TestAPIShutdownDrainsClipHandlerBeforeClosingStorage(t *testing.T) {
 }
 
 func TestRenderHTTPTimeoutAndShutdownStatus(t *testing.T) {
-	manager, err := newRenderJobManager(t.TempDir(), func(ctx context.Context, _ renderJobSpec, _ string) error {
+	manager, err := newRenderJobManager(t.TempDir(), func(ctx context.Context, _ renderJobSpec, _ string) (string, error) {
 		<-ctx.Done()
-		return ctx.Err()
+		return "", ctx.Err()
 	})
 	if err != nil {
 		t.Fatal(err)

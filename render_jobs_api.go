@@ -25,7 +25,7 @@ import (
 // and timestamps shared by the other render-job handlers.
 
 func (m *renderJobManager) defaultExecute(app *Application) renderJobExecutor {
-	return func(ctx context.Context, spec renderJobSpec, outputPartial string) error {
+	return func(ctx context.Context, spec renderJobSpec, outputPartial string) (string, error) {
 		return app.executeRenderSpec(ctx, spec, outputPartial)
 	}
 }

@@ -25,7 +25,7 @@ func captureRenderParams(t *testing.T, app *Application, spec renderJobSpec) (Ff
 		captured = params
 		return "/out/job.mp4", nil
 	}
-	err := app.executeRenderSpec(context.Background(), spec, "/out/job.mp4")
+	_, err := app.executeRenderSpec(context.Background(), spec, "/out/job.mp4")
 	return captured, err
 }
 

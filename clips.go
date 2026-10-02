@@ -34,28 +34,31 @@ func setCapabilityResponseHeaders(ctx fiber.Ctx) {
 // raw share token are intentionally not serialized; callers receive URLs
 // rather than storage implementation details or credentials.
 type Clip struct {
-	ID                 string    `json:"id"`
-	OwnerUUID          string    `json:"-"`
-	CreatorDisplayName string    `json:"creatorDisplayName,omitempty"`
-	MediaKind          string    `json:"mediaKind,omitempty"`
-	MovieTitle         string    `json:"movieTitle,omitempty"`
-	MovieYear          *int      `json:"movieYear,omitempty"`
-	ShowTitle          string    `json:"showTitle,omitempty"`
-	SeasonNumber       *int      `json:"seasonNumber,omitempty"`
-	EpisodeNumber      *int      `json:"episodeNumber,omitempty"`
-	EpisodeTitle       string    `json:"episodeTitle,omitempty"`
-	Title              string    `json:"title"`
-	RatingKey          string    `json:"ratingKey"`
-	MediaID            int64     `json:"mediaId"`
-	FromMs             int64     `json:"fromMs"`
-	ToMs               int64     `json:"toMs"`
-	CreatedAt          time.Time `json:"createdAt"`
-	FilePath           string    `json:"-"`
-	ArtworkPath        string    `json:"-"`
-	ThumbnailMIME      string    `json:"-"`
-	ShareToken         string    `json:"-"`
-	tokenCiphertext    []byte
-	tokenHash          string
+	ID                 string `json:"id"`
+	OwnerUUID          string `json:"-"`
+	CreatorDisplayName string `json:"creatorDisplayName,omitempty"`
+	MediaKind          string `json:"mediaKind,omitempty"`
+	MovieTitle         string `json:"movieTitle,omitempty"`
+	MovieYear          *int   `json:"movieYear,omitempty"`
+	ShowTitle          string `json:"showTitle,omitempty"`
+	SeasonNumber       *int   `json:"seasonNumber,omitempty"`
+	EpisodeNumber      *int   `json:"episodeNumber,omitempty"`
+	EpisodeTitle       string `json:"episodeTitle,omitempty"`
+	Title              string `json:"title"`
+	// SubtitleSnippet is a short excerpt of the clip's dialogue, used to make
+	// the download filename distinguishable. Never returned over the API.
+	SubtitleSnippet string    `json:"-"`
+	RatingKey       string    `json:"ratingKey"`
+	MediaID         int64     `json:"mediaId"`
+	FromMs          int64     `json:"fromMs"`
+	ToMs            int64     `json:"toMs"`
+	CreatedAt       time.Time `json:"createdAt"`
+	FilePath        string    `json:"-"`
+	ArtworkPath     string    `json:"-"`
+	ThumbnailMIME   string    `json:"-"`
+	ShareToken      string    `json:"-"`
+	tokenCiphertext []byte
+	tokenHash       string
 }
 
 type clipStore struct {
@@ -168,6 +171,15 @@ var clipPresentationColumns = map[string]bool{
 	"creator_display_name": true, "media_kind": true, "movie_title": true,
 	"movie_year": true, "show_title": true, "season_number": true,
 	"episode_number": true, "episode_title": true, "thumbnail_mime": true,
+}
+
+// clipOptionalColumns are additive columns that do not take part in schema
+// tier detection. A database may have them or not, and either state is valid;
+// initialize adds any that are missing. They are kept separate from
+// clipPresentationColumns so that adding one does not change which tier an
+// existing database is recognised as.
+var clipOptionalColumns = map[string]bool{
+	"subtitle_snippet": true,
 }
 
 func resolveClipDatabasePath(root, configured string) (string, error) {
@@ -404,6 +416,9 @@ func inspectClipSchema(db *sql.DB) (clipSchema, error) {
 	if hasCipher {
 		allowed["share_token_ciphertext"] = true
 	}
+	for column := range clipOptionalColumns {
+		allowed[column] = true
+	}
 	for column := range columns {
 		if !allowed[column] {
 			return clipSchema{}, fmt.Errorf("clips table has unknown column %q", column)
@@ -569,7 +584,8 @@ func (s *clipStore) initialize(schema clipSchema) error {
 				season_number INTEGER,
 				episode_number INTEGER,
 				episode_title TEXT,
-				thumbnail_mime TEXT
+				thumbnail_mime TEXT,
+				subtitle_snippet TEXT
 			);
 			CREATE INDEX clips_owner_created ON clips(owner_uuid, created_at DESC);
 			CREATE INDEX clips_created ON clips(created_at DESC);
@@ -580,7 +596,7 @@ func (s *clipStore) initialize(schema clipSchema) error {
 		return nil
 	}
 	if schema.kind == clipSchemaPresentation {
-		return nil
+		return s.addSubtitleSnippetColumn()
 	}
 	if _, err := s.db.Exec("PRAGMA secure_delete = ON"); err != nil {
 		return fmt.Errorf("prepare legacy clip migration: %w", err)
@@ -590,6 +606,46 @@ func (s *clipStore) initialize(schema clipSchema) error {
 	}
 	if _, err := s.db.Exec("VACUUM"); err != nil {
 		return fmt.Errorf("vacuum legacy clip data: %w", err)
+	}
+	return s.addSubtitleSnippetColumn()
+}
+
+// addSubtitleSnippetColumn adds the optional subtitle excerpt column to a
+// database created before it existed. Additive and idempotent: existing rows
+// keep a NULL excerpt and simply fall back to timestamps in their filename.
+//
+// The column is checked first because SQLite's "ADD COLUMN IF NOT EXISTS" is
+// only available from 3.35 and is not supported by every bundled library.
+func (s *clipStore) addSubtitleSnippetColumn() error {
+	rows, err := s.db.Query("PRAGMA table_info(clips)")
+	if err != nil {
+		return fmt.Errorf("inspect clip columns for subtitle excerpt: %w", err)
+	}
+	found := false
+	for rows.Next() {
+		var cid int
+		var name, columnType string
+		var notNull int
+		var dfltValue any
+		var primaryKey int
+		if err := rows.Scan(&cid, &name, &columnType, &notNull, &dfltValue, &primaryKey); err != nil {
+			rows.Close()
+			return fmt.Errorf("inspect clip columns for subtitle excerpt: %w", err)
+		}
+		if name == "subtitle_snippet" {
+			found = true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return fmt.Errorf("inspect clip columns for subtitle excerpt: %w", err)
+	}
+	rows.Close()
+	if found {
+		return nil
+	}
+	if _, err := s.db.Exec("ALTER TABLE clips ADD COLUMN subtitle_snippet TEXT"); err != nil {
+		return fmt.Errorf("add clip subtitle excerpt column: %w", err)
 	}
 	return nil
 }
@@ -870,7 +926,8 @@ func (s *clipStore) promoteWithArtwork(spec renderJobSpec, sourcePath, artworkSo
 		MovieTitle: spec.MovieTitle, MovieYear: spec.MovieYear, ShowTitle: spec.ShowTitle,
 		SeasonNumber: spec.SeasonNumber, EpisodeNumber: spec.EpisodeNumber,
 		EpisodeTitle: spec.EpisodeTitle, ArtworkPath: artworkPath, ThumbnailMIME: artworkMIME,
-		tokenHash: tokenHash,
+		SubtitleSnippet: spec.SubtitleSnippet,
+		tokenHash:       tokenHash,
 	}
 	ciphertext, err := s.encryptToken(token)
 	if err != nil {
@@ -879,14 +936,15 @@ func (s *clipStore) promoteWithArtwork(spec renderJobSpec, sourcePath, artworkSo
 	}
 	_, err = s.db.Exec(`INSERT INTO clips
 		(id, owner_uuid, title, rating_key, media_id, from_ms, to_ms, created_at, share_token_hash, share_token_ciphertext,
-		 creator_display_name, media_kind, movie_title, movie_year, show_title, season_number, episode_number, episode_title, thumbnail_mime)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		 creator_display_name, media_kind, movie_title, movie_year, show_title, season_number, episode_number, episode_title, thumbnail_mime,
+		 subtitle_snippet)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		clip.ID, clip.OwnerUUID, clip.Title, clip.RatingKey, clip.MediaID,
 		clip.FromMs, clip.ToMs, clip.CreatedAt.Format(time.RFC3339Nano),
 		tokenHash, ciphertext, nullableString(clip.CreatorDisplayName), nullableString(clip.MediaKind),
 		nullableString(clip.MovieTitle), nullableInt(clip.MovieYear), nullableString(clip.ShowTitle),
 		nullableInt(clip.SeasonNumber), nullableInt(clip.EpisodeNumber), nullableString(clip.EpisodeTitle),
-		nullableString(clip.ThumbnailMIME))
+		nullableString(clip.ThumbnailMIME), nullableString(clip.SubtitleSnippet))
 	if err != nil {
 		rollback()
 		return nil, fmt.Errorf("persist clip metadata: %w", err)
@@ -931,12 +989,12 @@ func (s *clipStore) scanClip(scanner interface{ Scan(...any) error }) (*Clip, er
 	var clip Clip
 	var created string
 	var tokenHash string
-	var creator, mediaKind, movieTitle, showTitle, episodeTitle, thumbnailMIME sql.NullString
+	var creator, mediaKind, movieTitle, showTitle, episodeTitle, thumbnailMIME, snippet sql.NullString
 	var movieYear, seasonNumber, episodeNumber sql.NullInt64
 	if err := scanner.Scan(&clip.ID, &clip.OwnerUUID, &clip.Title, &clip.RatingKey,
 		&clip.MediaID, &clip.FromMs, &clip.ToMs, &created, &tokenHash, &clip.tokenCiphertext,
 		&creator, &mediaKind, &movieTitle, &movieYear, &showTitle, &seasonNumber, &episodeNumber,
-		&episodeTitle, &thumbnailMIME); err != nil {
+		&episodeTitle, &thumbnailMIME, &snippet); err != nil {
 		return nil, err
 	}
 	var err error
@@ -953,6 +1011,7 @@ func (s *clipStore) scanClip(scanner interface{ Scan(...any) error }) (*Clip, er
 	clip.MovieTitle = movieTitle.String
 	clip.ShowTitle = showTitle.String
 	clip.EpisodeTitle = episodeTitle.String
+	clip.SubtitleSnippet = snippet.String
 	if movieYear.Valid {
 		value := int(movieYear.Int64)
 		clip.MovieYear = &value
@@ -977,7 +1036,8 @@ func (s *clipStore) scanClip(scanner interface{ Scan(...any) error }) (*Clip, er
 }
 
 const clipSelect = `id, owner_uuid, title, rating_key, media_id, from_ms, to_ms, created_at, share_token_hash, share_token_ciphertext,
-	creator_display_name, media_kind, movie_title, movie_year, show_title, season_number, episode_number, episode_title, thumbnail_mime`
+	creator_display_name, media_kind, movie_title, movie_year, show_title, season_number, episode_number, episode_title, thumbnail_mime,
+	subtitle_snippet`
 
 func (s *clipStore) get(id string) (*Clip, error) {
 	row := s.db.QueryRow("SELECT "+clipSelect+" FROM clips WHERE id = ?", id)
@@ -1347,6 +1407,7 @@ func (a *API) sendClipFile(ctx fiber.Ctx, clip *Clip, attachment bool) error {
 	if attachment {
 		ctx.Set(fiber.HeaderContentDisposition, renderDownloadContentDisposition(renderJobSpec{
 			Title: clip.Title, FromMs: clip.FromMs, ToMs: clip.ToMs,
+			SubtitleSnippet: clip.SubtitleSnippet,
 		}))
 	} else {
 		ctx.Set(fiber.HeaderContentDisposition, "inline")

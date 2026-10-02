@@ -297,7 +297,15 @@ func (m *renderJobManager) run(job *renderJob) {
 			m.mu.Unlock()
 			return
 		}
-		err = m.execute(ctx, job.spec, filepath.Join(job.dir, "output.partial"))
+		var subtitleSnippet string
+		subtitleSnippet, err = m.execute(ctx, job.spec, filepath.Join(job.dir, "output.partial"))
+		if err == nil && subtitleSnippet != "" {
+			// Record the excerpt under the job lock: the worker mutates the spec
+			// while status and download handlers may be reading it concurrently.
+			job.mu.Lock()
+			job.spec.SubtitleSnippet = subtitleSnippet
+			job.mu.Unlock()
+		}
 	}
 	defer m.clearCallerLease(job.id)
 	cancel()

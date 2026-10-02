@@ -79,13 +79,25 @@ func downloadRangeTimestamp(ms int64) string {
 	return fmt.Sprintf("%02d-%02d-%02d", hours, minutes, seconds)
 }
 
+// buildDownloadFilename composes the download name from the clip title, an
+// excerpt of the clip's subtitle dialogue, and the time range.
+//
+// The dialogue excerpt is what makes several clips of the same scene
+// distinguishable in a folder, so it is preferred over the timestamps when
+// one is available. Clips rendered without a subtitle track keep the
+// timestamps, which remain the only distinguishing information.
 func buildDownloadFilename(spec renderJobSpec, ascii bool) string {
 	title, asciiTitle := cleanDownloadTitle(spec.Title)
+	snippet, asciiSnippet := cleanDownloadTitle(spec.SubtitleSnippet)
 	if ascii {
 		title = asciiTitle
+		snippet = asciiSnippet
 	}
 	if title == "" {
 		title = "clip"
+	}
+	if snippet != "" {
+		return fmt.Sprintf("%s_%s.mp4", title, snippet)
 	}
 	return fmt.Sprintf("%s_%s_to_%s.mp4", title, downloadRangeTimestamp(spec.FromMs), downloadRangeTimestamp(spec.ToMs))
 }
