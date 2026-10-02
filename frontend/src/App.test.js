@@ -949,11 +949,13 @@ test('episode cards fall back to the show poster when the episode has no thumbna
   render(<App/>);
   await flush();
 
-  // Episode card uses the show poster URL.
+  // Episode card uses the show poster URL. The path is percent-encoded so a
+  // thumbnail path containing a query string survives the round trip intact.
   const episodeCard = screen.getByRole('button', {name: /Your session.*The Show/});
   const episodeImg = episodeCard.querySelector('img');
   expect(episodeImg).not.toBeNull();
-  expect(episodeImg.getAttribute('src')).toBe('/thumb?path=/show/poster');
+  const episodeSrc = new URL(episodeImg.getAttribute('src'), 'http://localhost');
+  expect(episodeSrc.searchParams.get('path')).toBe('/show/poster');
 
   // Movie with no artwork renders a placeholder and no <img> at all.
   const movieCard = screen.getByRole('button', {name: /NoArt Movie/});
