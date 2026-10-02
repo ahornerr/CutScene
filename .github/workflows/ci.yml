@@ -25,6 +25,16 @@ jobs:
           go-version-file: go.mod
           cache: true
 
+      # The end-to-end preview/render comparison shells out to FFmpeg and
+      # silently skips when it is missing, which made it look green in CI while
+      # never running. The GitHub runner image does not ship FFmpeg, so install
+      # it explicitly. libx264 is required by the test.
+      - name: install ffmpeg
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ffmpeg
+          ffmpeg -version
+
       - name: gofmt
         run: |
           unformatted="$(gofmt -l . | grep -v node_modules || true)"

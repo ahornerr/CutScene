@@ -3,11 +3,29 @@ package main
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"testing"
 )
+
+// TestMain makes a missing FFmpeg a hard failure in CI while still allowing a
+// bare `go test` on a developer machine without FFmpeg to pass.
+//
+// Without this, the guard below skips silently: CI reported the suite green and
+// "ok" while this test never executed, because the GitHub runner image does not
+// ship FFmpeg. Skipping must be visible.
+func TestMain(m *testing.M) {
+	if os.Getenv("CI") != "" {
+		if _, err := exec.LookPath("ffmpeg"); err != nil {
+			fmt.Fprintln(os.Stderr, "CI is set but ffmpeg is not installed; the end-to-end preview/render tests would be skipped.")
+			fmt.Fprintln(os.Stderr, "Install ffmpeg (apt-get install -y ffmpeg) so CI exercises them.")
+			os.Exit(1)
+		}
+	}
+	os.Exit(m.Run())
+}
 
 // TestPreviewAndRenderProduceEquivalentVideo exercises both pipelines for real
 // against the same source and compares decoded pixels. Argument assertions
@@ -18,7 +36,7 @@ import (
 // resolution render against a 720p preview would compare different requests.
 func TestPreviewAndRenderProduceEquivalentVideo(t *testing.T) {
 	if _, lookErr := exec.LookPath("ffmpeg"); lookErr != nil {
-		t.Skip("ffmpeg is not installed; skipping end-to-end encode comparison")
+		t.Skip("ffmpeg is not installed; skipping end-to-end encode comparison (set CI=true to make this fatal)")
 	}
 	dir := t.TempDir()
 	source := filepath.Join(dir, "source.mp4")
