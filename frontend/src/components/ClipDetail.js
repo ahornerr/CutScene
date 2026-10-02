@@ -97,6 +97,9 @@ export default function ClipDetail({clipId, onBack, onDeleted}) {
   const creator = admin ? creatorLabel(clip) : ''
   const {primary: mediaPrimary, secondary: mediaSecondary} = mediaLabel(clip)
   const displayTitle = clip?.title || 'Untitled clip'
+  // Shown on the clip library card too; the detail view is where a viewer goes
+  // to identify a specific clip, so the excerpt belongs here as well.
+  const snippet = (clip?.subtitleSnippet || '').trim()
   // shareUrl and publicDownloadUrl are the same stable public inline MP4 URL.
   const playbackSrc = clip?.publicDownloadUrl || clip?.shareUrl || ''
   const downloadUrl = clip?.downloadUrl || ''
@@ -164,6 +167,14 @@ export default function ClipDetail({clipId, onBack, onDeleted}) {
             {(mediaPrimary || mediaSecondary) && (
               <Typography variant="subtitle1" sx={{color: 'text.secondary', mt: 0.5, wordBreak: 'break-word'}}>
                 {mediaContext(clip)}
+              </Typography>
+            )}
+            {snippet && (
+              <Typography
+                variant="body1"
+                sx={{color: 'text.secondary', fontStyle: 'italic', mt: 0.75, overflowWrap: 'anywhere'}}
+              >
+                &ldquo;{snippet}&rdquo;
               </Typography>
             )}
             <Box sx={{display: 'flex', flexWrap: 'wrap', gap: 1, alignItems: 'center', mt: 1}}>

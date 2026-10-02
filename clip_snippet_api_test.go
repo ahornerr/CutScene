@@ -5,6 +5,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -90,5 +91,65 @@ func TestClipAPIWithoutSubtitleSnippet(t *testing.T) {
 	}
 	if _, present := fields["subtitleSnippet"]; present {
 		t.Errorf("subtitleSnippet should be omitted when no dialogue was captured: %s", encoded)
+	}
+}
+
+// TestRenderJobStatusReportsSubtitleSnippet pins that a finished render tells
+// the caller what dialogue it captured, so the UI can show it without opening
+// the library.
+func TestRenderJobStatusReportsSubtitleSnippet(t *testing.T) {
+	manager, err := newRenderJobManager(t.TempDir(), writeRenderOutput)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer manager.stopAndWait()
+
+	const dialogue = "We never told the police"
+	job, err := manager.enqueue("owner-a", renderTestSpec("owner-a"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The encode records the excerpt, as executeRenderSpec does after a
+	// successful subtitle pass.
+	job.mu.Lock()
+	job.spec.SubtitleSnippet = dialogue
+	job.mu.Unlock()
+
+	waitRenderStatus(t, manager, job.id, "owner-a", renderSucceeded)
+
+	response, err := manager.status(job.id, "owner-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.SubtitleSnippet != dialogue {
+		t.Errorf("status snippet = %q, want %q", response.SubtitleSnippet, dialogue)
+	}
+}
+
+// TestRenderJobStatusOmitsSnippetWhenNoneCaptured keeps the field absent for
+// renders that carried no subtitle track.
+func TestRenderJobStatusOmitsSnippetWhenNoneCaptured(t *testing.T) {
+	manager, err := newRenderJobManager(t.TempDir(), writeRenderOutput)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer manager.stopAndWait()
+
+	job, err := manager.enqueue("owner-a", renderTestSpec("owner-a"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitRenderStatus(t, manager, job.id, "owner-a", renderSucceeded)
+
+	response, err := manager.status(job.id, "owner-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := json.Marshal(response)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := string(encoded); strings.Contains(got, "subtitleSnippet") {
+		t.Errorf("subtitleSnippet should be omitted when nothing was captured: %s", got)
 	}
 }
