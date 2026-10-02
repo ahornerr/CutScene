@@ -19,7 +19,12 @@ type Config struct {
 	API struct {
 		ListenAddr string `mapstructure:"listen_addr"`
 		Domain     string `mapstructure:"domain"`
-	}
+		// SecureCookies marks the session cookie Secure, so browsers only send
+		// it over HTTPS. It defaults to false because CutScene is commonly
+		// self-hosted over plain HTTP on a trusted LAN; enable it whenever the
+		// service is reachable over HTTPS.
+		SecureCookies bool `mapstructure:"secure_cookies"`
+	} `mapstructure:"api"`
 	Ffmpeg struct {
 		Codec       Codec `mapstructure:"codec"`
 		Concurrency int   `mapstructure:"concurrency"`
@@ -82,7 +87,7 @@ func main() {
 
 	// The session store lives under the configured storage root, so it must be
 	// created after the configuration is loaded.
-	if err := configureSessionStore(cfg.Storage.Root); err != nil {
+	if err := configureSessionStore(cfg.Storage.Root, cfg.API.SecureCookies); err != nil {
 		log.Fatal(err)
 	}
 

@@ -170,3 +170,20 @@ func TestPlexPathMappingsConfig(t *testing.T) {
 		t.Fatalf("expected /shows, got %q", cfg.Plex.PathMappings["/volume2/shows"])
 	}
 }
+
+func TestSecureCookiesConfig(t *testing.T) {
+	cfg := loadConfigForTest(t, `api:
+  listen_addr: ":8080"
+  secure_cookies: true
+`)
+	if !cfg.API.SecureCookies {
+		t.Fatal("expected api.secure_cookies to be enabled")
+	}
+
+	// Omitting the key must leave it disabled: a Secure cookie would never be
+	// delivered over plain HTTP.
+	cfg = loadConfigForTest(t, "api:\n  listen_addr: \":8080\"\n")
+	if cfg.API.SecureCookies {
+		t.Fatal("expected api.secure_cookies to default to false")
+	}
+}
