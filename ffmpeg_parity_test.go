@@ -218,3 +218,20 @@ func TestTranscodeArgsPreviewStreamsRenderSeeks(t *testing.T) {
 		t.Errorf("render map_chapters = %v, want -1", got)
 	}
 }
+
+// TestTranscodeSpecZeroAudioModeIsStandard pins the zero-value AudioMode to
+// standard playback. The preview entry points used to take a variadic
+// audioModes argument whose zero-argument form defaulted to standard; they now
+// take a single AudioMode, so the zero value must keep that meaning.
+func TestTranscodeSpecZeroAudioModeIsStandard(t *testing.T) {
+	_, output, err := buildArgsForTest(transcodeSpec{Codec: CodecLibx264})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := output["af"]; ok {
+		t.Errorf("output af = %v, want no audio filter for the zero-value audio mode", output["af"])
+	}
+	if _, ok := output["ar"]; ok {
+		t.Errorf("output ar = %v, want no output rate for the zero-value audio mode", output["ar"])
+	}
+}
