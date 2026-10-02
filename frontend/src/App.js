@@ -175,6 +175,17 @@ function App() {
   // workspace state (selectedSession, render job, etc.) is retained across
   // navigation so the render workflow is never disrupted.
   const [view, setView] = useState(() => viewFromHash(window.location.hash))
+  // Hash navigation calls setView with a freshly parsed object on every
+  // history event, even when the route is unchanged. Effects that depend on
+  // the view must key off a stable identity derived from the fields they read,
+  // otherwise an equivalent route re-fires them (and re-hydrates the workspace).
+  const viewKey = `${view.name}|${view.clipId || ''}|${view.ratingKey || ''}|${view.mediaId ?? ''}|${view.partId ?? ''}`
+  // Depending on `view` here would defeat the purpose: `view` is replaced with
+  // a new object on every history event, which is exactly what viewKey filters
+  // out. The memo deliberately keeps the previous object when the route is
+  // equivalent.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  const stableView = useMemo(() => view, [viewKey])
   const activeJobRef = useRef(false)
   const selectedSessionRef = useRef(null)
 
@@ -1139,21 +1150,21 @@ const handleLibraryAuthRequired = useCallback(() => setNeedsAuth(true), [])
     workspaceHydrationControllerRef.current?.abort()
     workspaceHydrationControllerRef.current = null
 
-    if (view.name !== 'workspace') return undefined
+    if (stableView.name !== 'workspace') return undefined
     if (
       activeJobRef.current &&
       selectedSession &&
-      !sessionMatchesWorkspace(selectedSession, view)
+      !sessionMatchesWorkspace(selectedSession, stableView)
     ) {
       const canonicalView = workspaceViewForSession(selectedSession)
       if (canonicalView) navigateTo(canonicalView, true)
       return undefined
     }
-    if (selectedSession && sessionMatchesWorkspace(selectedSession, view)) {
+    if (selectedSession && sessionMatchesWorkspace(selectedSession, stableView)) {
       stopSessionRefresh()
       return undefined
     }
-    if (selectedSession && !sessionMatchesWorkspace(selectedSession, view)) {
+    if (selectedSession && !sessionMatchesWorkspace(selectedSession, stableView)) {
       // Clear source-bound subtitle state before the hydrated source is
       // installed. This prevents the subtitle effect from combining the new
       // route with the previous session's selected track for one render.
@@ -1181,13 +1192,13 @@ const handleLibraryAuthRequired = useCallback(() => setNeedsAuth(true), [])
     const hydrate = async () => {
       try {
         let session
-        if (view.partId == null) {
+        if (stableView.partId == null) {
           const liveSessions = await fetchWorkspaceSessions(controller.signal)
-          session = liveSessions.find(candidate => sessionMatchesWorkspace(candidate, view))
+          session = liveSessions.find(candidate => sessionMatchesWorkspace(candidate, stableView))
           if (!session) throw new Error('The active session is no longer available.')
         } else {
           const response = await fetch(
-            `/library/source/${encodeURIComponent(view.ratingKey)}?mediaId=${view.mediaId}&partId=${view.partId}`,
+            `/library/source/${encodeURIComponent(stableView.ratingKey)}?mediaId=${stableView.mediaId}&partId=${stableView.partId}`,
             {redirect: 'manual', signal: controller.signal}
           )
           if (response.type === 'opaqueredirect' || response.status === 401 || response.status === 403) {
@@ -1198,9 +1209,9 @@ const handleLibraryAuthRequired = useCallback(() => setNeedsAuth(true), [])
           const validationError = validateLibraryResult(result)
           if (validationError) throw new Error(validationError)
           if (
-            String(result.ratingKey) !== view.ratingKey ||
-            Number(result.mediaId) !== view.mediaId ||
-            Number(result.partId) !== view.partId
+            String(result.ratingKey) !== stableView.ratingKey ||
+            Number(result.mediaId) !== stableView.mediaId ||
+            Number(result.partId) !== stableView.partId
           ) {
             throw new Error('The requested library source is no longer available.')
           }
@@ -1228,8 +1239,10 @@ const handleLibraryAuthRequired = useCallback(() => setNeedsAuth(true), [])
       }
     }
   }, [
-    navigateTo, selectedSession, stopSessionRefresh,
-    view.name, view.ratingKey, view.mediaId, view.partId,
+    // view is read as a whole object here (sessionMatchesWorkspace takes the
+    // object), so depend on a referentially stable view rather than its
+    // individual fields.
+    navigateTo, selectedSession, stopSessionRefresh, stableView,
   ])
 
   // ---------------------------------------------------------------- clip library navigation
