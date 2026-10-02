@@ -520,6 +520,13 @@ func samePlexOrigin(left, right *url.URL) bool {
 	return canonicalPlexOrigin(left).String() == canonicalPlexOrigin(right).String()
 }
 
+// canonicalPlexOrigin reduces a URL to its origin: lower-cased scheme, host and
+// port, with any default port removed.
+//
+// The path, query and fragment are deliberately dropped. Callers compare a
+// configured, path-less Plex origin against resource and redirect URLs that
+// necessarily carry a path, so retaining those components would make every
+// legitimate URL look like a different origin.
 func canonicalPlexOrigin(origin *url.URL) *url.URL {
 	copy := *origin
 	hostname := strings.ToLower(copy.Hostname())
@@ -535,6 +542,15 @@ func canonicalPlexOrigin(origin *url.URL) *url.URL {
 		copy.Host = host
 	}
 	copy.Scheme = strings.ToLower(copy.Scheme)
+	copy.Path = ""
+	copy.RawPath = ""
+	copy.RawQuery = ""
+	copy.Fragment = ""
+	copy.RawFragment = ""
+	copy.Opaque = ""
+	// User is deliberately NOT stripped. Dropping it would make
+	// "https://user:pass@plex.example/x" compare equal to "https://plex.example",
+	// letting a userinfo trick satisfy the origin check.
 	return &copy
 }
 
