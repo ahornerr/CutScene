@@ -17,7 +17,10 @@ export default function RenderJobBar({
   onCreateJob, onDownload, onRetry, onRetryPoll, onCreateNew,
   onOpenClip,
 }) {
-  const {status, error, downloadUrl, expiresAt, retryAfter, clipId} = renderState
+  const {status, error, downloadUrl, expiresAt, retryAfter, clipId, subtitleSnippet} = renderState
+  // The dialogue captured by the encode, so a finished render shows what it
+  // actually recorded instead of only a time range.
+  const snippet = (subtitleSnippet || '').trim()
   // A successful render is promoted to a durable saved clip (see clips.go).
   // The terminal job response carries clipId; we surface a discoverable
   // "Open in library" affordance that is visually distinct from the transient
@@ -254,6 +257,11 @@ export default function RenderJobBar({
           <Typography variant="caption" sx={{color: '#7fd391', display: 'block', mb: 0.75}}>
             Saved to your clip library.
           </Typography>
+          {snippet && (
+            <Typography variant="body2" sx={{color: 'text.secondary', fontStyle: 'italic', mb: 0.75, overflowWrap: 'anywhere'}}>
+              &ldquo;{snippet}&rdquo;
+            </Typography>
+          )}
           <Button
             variant="outlined"
             size="small"

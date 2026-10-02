@@ -177,15 +177,19 @@ type renderJobError struct {
 }
 
 type renderJobResponse struct {
-	ID          string          `json:"id"`
-	Status      renderJobState  `json:"status"`
-	CreatedAt   time.Time       `json:"createdAt"`
-	UpdatedAt   time.Time       `json:"updatedAt"`
-	ExpiresAt   *time.Time      `json:"expiresAt,omitempty"`
-	DownloadURL string          `json:"downloadUrl,omitempty"`
-	ClipID      string          `json:"clipId,omitempty"`
-	ShareURL    string          `json:"shareUrl,omitempty"`
-	Error       *renderJobError `json:"error,omitempty"`
+	ID          string         `json:"id"`
+	Status      renderJobState `json:"status"`
+	CreatedAt   time.Time      `json:"createdAt"`
+	UpdatedAt   time.Time      `json:"updatedAt"`
+	ExpiresAt   *time.Time     `json:"expiresAt,omitempty"`
+	DownloadURL string         `json:"downloadUrl,omitempty"`
+	ClipID      string         `json:"clipId,omitempty"`
+	// SubtitleSnippet is the dialogue excerpt captured during the encode. It
+	// is only known once the render has produced its subtitles, so it is empty
+	// while a job is queued or running.
+	SubtitleSnippet string          `json:"subtitleSnippet,omitempty"`
+	ShareURL        string          `json:"shareUrl,omitempty"`
+	Error           *renderJobError `json:"error,omitempty"`
 }
 
 type renderFailure struct {

@@ -875,6 +875,7 @@ function App() {
           retryAfter: null,
           clipId: job.clipId || null,
           shareUrl: job.shareUrl || null,
+          subtitleSnippet: job.subtitleSnippet || null,
         })
         pollForJobRef.current(job.id, controller)
       })
@@ -924,6 +925,7 @@ function App() {
               retryAfter: null,
               clipId: job.clipId || null,
               shareUrl: job.shareUrl || null,
+              subtitleSnippet: job.subtitleSnippet || null,
             })
             if (!isTerminal(job.status)) {
               pollTimeoutRef.current = setTimeout(poll, POLL_INTERVAL_MS)
