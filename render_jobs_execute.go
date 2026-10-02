@@ -12,7 +12,10 @@ import (
 // Resolves an authorised source URL (capability proxy or local file), prepares
 // subtitles, and invokes FFmpeg to produce the clip.
 
-func (a *Application) executeRenderSpec(ctx context.Context, spec renderJobSpec, outputPartial string) error {
+// executeRenderSpec encodes one render and returns a short excerpt of the
+// burned-in subtitle dialogue, which the caller records so the download
+// filename can identify the clip.
+func (a *Application) executeRenderSpec(ctx context.Context, spec renderJobSpec, outputPartial string) (string, error) {
 	callerScoped := false
 	var callerAccess *PlexAccess
 	if current := activeRenderCallerAccess(ctx); current != nil {
@@ -25,11 +28,11 @@ func (a *Application) executeRenderSpec(ctx context.Context, spec renderJobSpec,
 		var err error
 		proxy, err := a.ensureMediaProxy()
 		if err != nil {
-			return newRenderStageFailure("source", "source_unavailable", errors.New("Plex capability proxy is unavailable"))
+			return "", newRenderStageFailure("source", "source_unavailable", errors.New("Plex capability proxy is unavailable"))
 		}
 		sourceURL, capabilityRelease, err = proxy.IssueWithTTL(ctx, callerAccess, spec.PartKey, renderTimeout)
 		if err != nil {
-			return newRenderStageFailure("source", "source_unavailable", err)
+			return "", newRenderStageFailure("source", "source_unavailable", err)
 		}
 		defer capabilityRelease()
 	} else {
@@ -68,7 +71,7 @@ func (a *Application) executeRenderSpec(ctx context.Context, spec renderJobSpec,
 				if errors.Is(err, ErrNoUsableSubtitleCues) {
 					subtitleFile = ""
 				} else {
-					return newRenderStageFailure("subtitle", "subtitle_unavailable", err)
+					return "", newRenderStageFailure("subtitle", "subtitle_unavailable", err)
 				}
 			}
 		} else {
@@ -79,16 +82,16 @@ func (a *Application) executeRenderSpec(ctx context.Context, spec renderJobSpec,
 			if callerScoped && spec.PartFile == "" {
 				proxy, proxyErr := a.ensureMediaProxy()
 				if proxyErr != nil {
-					return newRenderStageFailure("subtitle", "subtitle_unavailable", proxyErr)
+					return "", newRenderStageFailure("subtitle", "subtitle_unavailable", proxyErr)
 				}
 				subtitleURL, releaseCapability, issueErr := proxy.IssueWithTTL(ctx, callerAccess, spec.PartKey, renderTimeout)
 				if issueErr != nil {
-					return newRenderStageFailure("subtitle", "subtitle_unavailable", issueErr)
+					return "", newRenderStageFailure("subtitle", "subtitle_unavailable", issueErr)
 				}
 				defer releaseCapability()
 				releaseFFmpeg, acquireErr := a.acquireFFmpeg(ctx)
 				if acquireErr != nil {
-					return classifyRenderStageError("subtitle", acquireErr)
+					return "", classifyRenderStageError("subtitle", acquireErr)
 				}
 				var subtitleErr error
 				subtitleFile, subtitleErr = func() (string, error) {
@@ -99,14 +102,14 @@ func (a *Application) executeRenderSpec(ctx context.Context, spec renderJobSpec,
 					if errors.Is(subtitleErr, ErrNoUsableSubtitleCues) {
 						subtitleFile = ""
 					} else {
-						return classifyRenderStageError("subtitle", subtitleErr)
+						return "", classifyRenderStageError("subtitle", subtitleErr)
 					}
 				}
 				goto subtitleReady
 			}
 			release, err := a.acquireFFmpeg(ctx)
 			if err != nil {
-				return classifyRenderStageError("subtitle", err)
+				return "", classifyRenderStageError("subtitle", err)
 			}
 			subtitleFile, err = func() (string, error) {
 				defer release()
@@ -116,7 +119,7 @@ func (a *Application) executeRenderSpec(ctx context.Context, spec renderJobSpec,
 				if errors.Is(err, ErrNoUsableSubtitleCues) {
 					subtitleFile = ""
 				} else {
-					return classifyRenderStageError("subtitle", err)
+					return "", classifyRenderStageError("subtitle", err)
 				}
 			}
 		}
@@ -138,12 +141,20 @@ func (a *Application) executeRenderSpec(ctx context.Context, spec renderJobSpec,
 	}
 	release, err := a.acquireFFmpeg(ctx)
 	if err != nil {
-		return classifyRenderStageError("encoder", err)
+		return "", classifyRenderStageError("encoder", err)
+	}
+	// Capture the clip's dialogue before the temporary SRT is discarded, so the
+	// download filename can identify the clip by what was said in it.
+	var snippet string
+	if subtitleFile != "" {
+		if entries, parseErr := ParseSRT(subtitleFile); parseErr == nil {
+			snippet = subtitleSnippetFromEntries(entries)
+		}
 	}
 	_, err = doFfmpegFn(params)
 	release()
 	if err != nil {
-		return classifyRenderError(err)
+		return "", classifyRenderError(err)
 	}
-	return err
+	return snippet, nil
 }

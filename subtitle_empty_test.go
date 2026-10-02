@@ -86,7 +86,7 @@ func TestExecuteRenderSpecNonScopedEmbeddedEmptySubtitle(t *testing.T) {
 			return "/out/job.mp4", nil
 		}
 
-		err := app.executeRenderSpec(context.Background(), spec, "/out/job.mp4")
+		_, err := app.executeRenderSpec(context.Background(), spec, "/out/job.mp4")
 		if err != nil {
 			t.Fatalf("executeRenderSpec failed: %v", err)
 		}
@@ -100,7 +100,7 @@ func TestExecuteRenderSpecNonScopedEmbeddedEmptySubtitle(t *testing.T) {
 			return "", errors.New("ffmpeg extraction failed")
 		}
 
-		err := app.executeRenderSpec(context.Background(), spec, "/out/job.mp4")
+		_, err := app.executeRenderSpec(context.Background(), spec, "/out/job.mp4")
 		if err == nil {
 			t.Fatal("expected error, got nil")
 		}

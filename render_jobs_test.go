@@ -111,8 +111,8 @@ func renderTestSpec(owner string) renderJobSpec {
 	}
 }
 
-func writeRenderOutput(_ context.Context, _ renderJobSpec, output string) error {
-	return os.WriteFile(output, []byte("valid mp4 bytes"), 0600)
+func writeRenderOutput(_ context.Context, _ renderJobSpec, output string) (string, error) {
+	return "", os.WriteFile(output, []byte("valid mp4 bytes"), 0600)
 }
 
 func waitRenderStatus(t *testing.T, manager *renderJobManager, id, owner string, state renderJobState) renderJobResponse {
@@ -391,10 +391,10 @@ func TestRenderJobExpirationRespectsDownloadLease(t *testing.T) {
 func TestRenderJobQueueAndOwnerSaturation(t *testing.T) {
 	release := make(chan struct{})
 	started := make(chan struct{}, 1)
-	executor := func(_ context.Context, _ renderJobSpec, output string) error {
+	executor := func(_ context.Context, _ renderJobSpec, output string) (string, error) {
 		started <- struct{}{}
 		<-release
-		return os.WriteFile(output, []byte("ok"), 0600)
+		return "", os.WriteFile(output, []byte("ok"), 0600)
 	}
 	manager, err := newRenderJobManager(t.TempDir(), executor)
 	if err != nil {
@@ -461,11 +461,11 @@ func TestSubtitleBulkGateReservesForegroundFFmpegSlot(t *testing.T) {
 }
 
 func TestRenderJobFailureIsSanitizedAndCleansOutput(t *testing.T) {
-	manager, err := newRenderJobManager(t.TempDir(), func(_ context.Context, _ renderJobSpec, output string) error {
+	manager, err := newRenderJobManager(t.TempDir(), func(_ context.Context, _ renderJobSpec, output string) (string, error) {
 		if err := os.WriteFile(output, []byte("partial"), 0600); err != nil {
-			return err
+			return "", err
 		}
-		return newRenderFailure("source_unavailable", errors.New("GET https://plex.test/file?X-Plex-Token=secret stderr=raw"))
+		return "", newRenderFailure("source_unavailable", errors.New("GET https://plex.test/file?X-Plex-Token=secret stderr=raw"))
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -521,7 +521,7 @@ func TestRenderFailureClassificationAndRedaction(t *testing.T) {
 }
 
 func TestRenderMissingOutputIsRenderFailure(t *testing.T) {
-	manager, err := newRenderJobManager(t.TempDir(), func(context.Context, renderJobSpec, string) error { return nil })
+	manager, err := newRenderJobManager(t.TempDir(), func(context.Context, renderJobSpec, string) (string, error) { return "", nil })
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -564,10 +564,10 @@ func TestFFmpegLimiterTimeoutAndApplicationLifetimeCancellation(t *testing.T) {
 func TestRenderManagerParentCancellationCancelsRunningJob(t *testing.T) {
 	parent, cancelParent := context.WithCancel(context.Background())
 	started := make(chan struct{})
-	manager, err := newRenderJobManagerWithContext(parent, t.TempDir(), func(ctx context.Context, _ renderJobSpec, _ string) error {
+	manager, err := newRenderJobManagerWithContext(parent, t.TempDir(), func(ctx context.Context, _ renderJobSpec, _ string) (string, error) {
 		close(started)
 		<-ctx.Done()
-		return ctx.Err()
+		return "", ctx.Err()
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -590,9 +590,9 @@ func TestRenderManagerParentCancellationCancelsRunningJob(t *testing.T) {
 }
 
 func TestRenderJobByteBudgetAndShutdownCancellation(t *testing.T) {
-	manager, err := newRenderJobManager(t.TempDir(), func(ctx context.Context, _ renderJobSpec, output string) error {
+	manager, err := newRenderJobManager(t.TempDir(), func(ctx context.Context, _ renderJobSpec, output string) (string, error) {
 		<-ctx.Done()
-		return ctx.Err()
+		return "", ctx.Err()
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -608,8 +608,8 @@ func TestRenderJobByteBudgetAndShutdownCancellation(t *testing.T) {
 	}
 	manager.stopAndWait()
 
-	manager, err = newRenderJobManager(t.TempDir(), func(_ context.Context, _ renderJobSpec, output string) error {
-		return os.WriteFile(output, []byte("12345"), 0600)
+	manager, err = newRenderJobManager(t.TempDir(), func(_ context.Context, _ renderJobSpec, output string) (string, error) {
+		return "", os.WriteFile(output, []byte("12345"), 0600)
 	})
 	if err != nil {
 		t.Fatal(err)

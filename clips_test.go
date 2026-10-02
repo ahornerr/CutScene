@@ -30,8 +30,8 @@ func TestSuccessfulRenderPromotesToDurableClipAndSurvivesStoreReopen(t *testing.
 		t.Fatal(err)
 	}
 	defer store.close()
-	manager, err := newRenderJobManagerWithContextAndPromotion(context.Background(), filepath.Join(root, "transient"), func(_ context.Context, spec renderJobSpec, output string) error {
-		return os.WriteFile(output, []byte("durable mp4"), 0600)
+	manager, err := newRenderJobManagerWithContextAndPromotion(context.Background(), filepath.Join(root, "transient"), func(_ context.Context, spec renderJobSpec, output string) (string, error) {
+		return "", os.WriteFile(output, []byte("durable mp4"), 0600)
 	}, func(job *renderJob, output string) error {
 		clip, err := store.promote(job.spec, output)
 		if err == nil {

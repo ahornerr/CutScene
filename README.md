@@ -111,6 +111,19 @@ Without this, VAAPI encodes fail with a device permission error.
 
 After authentication, choose an active Plex session in the UI, preview and trim it, then submit the render. Completed clips are downloadable from the render-job status panel.
 
+Downloaded clips are named after the clip title plus a short excerpt of the
+dialogue they contain, so several clips of the same scene stay tellable apart
+in a folder:
+
+```
+The_Movie_We_never_told_the_police.mp4
+```
+
+The excerpt comes from the subtitle track burned into the clip, is capped at 72
+characters, and stops at a word boundary. Clips rendered **without** a
+subtitle track have nothing to excerpt, so they keep the
+`Title_00-01-15_to_00-00-45.mp4` form.
+
 ### HTTP render jobs
 
 The examples below assume an authenticated session cookie in `$COOKIE`:
