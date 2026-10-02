@@ -10,7 +10,6 @@ import (
 	"sync/atomic"
 	"testing"
 
-	"github.com/LukeHagar/plexgo"
 	"github.com/gofiber/fiber/v3"
 )
 
@@ -165,76 +164,6 @@ func TestGetSessionsValidationAndLimit(t *testing.T) {
 			t.Fatalf("expected 1 session with ratingKey 1, got %+v", sessions)
 		}
 	})
-}
-
-func TestClipNoUsableSubtitleCuesFallback(t *testing.T) {
-	origExtract := extractSubtitleContextFn
-	origDoFfmpeg := doFfmpegFn
-	defer func() {
-		extractSubtitleContextFn = origExtract
-		doFfmpegFn = origDoFfmpeg
-	}()
-
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		switch r.URL.Path {
-		case "/library/metadata/10":
-			_, _ = io.WriteString(w, `{
-				"MediaContainer": {
-					"Metadata": [{
-						"ratingKey": "10",
-						"type": "movie",
-						"title": "Test Movie",
-						"Media": [{
-							"id": 100,
-							"Part": [{
-								"id": 200,
-								"key": "/library/parts/200/file.mp4",
-								"Stream": [
-									{"id": 300, "streamType": 1, "codec": "h264"},
-									{"id": 301, "streamType": 2, "codec": "aac"},
-									{"id": 302, "streamType": 3, "codec": "srt", "index": 2}
-								]
-							}]
-						}]
-					}]
-				}
-			}`)
-		default:
-			http.NotFound(w, r)
-		}
-	}))
-	defer server.Close()
-
-	app := &Application{}
-	app.config.Plex.Host = server.URL
-	app.config.Plex.Token = "admin-tok"
-	app.plexAdmin = plexgo.New(plexgo.WithServerURL(server.URL), plexgo.WithSecurity("admin-tok"))
-
-	// Subtitle extraction returns ErrNoUsableSubtitleCues
-	extractSubtitleContextFn = func(ctx context.Context, fileURL, from, to string, subtitleIndex int, subtitleOffsetMs ...int64) (string, error) {
-		return "", ErrNoUsableSubtitleCues
-	}
-
-	var capturedParams FfmpegParams
-	doFfmpegFn = func(params FfmpegParams) (string, error) {
-		capturedParams = params
-		return "/tmp/out.mp4", nil
-	}
-
-	res, err := app.Clip(context.Background(), "10", "100", "00:01:00.000", "00:02:00.000", 720, 20, 0)
-	if err != nil {
-		t.Fatalf("Clip failed unexpectedly: %v", err)
-	}
-	if res != "/tmp/out.mp4" {
-		t.Fatalf("result = %q, want /tmp/out.mp4", res)
-	}
-	if capturedParams.SubtitleFile != "" {
-		t.Fatalf("expected empty SubtitleFile on fallback, got %q", capturedParams.SubtitleFile)
-	}
-	if capturedParams.SubtitleIndex != -1 {
-		t.Fatalf("expected SubtitleIndex -1 on fallback, got %d", capturedParams.SubtitleIndex)
-	}
 }
 
 func TestAPISessionsAndSubtitleStructuredErrors(t *testing.T) {

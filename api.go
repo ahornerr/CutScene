@@ -11,7 +11,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"path/filepath"
+
 	"strconv"
 	"strings"
 	"time"
@@ -634,56 +634,6 @@ func (a *API) getSubtitleEntries(ctx fiber.Ctx) error {
 	}
 
 	return ctx.JSON(entries)
-}
-
-func (a *API) clip(ctx fiber.Ctx) error {
-	ratingKeyStr := ctx.Params("ratingKey")
-	if ratingKeyStr == "" || len(ratingKeyStr) > 512 {
-		return fmt.Errorf("ratingKey not specified")
-	}
-
-	mediaIdStr := ctx.Query("mediaId")
-
-	from := ctx.Params("from")
-	if from == "" {
-		return fmt.Errorf("from not specified")
-	}
-
-	to := ctx.Params("to")
-	if to == "" {
-		return fmt.Errorf("to not specified")
-	}
-
-	heightStr := ctx.Query("height", "0")
-	height, err := strconv.Atoi(heightStr)
-	if err != nil {
-		return fmt.Errorf("height not an integer")
-	}
-
-	qpStr := ctx.Query("qp", "0")
-	qp, err := strconv.Atoi(qpStr)
-	if err != nil {
-		return fmt.Errorf("qp not an integer")
-	}
-
-	subtitleIndexStr := ctx.Query("subtitle", "-1")
-	subtitleIndex, err := strconv.Atoi(subtitleIndexStr)
-	if err != nil {
-		return fmt.Errorf("subtitle not an integer")
-	}
-
-	filePath, err := a.app.Clip(ctx.UserContext(), ratingKeyStr, mediaIdStr, from, to, height, qp, subtitleIndex)
-	if err != nil {
-		return err
-	}
-
-	fileName := filepath.Base(filePath)
-	ctx.Type(filepath.Ext(fileName))
-	ctx.Set(fiber.HeaderContentDisposition, fmt.Sprintf(`attachment; filename="%s"`, fileName))
-
-	return ctx.SendFile(filePath, fiber.SendFile{
-		ByteRange: true,
-	})
 }
 
 func (a *API) thumb(ctx fiber.Ctx) error {
