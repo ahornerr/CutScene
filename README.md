@@ -34,10 +34,14 @@ process working directory. If `storage.database` is omitted it defaults to
 relative to the root.
 
 The container runs as the unprivileged `cutscene` user (uid 10001) and only
-writes below `storage.root` and `/tmp`. Upgrading from a release that kept
-`sessions.sqlite3` (previously `fiber.sqlite3`) in the working directory simply
-starts a new session database under `storage.root`; existing users are asked to
-sign in again.
+writes below `storage.root` and `/tmp`. On startup the entrypoint briefly runs as
+root to adopt a storage volume left root-owned by earlier releases, then drops to
+the unprivileged user for the process lifetime.
+
+Upgrading from a release that kept `sessions.sqlite3` (previously `fiber.sqlite3`)
+in the working directory simply starts a new session database under
+`storage.root`; existing users are asked to sign in again. Existing clips, the
+clip database, and `clip-token.key` are migrated in place and keep working.
 
 Do not use `docker compose down -v` unless you intend to delete the durable
 volume and all saved clips.
@@ -87,6 +91,17 @@ docker compose -f docker-compose.yaml -f docker-compose.gpu.yaml up
 ```
 
 The VAAPI setup is tested with AMD GPUs on Linux. Intel QuickSync through VAAPI may work but is untested. `h264_nvenc` is also available for Nvidia, but requires a working Nvidia driver, the [Nvidia Container Toolkit](https://github.com/NVIDIA/nvidia-container-toolkit), and Docker configured to expose the GPU; the supplied GPU override only provides the VAAPI/DRI device.
+
+Because the service runs as uid 10001, it also needs the host's `render` group
+to open the render device. [docker-compose.gpu.yaml](docker-compose.gpu.yaml)
+adds it via `group_add`, defaulting to gid `989`. If your host uses a different
+gid, check it with `getent group render` and set `RENDER_GROUP`:
+
+```sh
+RENDER_GROUP=993 docker compose -f docker-compose.yaml -f docker-compose.gpu.yaml up
+```
+
+Without this, VAAPI encodes fail with a device permission error.
 
 ## Usage
 

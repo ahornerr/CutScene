@@ -4,3 +4,9 @@ services:
       - SYS_PTRACE
     devices:
       - /dev/dri/renderD128:/dev/dri/renderD128
+    # The service runs as uid 10001, which is not a member of the host's
+    # `render` group. On hosts where the device is 0660 root:render (the
+    # default), VAAPI encodes fail with a permission error unless that gid is
+    # added as a supplemental group. `render` normally resolves to gid 989.
+    group_add:
+      - "${RENDER_GROUP:-989}"

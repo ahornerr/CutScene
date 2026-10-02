@@ -61,19 +61,31 @@ ENV FONTCONFIG_PATH=/etc/fonts
 # /config.yaml, keeps durable clips and its session database under /data, and
 # uses /tmp for transient render jobs. GPU access comes from device
 # passthrough rather than elevated privileges.
+#
+# The entrypoint starts as root purely to adopt a storage volume left
+# root-owned by earlier releases, then drops to this user for the process
+# lifetime. See docker-entrypoint.sh.
 RUN groupadd --gid 10001 cutscene && \
-    useradd --uid 10001 --gid 10001 --home-dir /home/cutscene --create-home --shell /usr/sbin/nologin cutscene
+    useradd --uid 10001 --gid 10001 --home-dir /home/cutscene --create-home --shell /usr/sbin/nologin cutscene && \
+    apt-get update && apt-get install -y --no-install-recommends util-linux && \
+    rm -rf /var/lib/apt/lists/*
 
 WORKDIR /
 COPY --from=build_go /cutscene /cutscene
 COPY --from=build_react /app/build /frontend/build
+COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 
-# The session store lives under /data (storage.root), so the unprivileged user
-# only needs write access there. The working directory stays / and keeps root
-# ownership: it holds config.yaml, the binary, and the frontend assets, and a
-# writable / would let a compromised process replace the binary.
-RUN mkdir -p /data && chown -R cutscene:cutscene /data /frontend
+# The unprivileged user only needs write access to storage.root. The working
+# directory stays / and keeps root ownership: it holds config.yaml, the binary,
+# and the frontend assets, and a writable / would let a compromised process
+# replace the binary.
+RUN mkdir -p /data && chown -R cutscene:cutscene /data /frontend && \
+    chmod +x /usr/local/bin/docker-entrypoint.sh
 
-USER cutscene:cutscene
+# No USER directive: the entrypoint must start as root to adopt a storage
+# volume left root-owned by earlier releases, then exec setpriv to drop to the
+# unprivileged cutscene user. Supplemental groups for VAAPI (the host `render`
+# gid, commonly 989) are supplied by docker-compose.gpu.yaml via group_add and
+# are preserved across the privilege drop.
 
-ENTRYPOINT ["/cutscene"]
+ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
