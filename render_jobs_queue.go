@@ -504,6 +504,7 @@ func (m *renderJobManager) status(id, owner string) (renderJobResponse, error) {
 	response := renderJobResponse{ID: job.id, Status: job.state, CreatedAt: job.createdAt, UpdatedAt: job.updatedAt}
 	response.ClipID = job.clipID
 	response.ShareURL = job.shareURL
+	response.SubtitleSnippet = job.spec.SubtitleSnippet
 	if !job.expiresAt.IsZero() {
 		expiresAt := job.expiresAt
 		response.ExpiresAt = &expiresAt
