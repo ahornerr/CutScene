@@ -277,6 +277,149 @@ func configureMP4Output(outputArgs ffmpeg.KwArgs) {
 	outputArgs["f"] = "mp4"
 }
 
+// defaultPreviewHeight is the fixed height used for browser previews. Previews
+// are not user-selectable, so they do not carry a height like renders do.
+const defaultPreviewHeight = 720
+
+// defaultNVENCQP is the constant quantization parameter applied to NVENC
+// encodes when the caller does not request one.
+const defaultNVENCQP = 24
+
+// transcodeSpec describes a single transcode. The preview and render pipelines
+// both build their FFmpeg arguments from this one description so that codec
+// selection, hardware acceleration, scaling and subtitle handling cannot drift
+// apart between the two.
+//
+// Only genuinely structural concerns stay outside this type: where the output
+// is written (a file vs a pipe), container metadata tags, and the caller's
+// chosen height.
+type transcodeSpec struct {
+	Codec              Codec
+	Height             int
+	QP                 int
+	AudioMode          AudioMode
+	SubtitleFile       string
+	SubtitleIndex      int // >= 0 for PGS overlay via the overlay filter
+	SubtitleOffsetMs   int64
+	FragmentedOutput   bool // stream with fragmented MP4 instead of a seekable file
+	MetadataTags       []string
+	StripInputChapters bool
+	StripInputMetadata bool
+}
+
+// buildTranscodeArgs populates inputArgs and outputArgs for a transcode. It is
+// the single source of truth for codec, hardware acceleration, scaling and
+// subtitle arguments, shared by preview and render.
+func buildTranscodeArgs(spec transcodeSpec, inputArgs, outputArgs ffmpeg.KwArgs) error {
+	if err := configureAudioOutput(outputArgs, spec.AudioMode); err != nil {
+		return err
+	}
+	if spec.StripInputChapters {
+		outputArgs["map_chapters"] = -1
+	}
+	if spec.StripInputMetadata {
+		outputArgs["map_metadata"] = 0
+	}
+	if len(spec.MetadataTags) > 0 {
+		outputArgs["metadata"] = spec.MetadataTags
+	}
+	if spec.FragmentedOutput {
+		outputArgs["movflags"] = "frag_keyframe+empty_moov"
+	} else {
+		outputArgs["movflags"] = "+use_metadata_tags+faststart"
+	}
+	configureMP4Output(outputArgs)
+
+	outputArgs["vcodec"] = spec.Codec
+	// qp is only emitted for codecs that act on it. For libx264 the encoder
+	// prefers crf and ignores qp, so passing it would be misleading; the VAAPI
+	// and NVENC encoders do honour it, and QP is part of the public render
+	// request contract for those codecs.
+	if spec.Codec == CodecH264NVENC || spec.Codec == CodecH264VAAPI {
+		if spec.QP > 0 {
+			outputArgs["qp"] = spec.QP
+		}
+	}
+
+	switch spec.Codec {
+	case CodecH264VAAPI:
+		inputArgs["hwaccel"] = "vaapi"
+		inputArgs["hwaccel_device"] = "/dev/dri/renderD128"
+		inputArgs["hwaccel_output_format"] = "vaapi"
+	case CodecH264NVENC:
+		inputArgs["hwaccel"] = "cuda"
+		// Extra hardware frames keep subtitle and scale filters from starving
+		// the decoder on long clips.
+		inputArgs["extra_hw_frames"] = 8
+	case CodecLibx264:
+		fallthrough
+	default:
+	}
+
+	switch spec.Codec {
+	case CodecH264VAAPI:
+		if spec.SubtitleIndex >= 0 {
+			outputArgs["filter_complex"] = subtitleOverlayFilter(spec.SubtitleIndex, spec.SubtitleOffsetMs, ",format=nv12,hwupload,"+scaleVAAPIFilter(spec.Height)+"[out]")
+			outputArgs["map"] = []string{"[out]", "0:a:0?"}
+			delete(inputArgs, "hwaccel_output_format")
+		} else if spec.SubtitleFile != "" {
+			delete(inputArgs, "hwaccel_output_format")
+			outputArgs["vf"] = fmt.Sprintf("%s,format=nv12,hwupload,%s", subtitlesFilter(spec.SubtitleFile), scaleVAAPIFilter(spec.Height))
+		} else {
+			outputArgs["vf"] = "hwupload," + scaleVAAPIFilter(spec.Height)
+		}
+		outputArgs["compression_level"] = "0"
+	case CodecH264NVENC:
+		if spec.SubtitleIndex >= 0 {
+			outputArgs["filter_complex"] = subtitleOverlayFilter(spec.SubtitleIndex, spec.SubtitleOffsetMs, ",hwupload_cuda,"+scaleCUDAFilter(spec.Height)+"[out]")
+			outputArgs["map"] = []string{"[out]", "0:a:0?"}
+		} else if spec.SubtitleFile != "" {
+			configureNVENCTextSubtitle(inputArgs, outputArgs, spec.SubtitleFile, spec.Height)
+		} else {
+			inputArgs["hwaccel_output_format"] = "cuda"
+			if filter := scaleCUDAFilter(spec.Height); filter != "" {
+				outputArgs["vf"] = filter
+			}
+		}
+		if spec.QP == 0 {
+			// Without an explicit QP, pin NVENC to constant quantization so a
+			// preview and its render agree instead of falling back to NVENC's
+			// variable-bitrate defaults.
+			outputArgs["rc"] = "constqp"
+			outputArgs["qp"] = defaultNVENCQP
+			outputArgs["b:v"] = "0K"
+		}
+	case CodecLibx264:
+		fallthrough
+	default:
+		if spec.SubtitleIndex >= 0 {
+			suffix := "[out]"
+			if filter := scaleSoftwareFilter(spec.Height); filter != "" {
+				suffix = "," + filter + suffix
+			}
+			outputArgs["filter_complex"] = subtitleOverlayFilter(spec.SubtitleIndex, spec.SubtitleOffsetMs, suffix)
+			outputArgs["map"] = []string{"[out]", "0:a:0?"}
+		} else {
+			vf := scaleSoftwareFilter(spec.Height)
+			if spec.SubtitleFile != "" {
+				if vf != "" {
+					vf += ","
+				}
+				vf += subtitlesFilter(spec.SubtitleFile)
+			}
+			if vf != "" {
+				outputArgs["vf"] = vf
+			}
+		}
+		outputArgs["pix_fmt"] = "yuv420p"
+		outputArgs["crf"] = 23
+		outputArgs["video_bitrate"] = 0
+		outputArgs["tune"] = "film"
+	}
+
+	return nil
+}
+
 func DoFfmpeg(params FfmpegParams) (string, error) {
 	if err := validateSubtitleOffsetMs(params.SubtitleOffsetMs); err != nil {
 		return params.OutputPath, err
@@ -330,98 +473,26 @@ func DoFfmpeg(params FfmpegParams) (string, error) {
 		"hide_banner": "",
 		"loglevel":    "error",
 	}
-
-	switch params.Codec {
-	case CodecH264VAAPI:
-		inputArgs["hwaccel"] = "vaapi"
-		inputArgs["hwaccel_device"] = "/dev/dri/renderD128"
-		inputArgs["hwaccel_output_format"] = "vaapi"
-	case CodecH264NVENC:
-		inputArgs["hwaccel"] = "cuda"
-		inputArgs["extra_hw_frames"] = 8
-	case CodecLibx264:
-		fallthrough
-	default:
-	}
-
 	// TODO: Might be a good idea to make these configurable or add support for presets
 	outputArgs := ffmpeg.KwArgs{
-		"acodec":       "aac",
-		"ac":           2,
-		"b:a":          "192k",
-		"map_chapters": -1,
-		"map_metadata": 0,
-		"movflags":     "+use_metadata_tags+faststart",
-		"metadata":     metadataArr,
-		"qp":           params.QP,
+		"acodec": "aac",
+		"ac":     2,
+		"b:a":    "192k",
 	}
-	if err := configureAudioOutput(outputArgs, params.AudioMode); err != nil {
+	spec := transcodeSpec{
+		Codec:              params.Codec,
+		Height:             params.Height,
+		QP:                 params.QP,
+		AudioMode:          params.AudioMode,
+		SubtitleFile:       params.SubtitleFile,
+		SubtitleIndex:      params.SubtitleIndex,
+		SubtitleOffsetMs:   params.SubtitleOffsetMs,
+		MetadataTags:       metadataArr,
+		StripInputChapters: true,
+		StripInputMetadata: true,
+	}
+	if err := buildTranscodeArgs(spec, inputArgs, outputArgs); err != nil {
 		return tmpFile, err
-	}
-	configureMP4Output(outputArgs)
-
-	outputArgs["vcodec"] = params.Codec
-
-	switch params.Codec {
-	case CodecH264VAAPI:
-		if params.SubtitleIndex >= 0 {
-			outputArgs["filter_complex"] = subtitleOverlayFilter(params.SubtitleIndex, params.SubtitleOffsetMs, ",format=nv12,hwupload,"+scaleVAAPIFilter(params.Height)+"[out]")
-			outputArgs["map"] = []string{"[out]", "0:a:0?"}
-			delete(inputArgs, "hwaccel_output_format")
-		} else if params.SubtitleFile != "" {
-			delete(inputArgs, "hwaccel_output_format")
-			outputArgs["vf"] = fmt.Sprintf("%s,format=nv12,hwupload,%s", subtitlesFilter(params.SubtitleFile), scaleVAAPIFilter(params.Height))
-		} else {
-			outputArgs["vf"] = "hwupload," + scaleVAAPIFilter(params.Height)
-		}
-		outputArgs["compression_level"] = "0"
-	case CodecH264NVENC:
-		if params.SubtitleIndex >= 0 {
-			if params.Height > 0 {
-				outputArgs["filter_complex"] = subtitleOverlayFilter(params.SubtitleIndex, params.SubtitleOffsetMs, fmt.Sprintf(",hwupload_cuda,scale_cuda=-2:%d[out]", params.Height))
-			} else {
-				outputArgs["filter_complex"] = subtitleOverlayFilter(params.SubtitleIndex, params.SubtitleOffsetMs, ",hwupload_cuda[out]")
-			}
-			outputArgs["map"] = []string{"[out]", "0:a:0?"}
-		} else if params.SubtitleFile != "" {
-			configureNVENCTextSubtitle(inputArgs, outputArgs, params.SubtitleFile, params.Height)
-		} else {
-			inputArgs["hwaccel_output_format"] = "cuda"
-			if params.Height > 0 {
-				outputArgs["vf"] = "scale_cuda=-2:" + strconv.Itoa(params.Height)
-			}
-		}
-		if params.QP == 0 {
-			outputArgs["rc"] = "constqp"
-			outputArgs["qp"] = 24
-			outputArgs["b:v"] = "0K"
-		}
-	case CodecLibx264:
-		fallthrough
-	default:
-		if params.SubtitleIndex >= 0 {
-			suffix := "[out]"
-			if filter := scaleSoftwareFilter(params.Height); filter != "" {
-				suffix = "," + filter + suffix
-			}
-			outputArgs["filter_complex"] = subtitleOverlayFilter(params.SubtitleIndex, params.SubtitleOffsetMs, suffix)
-			outputArgs["map"] = []string{"[out]", "0:a:0?"}
-		} else {
-			vf := scaleSoftwareFilter(params.Height)
-			if params.SubtitleFile != "" {
-				if vf != "" {
-					vf += ","
-				}
-				vf += subtitlesFilter(params.SubtitleFile)
-			}
-			if vf != "" {
-				outputArgs["vf"] = vf
-			}
-		}
-		outputArgs["pix_fmt"] = "yuv420p"
-		outputArgs["crf"] = 23
-		outputArgs["video_bitrate"] = 0
-		outputArgs["tune"] = "film"
 	}
 
 	configureFFmpegHTTPRecovery(inputArgs, params.URL)
@@ -542,95 +613,31 @@ func doFfmpegPreviewContext(ctx context.Context, fileURL, from, to string, subti
 		"hide_banner": "",
 		"loglevel":    "error",
 	}
-
-	switch codec {
-	case CodecH264VAAPI:
-		inputArgs["hwaccel"] = "vaapi"
-		inputArgs["hwaccel_device"] = "/dev/dri/renderD128"
-		inputArgs["hwaccel_output_format"] = "vaapi"
-	case CodecH264NVENC:
-		inputArgs["hwaccel"] = "cuda"
-	case CodecLibx264:
-		fallthrough
-	default:
-	}
-
-	outputArgs := ffmpeg.KwArgs{
-		"acodec":   "aac",
-		"ac":       2,
-		"b:a":      "192k",
-		"f":        "mp4",
-		"movflags": "frag_keyframe+empty_moov",
-	}
 	audioMode := AudioModeStandard
 	if len(audioModes) > 1 {
 		return errors.New("multiple audio modes specified")
 	} else if len(audioModes) == 1 {
 		audioMode = audioModes[0]
 	}
-	if err := configureAudioOutput(outputArgs, audioMode); err != nil {
-		return err
+	outputArgs := ffmpeg.KwArgs{
+		"acodec": "aac",
+		"ac":     2,
+		"b:a":    "192k",
 	}
-
-	outputArgs["vcodec"] = codec
-
-	height := 720
-
-	switch codec {
-	case CodecH264VAAPI:
-		if subtitleIndex >= 0 {
-			outputArgs["filter_complex"] = subtitleOverlayFilter(subtitleIndex, subtitleOffsetMs, ",format=nv12,hwupload,"+scaleVAAPIFilter(height)+"[out]")
-			outputArgs["map"] = []string{"[out]", "0:a:0?"}
-			delete(inputArgs, "hwaccel_output_format")
-		} else if subtitleFile != "" {
-			delete(inputArgs, "hwaccel_output_format")
-			outputArgs["vf"] = fmt.Sprintf("%s,format=nv12,hwupload,%s", subtitlesFilter(subtitleFile), scaleVAAPIFilter(height))
-		} else {
-			outputArgs["vf"] = "hwupload," + scaleVAAPIFilter(height)
-		}
-		outputArgs["compression_level"] = "0"
-	case CodecH264NVENC:
-		if subtitleIndex >= 0 {
-			if height > 0 {
-				outputArgs["filter_complex"] = subtitleOverlayFilter(subtitleIndex, subtitleOffsetMs, ",hwupload_cuda,"+scaleCUDAFilter(height)+"[out]")
-			} else {
-				outputArgs["filter_complex"] = subtitleOverlayFilter(subtitleIndex, subtitleOffsetMs, ",hwupload_cuda[out]")
-			}
-			outputArgs["map"] = []string{"[out]", "0:a:0?"}
-		} else if subtitleFile != "" {
-			configureNVENCTextSubtitle(inputArgs, outputArgs, subtitleFile, height)
-		} else {
-			inputArgs["hwaccel_output_format"] = "cuda"
-			if filter := scaleCUDAFilter(height); filter != "" {
-				outputArgs["vf"] = filter
-			}
-		}
-	case CodecLibx264:
-		fallthrough
-	default:
-		if subtitleIndex >= 0 {
-			suffix := "[out]"
-			if filter := scaleSoftwareFilter(height); filter != "" {
-				suffix = "," + filter + suffix
-			}
-			outputArgs["filter_complex"] = subtitleOverlayFilter(subtitleIndex, subtitleOffsetMs, suffix)
-			outputArgs["map"] = []string{"[out]", "0:a:0?"}
-		} else {
-			vf := scaleSoftwareFilter(height)
-			if subtitleFile != "" {
-				if vf != "" {
-					vf += ","
-				}
-				vf += subtitlesFilter(subtitleFile)
-			}
-			if vf != "" {
-				outputArgs["vf"] = vf
-			}
-		}
-		outputArgs["pix_fmt"] = "yuv420p"
-		outputArgs["crf"] = 23
-		outputArgs["video_bitrate"] = 0
-		outputArgs["tune"] = "film"
+	// A preview has no container metadata and streams instead of writing a
+	// seekable file; everything else must match the render path exactly so the
+	// browser shows what the render will produce.
+	spec := transcodeSpec{
+		Codec:            codec,
+		Height:           defaultPreviewHeight,
+		AudioMode:        audioMode,
+		SubtitleFile:     subtitleFile,
+		SubtitleIndex:    subtitleIndex,
+		SubtitleOffsetMs: subtitleOffsetMs,
+		FragmentedOutput: true,
+	}
+	if err := buildTranscodeArgs(spec, inputArgs, outputArgs); err != nil {
+		return err
 	}
 
 	configureFFmpegHTTPRecovery(inputArgs, fileURL)
