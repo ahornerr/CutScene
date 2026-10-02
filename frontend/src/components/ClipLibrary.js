@@ -1,5 +1,8 @@
-import {Box, Button, Chip, CircularProgress, Paper, Stack, Tooltip, Typography} from "@mui/material";
-import {useCallback, useEffect, useRef, useState} from "react";
+import {
+  Box, Button, Chip, CircularProgress, IconButton, InputAdornment, Paper, Stack,
+  TextField, Tooltip, Typography,
+} from "@mui/material";
+import {useCallback, useEffect, useMemo, useRef, useState} from "react";
 import StateMessage from "./StateMessage";
 import {
   creatorLabel, deleteClip, fetchClips, formatClipCreated, formatClipDuration,
@@ -26,6 +29,16 @@ export default function ClipLibrary({onOpenClip, onBack, hasActiveWorkspace}) {
   const [deleteError, setDeleteError] = useState(null)
   const [deleting, setDeleting] = useState(false)
   const [toast, setToast] = useState(null)
+  const [query, setQuery] = useState('')
+
+  // Search matches the fields a viewer can actually recognise a clip by:
+  // its title, the show or film it came from, and the dialogue it contains.
+  const visibleClips = useMemo(() => {
+    if (!clips) return []
+    const needle = query.trim().toLowerCase()
+    if (!needle) return clips
+    return clips.filter(clip => clipSearchText(clip).includes(needle))
+  }, [clips, query])
 
   const abortRef = useRef(null)
   const mountedRef = useRef(true)
@@ -189,8 +202,60 @@ export default function ClipLibrary({onOpenClip, onBack, hasActiveWorkspace}) {
       )}
 
       {clips && clips.length > 0 && (
+        <Stack spacing={1.5}>
+          <TextField
+            value={query}
+            onChange={event => setQuery(event.target.value)}
+            size="small"
+            placeholder="Search by title, show, or dialogue…"
+            inputProps={{'aria-label': 'Search saved clips'}}
+            InputProps={{
+              startAdornment: (
+                <InputAdornment position="start">
+                  <SearchIcon fontSize="small" />
+                </InputAdornment>
+              ),
+              endAdornment: query ? (
+                <InputAdornment position="end">
+                  <IconButton
+                    size="small"
+                    aria-label="Clear clip search"
+                    onClick={() => setQuery('')}
+                  >
+                    <ClearIcon fontSize="small" />
+                  </IconButton>
+                </InputAdornment>
+              ) : null,
+            }}
+          />
+          <Typography variant="caption" sx={{color: 'text.disabled'}}>
+            {visibleClips.length === clips.length
+              ? `${clips.length} clip${clips.length === 1 ? '' : 's'}`
+              : `${visibleClips.length} of ${clips.length} clips match`}
+          </Typography>
+        </Stack>
+      )}
+
+      {clips && clips.length > 0 && visibleClips.length === 0 && (
+        <StateMessage
+          variant="empty"
+          title="No clips match your search."
+          hint={`Nothing in this library matches “${query.trim()}”.`}
+          live
+          action={
+            <Button variant="outlined" color="primary" size="small"
+              onClick={() => setQuery('')}
+              sx={{mt: 1, borderColor: 'rgba(255,255,255,0.2)'}}
+            >
+              Clear search
+            </Button>
+          }
+        />
+      )}
+
+      {clips && visibleClips.length > 0 && (
         <Stack spacing={1.5} aria-label="Saved clips">
-          {clips.map(clip => (
+          {visibleClips.map(clip => (
             <ClipRow
               key={clip.id}
               clip={clip}
@@ -235,6 +300,32 @@ export default function ClipLibrary({onOpenClip, onBack, hasActiveWorkspace}) {
   )
 }
 
+// Inline SVG icons — matches SubtitleList.js and avoids adding
+// @mui/icons-material as a dependency.
+function SearchIcon(props) {
+  return (
+    <svg viewBox="0 0 24 24" width="1em" height="1em" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" {...props}>
+      <circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/>
+    </svg>
+  )
+}
+function ClearIcon(props) {
+  return (
+    <svg viewBox="0 0 24 24" width="1em" height="1em" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" {...props}>
+      <path d="M18 6 6 18M6 6l12 12"/>
+    </svg>
+  )
+}
+
+// clipSearchText is the haystack for the library search box.
+function clipSearchText(clip) {
+  if (!clip) return ''
+  return [clip.title, mediaContext(clip), clip.subtitleSnippet, clip.creatorDisplayName]
+    .filter(Boolean)
+    .join(' \u2022 ')
+    .toLowerCase()
+}
+
 function ClipRow({clip, admin, onOpen, onDelete}) {
   const created = formatClipCreated(clip)
   const duration = formatClipDuration(clip)
@@ -244,12 +335,15 @@ function ClipRow({clip, admin, onOpen, onDelete}) {
   const context = mediaContext(clip)
   const artworkUrl = clip.artworkUrl || ''
   const title = clip.title || 'Untitled clip'
+  // The dialogue excerpt is what makes several clips of the same scene
+  // recognisable at a glance, and what the search box matches against.
+  const snippet = (clip.subtitleSnippet || '').trim()
 
   // The row is a non-interactive container. The clickable area (thumbnail +
   // title + metadata) is a dedicated button; the action controls are siblings,
   // not children. This eliminates nested interactive elements and keyboard
   // event bubbling while preserving the visual layout.
-  const openLabel = `Open clip ${title}${context ? `, ${context}` : ''}${duration ? `, ${duration}` : ''}${created ? `, created ${created}` : ''}`
+  const openLabel = `Open clip ${title}${context ? `, ${context}` : ''}${snippet ? `, dialogue ${snippet}` : ''}${duration ? `, ${duration}` : ''}${created ? `, created ${created}` : ''}`
 
   return (
     <Paper
@@ -283,6 +377,18 @@ function ClipRow({clip, admin, onOpen, onDelete}) {
             {context && (
               <Typography variant="body2" sx={{color: 'text.secondary', mt: -0.25, display: '-webkit-box', WebkitLineClamp: {xs: 2, sm: 1}, WebkitBoxOrient: 'vertical', overflow: 'hidden', overflowWrap: 'anywhere'}}>
                 {context}
+              </Typography>
+            )}
+            {snippet && (
+              <Typography
+                variant="body2"
+                sx={{
+                  color: 'text.secondary', fontStyle: 'italic', mt: 0.25,
+                  display: '-webkit-box', WebkitLineClamp: 1,
+                  WebkitBoxOrient: 'vertical', overflow: 'hidden', overflowWrap: 'anywhere',
+                }}
+              >
+                &ldquo;{snippet}&rdquo;
               </Typography>
             )}
             <Box sx={{display: 'flex', flexWrap: 'wrap', gap: 1, alignItems: 'center', mt: 0.5}}>
