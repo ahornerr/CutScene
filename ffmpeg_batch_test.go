@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -114,3 +115,75 @@ func TestExtractSubtitleTracksBatchAllowsZeroByteTrack(t *testing.T) {
 	}
 }
 
+func TestSafeFfmpegOutputPathConfinesNameToBaseDir(t *testing.T) {
+	tests := []struct {
+		name    string
+		input   string
+		want    string
+		wantErr bool
+	}{
+		{name: "plain name", input: "Show S01E01 (00:00 - 00:01).mp4", want: "/tmp/Show S01E01 (00:00 - 00:01).mp4"},
+		{name: "parent traversal is reduced to base", input: "../../../../etc/cron.d/pwn.mp4", want: "/tmp/pwn.mp4"},
+		{name: "embedded traversal is reduced to base", input: "shows/../../evil.mp4", want: "/tmp/evil.mp4"},
+		{name: "absolute path is reduced to base", input: "/etc/passwd", want: "/tmp/passwd"},
+		{name: "empty name is rejected", input: "", wantErr: true},
+		{name: "whitespace name is rejected", input: "   ", wantErr: true},
+		{name: "dot is rejected", input: ".", wantErr: true},
+		{name: "dotdot is rejected", input: "..", wantErr: true},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got, err := safeFfmpegOutputPath(ffmpegDefaultOutputDir, test.input)
+			if test.wantErr {
+				if err == nil {
+					t.Fatalf("safeFfmpegOutputPath(%q) = %q, want error", test.input, got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("safeFfmpegOutputPath(%q) returned error: %v", test.input, err)
+			}
+			if got != test.want {
+				t.Fatalf("safeFfmpegOutputPath(%q) = %q, want %q", test.input, got, test.want)
+			}
+			// The resolved path must stay directly inside the base directory.
+			if filepath.Dir(got) != ffmpegDefaultOutputDir {
+				t.Fatalf("resolved path %q escaped base dir %q", got, ffmpegDefaultOutputDir)
+			}
+		})
+	}
+}
+
+func TestDoFfmpegKeepsTraversalFilenameInsideDefaultOutputDir(t *testing.T) {
+	// DoFfmpeg is reached on the live render path via doFfmpegFn. A filename
+	// that would otherwise escape the default output directory must be
+	// confined to that directory rather than handed to FFmpeg verbatim.
+	if _, lookErr := exec.LookPath("ffmpeg"); lookErr != nil {
+		t.Skip("ffmpeg is not installed; skipping process-level check")
+	}
+
+	outside := filepath.Join(t.TempDir(), "victim.mp4")
+	escape := filepath.Join("..", "..", filepath.Base(filepath.Dir(outside)), filepath.Base(outside))
+
+	got, _ := DoFfmpeg(FfmpegParams{
+		URL:      "source",
+		Filename: escape,
+		Codec:    CodecLibx264,
+		From:     "00:00:00",
+		To:       "00:00:01",
+		Context:  context.Background(),
+	})
+
+	if filepath.Dir(got) != ffmpegDefaultOutputDir {
+		t.Fatalf("output path %q escaped default dir %q (traversal input %q)",
+			got, ffmpegDefaultOutputDir, escape)
+	}
+	if filepath.Base(got) != "victim.mp4" {
+		t.Fatalf("output basename = %q, want victim.mp4", filepath.Base(got))
+	}
+	if _, statErr := os.Stat(outside); !os.IsNotExist(statErr) {
+		t.Fatalf("traversal target outside %q was written: %v", outside, statErr)
+	}
+	_ = os.Remove(got)
+}

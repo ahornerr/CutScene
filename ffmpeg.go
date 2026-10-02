@@ -75,6 +75,24 @@ func subtitlesFilter(filename string) string {
 	return "subtitles=filename=" + escapeFFmpegFilterFilename(filename)
 }
 
+// ffmpegDefaultOutputDir is where a clip is written when the caller does not
+// supply an explicit output path.
+const ffmpegDefaultOutputDir = "/tmp"
+
+// safeFfmpegOutputPath resolves a caller-supplied output name inside dir,
+// reducing it to a single filename element first. Names can originate from
+// Plex metadata, which is not trusted input: a title carrying path separators
+// or ".." must never be able to steer FFmpeg output outside dir. filepath.Join
+// alone is not sufficient because it cleans ".." segments, which turns
+// "../../etc/x.mp4" into an absolute path outside the intended directory.
+func safeFfmpegOutputPath(dir, name string) (string, error) {
+	base := filepath.Base(strings.TrimSpace(name))
+	if base == "" || base == "." || base == ".." || base == string(filepath.Separator) {
+		return "", fmt.Errorf("refusing unsafe output filename %q", name)
+	}
+	return filepath.Join(dir, base), nil
+}
+
 // Subtitle offsets are deliberately bounded to keep timestamp arithmetic
 // predictable and to match the maximum supported clip duration.
 const maxSubtitleOffsetMs int64 = 15 * 60 * 1000
@@ -297,7 +315,11 @@ func DoFfmpeg(params FfmpegParams) (string, error) {
 
 	tmpFile := params.OutputPath
 	if tmpFile == "" {
-		tmpFile = filepath.Join("/tmp", params.Filename)
+		resolved, err := safeFfmpegOutputPath(ffmpegDefaultOutputDir, params.Filename)
+		if err != nil {
+			return params.OutputPath, err
+		}
+		tmpFile = resolved
 	}
 
 	inputArgs := ffmpeg.KwArgs{
@@ -646,12 +668,12 @@ func ExtractSubtitleFullContext(ctx context.Context, url string, subtitleIndex i
 	tmpFile := fmt.Sprintf("/tmp/cutscene_subfull_%d.srt", time.Now().UnixNano())
 
 	inputArgs := ffmpeg.KwArgs{
-		"hide_banner":      "",
-		"loglevel":         "error",
-		"probesize":        "1M",
-		"analyzeduration":  "1M",
-		"discard:v":        "all",
-		"discard:a":        "all",
+		"hide_banner":     "",
+		"loglevel":        "error",
+		"probesize":       "1M",
+		"analyzeduration": "1M",
+		"discard:v":       "all",
+		"discard:a":       "all",
 	}
 
 	outputArgs := ffmpeg.KwArgs{
