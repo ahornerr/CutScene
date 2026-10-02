@@ -80,6 +80,12 @@ func main() {
 		log.Fatal(err)
 	}
 
+	// The session store lives under the configured storage root, so it must be
+	// created after the configuration is loaded.
+	if err := configureSessionStore(cfg.Storage.Root); err != nil {
+		log.Fatal(err)
+	}
+
 	app, err := NewApplication(*cfg)
 	if err != nil {
 		log.Fatal(err)

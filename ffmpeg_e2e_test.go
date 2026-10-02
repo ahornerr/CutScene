@@ -24,7 +24,25 @@ func TestMain(m *testing.M) {
 			os.Exit(1)
 		}
 	}
-	os.Exit(m.Run())
+
+	// Initialise the session store for the whole package. main() does this
+	// after loading the configuration because the location depends on
+	// storage.root; tests construct API values directly and bypass main, so
+	// they must initialise it here.
+	sessionDir, err := os.MkdirTemp("", "cutscene-test-session-*")
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "could not create test session directory:", err)
+		os.Exit(1)
+	}
+	if err := configureSessionStore(sessionDir); err != nil {
+		fmt.Fprintln(os.Stderr, "could not initialise test session store:", err)
+		os.RemoveAll(sessionDir)
+		os.Exit(1)
+	}
+
+	code := m.Run()
+	os.RemoveAll(sessionDir)
+	os.Exit(code)
 }
 
 // TestPreviewAndRenderProduceEquivalentVideo exercises both pipelines for real

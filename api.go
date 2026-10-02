@@ -11,6 +11,8 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
+	"sync"
 
 	"strconv"
 	"strings"
@@ -25,14 +27,38 @@ import (
 	"github.com/google/uuid"
 )
 
-var storage = sqlite3.New()
+// sessionDatabaseFile is the session store's SQLite file below storage.root.
+// Keeping it under the configured storage root rather than the process working
+// directory means the container does not need a writable working directory to
+// run as an unprivileged user.
+const sessionDatabaseFile = "sessions.sqlite3"
 
-var store = session.New(session.Config{
-	Storage: storage,
-})
+// sessionStore builds the session store, placing its database under
+// storageRoot. It is initialised from main once the configuration is known
+// because the location depends on storage.root.
+var (
+	storeOnce sync.Once
+	store     *session.Store
+)
 
-func init() {
-	store.RegisterType(User{})
+// configureSessionStore creates the session store rooted at storageRoot.
+func configureSessionStore(storageRoot string) error {
+	var err error
+	storeOnce.Do(func() {
+		if strings.TrimSpace(storageRoot) == "" {
+			storageRoot = defaultDurableStorageRoot
+		}
+		if mkErr := os.MkdirAll(storageRoot, 0o700); mkErr != nil {
+			err = fmt.Errorf("create session storage root: %w", mkErr)
+			return
+		}
+		storage := sqlite3.New(sqlite3.Config{
+			Database: filepath.Join(storageRoot, sessionDatabaseFile),
+		})
+		store = session.New(session.Config{Storage: storage})
+		store.RegisterType(User{})
+	})
+	return err
 }
 
 const (
