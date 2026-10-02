@@ -1050,6 +1050,13 @@ func ParseTimestampToMs(ts string) (int64, error) {
 	if h < 0 {
 		return 0, fmt.Errorf("invalid hours in timestamp: %s", ts)
 	}
+	// Bound the hours before scaling: h*3600000 otherwise wraps around and
+	// yields a negative duration for an out-of-range input, which callers
+	// cannot distinguish from a valid result. The plain-numeric form above is
+	// bounded for the same reason.
+	if h > math.MaxInt64/3600000 {
+		return 0, fmt.Errorf("invalid hours in timestamp: %s", ts)
+	}
 	m, err := strconv.ParseInt(parts[1], 10, 64)
 	if err != nil {
 		return 0, fmt.Errorf("invalid minutes in timestamp: %w", err)
