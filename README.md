@@ -82,6 +82,8 @@ delete of both its SQLite metadata and MP4 bytes and is permanent.
 
 Open the CutScene URL in a browser and choose **Log in with Plex**. CutScene uses Plex's browser authentication flow and keeps the authenticated session in the browser. The session, preview, and render endpoints require that authenticated session; an HTTP client must preserve the session cookie established by its Plex login.
 
+The session cookie is issued `HttpOnly`, `SameSite=Lax`, and scoped to `/`. It carries the caller's Plex token, so it is not readable from JavaScript. If you serve CutScene over HTTPS, set `api.secure_cookies: true` so the cookie is also marked `Secure` and is never sent over plain HTTP. Leave it `false` for plain-HTTP LAN deployments — a `Secure` cookie would never be delivered there.
+
 ### Hardware acceleration
 
 The default `libx264` codec uses software encoding. On Linux, set `ffmpeg.codec` to `h264_vaapi` for VAAPI hardware encoding. The host and container need access to a usable render device under `/dev/dri`; the supplied [docker-compose.gpu.yaml](docker-compose.gpu.yaml) mounts `/dev/dri/renderD128`:

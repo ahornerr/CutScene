@@ -42,7 +42,9 @@ var (
 )
 
 // configureSessionStore creates the session store rooted at storageRoot.
-func configureSessionStore(storageRoot string) error {
+// secureCookies marks the session cookie Secure; it should be enabled whenever
+// the service is served over HTTPS.
+func configureSessionStore(storageRoot string, secureCookies bool) error {
 	var err error
 	storeOnce.Do(func() {
 		if strings.TrimSpace(storageRoot) == "" {
@@ -55,7 +57,20 @@ func configureSessionStore(storageRoot string) error {
 		storage := sqlite3.New(sqlite3.Config{
 			Database: filepath.Join(storageRoot, sessionDatabaseFile),
 		})
-		store = session.New(session.Config{Storage: storage})
+		store = session.New(session.Config{
+			Storage: storage,
+			// The session holds the caller's Plex token, so the cookie must not
+			// be readable from JavaScript: without HttpOnly, any script
+			// injected into the frontend could exfiltrate a live session.
+			CookieHTTPOnly: true,
+			// Lax still sends the cookie on top-level navigations (which the
+			// Plex PIN flow relies on) while blocking cross-site subrequests.
+			CookieSameSite: "lax",
+			// Pin the path explicitly; the default path would otherwise depend
+			// on which route first issued the cookie.
+			CookiePath:   "/",
+			CookieSecure: secureCookies,
+		})
 		store.RegisterType(User{})
 	})
 	return err

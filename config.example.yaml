@@ -11,6 +11,10 @@ api:
   listen_addr: ":8080"
   # Browser-reachable URL used as the Plex OAuth/PIN authentication forward URL.
   domain: http://localhost:8080
+  # Set to true when serving over HTTPS so the session cookie (which holds the
+  # caller's Plex token) is only sent over TLS. Leave false for plain-HTTP LAN
+  # deployments, where a Secure cookie would never be sent at all.
+  secure_cookies: false
 ffmpeg:
   # Maximum concurrent FFmpeg processes, shared by previews and render jobs.
   # Defaults to 2 when omitted, zero, or negative.

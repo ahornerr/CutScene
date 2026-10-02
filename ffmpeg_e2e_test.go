@@ -34,7 +34,7 @@ func TestMain(m *testing.M) {
 		fmt.Fprintln(os.Stderr, "could not create test session directory:", err)
 		os.Exit(1)
 	}
-	if err := configureSessionStore(sessionDir); err != nil {
+	if err := configureSessionStore(sessionDir, false); err != nil {
 		fmt.Fprintln(os.Stderr, "could not initialise test session store:", err)
 		os.RemoveAll(sessionDir)
 		os.Exit(1)
