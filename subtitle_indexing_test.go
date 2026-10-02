@@ -672,7 +672,3 @@ func TestExternalSubtitleTrackPlanIdentification(t *testing.T) {
 		t.Fatalf("expected stream type text, got %q", plans[0].Stream.Type)
 	}
 }
-
-
-
-
