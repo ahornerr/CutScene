@@ -142,7 +142,7 @@ export default function SessionCard({session, active, onSelect}) {
               <CardMedia
                 component="img"
                 sx={{position: 'absolute', inset: 0, width: '100%', height: '100%', objectFit: 'cover'}}
-                image={`/thumb?path=${thumbPath}`}
+                image={`/thumb?path=${encodeURIComponent(thumbPath)}`}
                 alt=""
               />
             ) : (
