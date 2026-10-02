@@ -1,12 +1,12 @@
 import {
-  Box, Button, Chip, CircularProgress, IconButton, InputAdornment, Paper, Stack,
-  TextField, Tooltip, Typography,
+  Box, Button, Chip, CircularProgress, IconButton, InputAdornment, Paper,
+  Stack, TextField, Tooltip, Typography,
 } from "@mui/material";
 import {useCallback, useEffect, useMemo, useRef, useState} from "react";
 import StateMessage from "./StateMessage";
 import {
-  creatorLabel, deleteClip, fetchClips, formatClipCreated, formatClipDuration,
-  mediaContext,
+  clipDurationMs, creatorLabel, deleteClip, fetchClips, formatClipCreated,
+  formatClipDuration, mediaContext,
 } from "./clips";
 import {CopyShareLinkButton} from "./ClipShareCopy";
 import {ClipDeleteDialog} from "./ClipDeleteDialog";
@@ -30,15 +30,18 @@ export default function ClipLibrary({onOpenClip, onBack, hasActiveWorkspace}) {
   const [deleting, setDeleting] = useState(false)
   const [toast, setToast] = useState(null)
   const [query, setQuery] = useState('')
+  const [sort, setSort] = useState(SORT_NEWEST)
 
   // Search matches the fields a viewer can actually recognise a clip by:
   // its title, the show or film it came from, and the dialogue it contains.
+  // Search narrows, then the chosen order decides how to read the result.
+  // The default preserves the server's ordering (newest first).
   const visibleClips = useMemo(() => {
     if (!clips) return []
     const needle = query.trim().toLowerCase()
-    if (!needle) return clips
-    return clips.filter(clip => clipSearchText(clip).includes(needle))
-  }, [clips, query])
+    const matched = needle ? clips.filter(clip => clipSearchText(clip).includes(needle)) : clips.slice()
+    return sortClips(matched, sort)
+  }, [clips, query, sort])
 
   const abortRef = useRef(null)
   const mountedRef = useRef(true)
@@ -228,11 +231,30 @@ export default function ClipLibrary({onOpenClip, onBack, hasActiveWorkspace}) {
               ) : null,
             }}
           />
-          <Typography variant="caption" sx={{color: 'text.disabled'}}>
-            {visibleClips.length === clips.length
-              ? `${clips.length} clip${clips.length === 1 ? '' : 's'}`
-              : `${visibleClips.length} of ${clips.length} clips match`}
-          </Typography>
+          <Box sx={{display: 'flex', flexWrap: 'wrap', gap: 1.5, alignItems: 'center', justifyContent: 'space-between'}}>
+            <Typography variant="caption" sx={{color: 'text.disabled'}}>
+              {visibleClips.length === clips.length
+                ? `${clips.length} clip${clips.length === 1 ? '' : 's'}`
+                : `${visibleClips.length} of ${clips.length} clips match`}
+            </Typography>
+            {/* A native select keeps the platform picker on mobile, where a
+                custom menu is fiddly, and stays reachable by assistive tech. */}
+            <TextField
+              select
+              SelectProps={{native: true, inputProps: {'aria-label': 'Sort saved clips'}}}
+              value={sort}
+              onChange={event => setSort(event.target.value)}
+              size="small"
+              label="Sort"
+              sx={{minWidth: 160}}
+            >
+              {SORT_CHOICES.map(choice => (
+                <option key={choice.value} value={choice.value}>
+                  {choice.label}
+                </option>
+              ))}
+            </TextField>
+          </Box>
         </Stack>
       )}
 
@@ -315,6 +337,39 @@ function ClearIcon(props) {
       <path d="M18 6 6 18M6 6l12 12"/>
     </svg>
   )
+}
+
+// Sort orders offered by the library. Newest matches the server ordering.
+const SORT_NEWEST = 'newest'
+const SORT_OLDEST = 'oldest'
+const SORT_LONGEST = 'longest'
+const SORT_SHORTEST = 'shortest'
+const SORT_TITLE = 'title'
+const SORT_CHOICES = [
+  {value: SORT_NEWEST, label: 'Newest first'},
+  {value: SORT_OLDEST, label: 'Oldest first'},
+  {value: SORT_LONGEST, label: 'Longest first'},
+  {value: SORT_SHORTEST, label: 'Shortest first'},
+  {value: SORT_TITLE, label: 'Title A–Z'},
+]
+
+// sortClips orders a list without mutating the caller's array.
+function sortClips(list, sort) {
+  const byTitle = (a, b) => String(a.title || '').localeCompare(String(b.title || ''), undefined, {sensitivity: 'base'})
+  const copy = list.slice()
+  switch (sort) {
+    case SORT_OLDEST:
+      return copy.reverse()
+    case SORT_LONGEST:
+      return copy.sort((a, b) => clipDurationMs(b) - clipDurationMs(a) || byTitle(a, b))
+    case SORT_SHORTEST:
+      return copy.sort((a, b) => clipDurationMs(a) - clipDurationMs(b) || byTitle(a, b))
+    case SORT_TITLE:
+      return copy.sort(byTitle)
+    case SORT_NEWEST:
+    default:
+      return copy
+  }
 }
 
 // clipSearchText is the haystack for the library search box.
