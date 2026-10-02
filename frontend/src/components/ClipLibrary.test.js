@@ -909,3 +909,53 @@ describe('async cleanup', () => {
     expect(second.options.signal.aborted).toBe(false);
   });
 });
+
+// ---------------------------------------------------------------------------
+// ClipLibrary sorting
+// ---------------------------------------------------------------------------
+
+describe('ClipLibrary sorting', () => {
+  const titlesInOrder = container =>
+    Array.from(container.querySelectorAll('button[aria-label^="Open clip"]'))
+      .map(node => (node.getAttribute('aria-label').match(/Open clip (.*?)(,| and|$)/) || [])[1]);
+
+  async function renderWith(clips) {
+    const requests = installFetch();
+    const view = render(<ClipLibrary onOpenClip={() => {}} onBack={() => {}}/>);
+    await resolveReq(byUrl(requests, u => u === '/clips'), listResponse(clips));
+    return view;
+  }
+
+  const clips = [
+    sampleClip({id: 'short', title: 'Beta', fromMs: 0, toMs: 5000}),
+    sampleClip({id: 'long', title: 'Alpha', fromMs: 0, toMs: 120000}),
+    sampleClip({id: 'mid', title: 'Gamma', fromMs: 0, toMs: 30000}),
+  ];
+
+  test('defaults to the server order (newest first)', async () => {
+    const {container} = await renderWith(clips);
+    expect(titlesInOrder(container)).toEqual(['Beta', 'Alpha', 'Gamma']);
+  });
+
+  test('can sort by title A–Z', async () => {
+    const {container} = await renderWith(clips);
+    fireEvent.change(screen.getByLabelText('Sort saved clips'), {target: {value: 'title'}});
+    expect(titlesInOrder(container)).toEqual(['Alpha', 'Beta', 'Gamma']);
+  });
+
+  test('can sort by longest and shortest first', async () => {
+    const {container} = await renderWith(clips);
+
+    fireEvent.change(screen.getByLabelText('Sort saved clips'), {target: {value: 'longest'}});
+    expect(titlesInOrder(container)).toEqual(['Alpha', 'Gamma', 'Beta']);
+
+    fireEvent.change(screen.getByLabelText('Sort saved clips'), {target: {value: 'shortest'}});
+    expect(titlesInOrder(container)).toEqual(['Beta', 'Gamma', 'Alpha']);
+  });
+
+  test('can reverse to oldest first', async () => {
+    const {container} = await renderWith(clips);
+    fireEvent.change(screen.getByLabelText('Sort saved clips'), {target: {value: 'oldest'}});
+    expect(titlesInOrder(container)).toEqual(['Gamma', 'Alpha', 'Beta']);
+  });
+});

@@ -124,6 +124,14 @@ characters, and stops at a word boundary. Clips rendered **without** a
 subtitle track have nothing to excerpt, so they keep the
 `Title_00-01-15_to_00-00-45.mp4` form.
 
+The same excerpt is shown on the clip card, on the clip detail page, and next
+to a finished render. The clip library can be **searched** by title, show or
+film, dialogue, or creator, and sorted by recency, duration, or title — so you
+can find a clip by what was said in it without downloading anything.
+
+> Subtitle burn-in is opt-in. If you want every clip to be self-describing,
+> select a subtitle track before rendering.
+
 ### HTTP render jobs
 
 The examples below assume an authenticated session cookie in `$COOKIE`:
