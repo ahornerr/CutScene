@@ -45,8 +45,9 @@ type Clip struct {
 	EpisodeNumber      *int   `json:"episodeNumber,omitempty"`
 	EpisodeTitle       string `json:"episodeTitle,omitempty"`
 	Title              string `json:"title"`
-	// SubtitleSnippet is a short excerpt of the clip's dialogue, used to make
-	// the download filename distinguishable. Never returned over the API.
+	// SubtitleSnippet is a short excerpt of the clip's dialogue. It names the
+	// download and is surfaced by clipAPIResponse so the library can display
+	// and search it; the raw Clip struct is not itself serialised.
 	SubtitleSnippet string    `json:"-"`
 	RatingKey       string    `json:"ratingKey"`
 	MediaID         int64     `json:"mediaId"`
@@ -1169,6 +1170,7 @@ type clipAPIResponse struct {
 	EpisodeTitle       string    `json:"episodeTitle,omitempty"`
 	ArtworkURL         string    `json:"artworkUrl,omitempty"`
 	Title              string    `json:"title"`
+	SubtitleSnippet    string    `json:"subtitleSnippet,omitempty"`
 	RatingKey          string    `json:"ratingKey"`
 	MediaID            int64     `json:"mediaId"`
 	FromMs             int64     `json:"fromMs"`
@@ -1190,7 +1192,8 @@ func (a *API) clipResponse(clip *Clip, includeOwner, includeShare, canDelete, is
 	result := clipAPIResponse{
 		ID: clip.ID, Title: clip.Title, RatingKey: clip.RatingKey, MediaID: clip.MediaID,
 		FromMs: clip.FromMs, ToMs: clip.ToMs, CreatedAt: clip.CreatedAt,
-		CanDelete: canDelete,
+		SubtitleSnippet: clip.SubtitleSnippet,
+		CanDelete:       canDelete,
 	}
 	if includeAdmin {
 		result.IsAdmin = &isAdmin
