@@ -4,10 +4,10 @@ services:
     ports:
       - 8080:8080
     volumes:
-      - ./config.yaml:/config.yaml
-      - ./fiber.sqlite3:/fiber.sqlite3
-      # Durable clip metadata, MP4s, and the token-encryption key. Transient
-      # render jobs intentionally remain under the container's /tmp.
+      - ./config.yaml:/config.yaml:ro
+      # Durable application data: clip metadata, MP4s, the token-encryption
+      # key, and the session database (sessions.sqlite3, under storage.root).
+      # Transient render jobs intentionally remain under the container's /tmp.
       - cutscene-data:/data
 
 volumes:

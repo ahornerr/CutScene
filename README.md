@@ -22,15 +22,22 @@ If you changed the listen address or port, update the port mapping in [docker-co
 
 Completed renders are promoted to durable clips. Configure `storage.root` (the
 sample uses `/data`) as the local application-data directory. CutScene stores
-the SQLite clip metadata database there, MP4s below `clips/`, and the
-`clip-token.key` encryption key. The default Compose file mounts the named
-`cutscene-data` volume at `/data`; it deliberately does not mount `/tmp`, which
-contains transient render jobs and may be cleared on restart.
+the SQLite clip metadata database there, MP4s below `clips/`, the
+`clip-token.key` encryption key, and `sessions.sqlite3` for browser sessions.
+The default Compose file mounts the named `cutscene-data` volume at `/data`; it
+deliberately does not mount `/tmp`, which contains transient render jobs and may
+be cleared on restart.
 
 If `storage.root` is omitted it defaults to `./data` relative to the CutScene
 process working directory. If `storage.database` is omitted it defaults to
 `clips.sqlite3` directly below that root; configured database paths must remain
 relative to the root.
+
+The container runs as the unprivileged `cutscene` user (uid 10001) and only
+writes below `storage.root` and `/tmp`. Upgrading from a release that kept
+`sessions.sqlite3` (previously `fiber.sqlite3`) in the working directory simply
+starts a new session database under `storage.root`; existing users are asked to
+sign in again.
 
 Do not use `docker compose down -v` unless you intend to delete the durable
 volume and all saved clips.

@@ -526,10 +526,6 @@ func DoFfmpeg(params FfmpegParams) (string, error) {
 	return tmpFile, err
 }
 
-func DoFfmpegPreview(fileURL, from, to string, subtitleFile string, subtitleIndex int, codec Codec, writer io.Writer, audioModes ...AudioMode) error {
-	return DoFfmpegPreviewContext(context.Background(), fileURL, from, to, subtitleFile, subtitleIndex, codec, writer, audioModes...)
-}
-
 // previewClientDisconnectWriter turns a response write failure into
 // cancellation of the FFmpeg context. Without this, FFmpeg can keep running
 // after fasthttp has closed the response pipe and hold the encoder limiter.
@@ -585,15 +581,13 @@ func isExpectedPreviewTermination(err error, writer io.Writer) bool {
 		isPreviewClientDisconnectError(err)
 }
 
-func DoFfmpegPreviewContext(ctx context.Context, fileURL, from, to string, subtitleFile string, subtitleIndex int, codec Codec, writer io.Writer, audioModes ...AudioMode) error {
-	return doFfmpegPreviewContext(ctx, fileURL, from, to, subtitleFile, subtitleIndex, codec, writer, 0, audioModes...)
-}
-
+// DoFfmpegPreviewContextWithSubtitleOffset streams a preview with the given
+// audio mode and a signed subtitle offset.
 func DoFfmpegPreviewContextWithSubtitleOffset(ctx context.Context, fileURL, from, to string, subtitleFile string, subtitleIndex int, codec Codec, writer io.Writer, audioMode AudioMode, subtitleOffsetMs int64) error {
 	return doFfmpegPreviewContext(ctx, fileURL, from, to, subtitleFile, subtitleIndex, codec, writer, subtitleOffsetMs, audioMode)
 }
 
-func doFfmpegPreviewContext(ctx context.Context, fileURL, from, to string, subtitleFile string, subtitleIndex int, codec Codec, writer io.Writer, subtitleOffsetMs int64, audioModes ...AudioMode) error {
+func doFfmpegPreviewContext(ctx context.Context, fileURL, from, to string, subtitleFile string, subtitleIndex int, codec Codec, writer io.Writer, subtitleOffsetMs int64, audioMode AudioMode) error {
 	if err := validateSubtitleOffsetMs(subtitleOffsetMs); err != nil {
 		return err
 	}
@@ -612,12 +606,6 @@ func doFfmpegPreviewContext(ctx context.Context, fileURL, from, to string, subti
 		"hwaccel":     "auto",
 		"hide_banner": "",
 		"loglevel":    "error",
-	}
-	audioMode := AudioModeStandard
-	if len(audioModes) > 1 {
-		return errors.New("multiple audio modes specified")
-	} else if len(audioModes) == 1 {
-		audioMode = audioModes[0]
 	}
 	outputArgs := ffmpeg.KwArgs{
 		"acodec": "aac",
