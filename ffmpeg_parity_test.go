@@ -33,9 +33,9 @@ func TestPreviewAndRenderProduceIdenticalArgs(t *testing.T) {
 		file  string
 		index int
 	}{
-		{name: "none"},
+		{name: "none", index: -1},
 		{name: "embedded", index: 2},
-		{name: "text", file: "/tmp/sub.srt"},
+		{name: "text", file: "/tmp/sub.srt", index: -1},
 	}
 
 	for _, codec := range codecs {
@@ -120,23 +120,25 @@ func assertNoDrift(t *testing.T, which string, render, preview ffmpeg.KwArgs) {
 	}
 }
 
-// TestTranscodeArgsNVENCDefaults pins the NVENC decode/encode arguments. The
-// preview path previously omitted extra_hw_frames and the constqp rate control
-// that the render path applied, so an NVENC preview did not represent the
-// render it preceded. These assertions exist to catch that class of removal,
-// which a preview-vs-render comparison cannot detect once both share one
-// builder.
+// TestTranscodeArgsNVENCDefaults pins the NVENC software-decode/GPU-upload
+// pipeline and encoder defaults.
 func TestTranscodeArgsNVENCDefaults(t *testing.T) {
 	input, output, err := buildArgsForTest(transcodeSpec{
 		Codec:            CodecH264NVENC,
 		Height:           defaultPreviewHeight,
+		SubtitleIndex:    -1,
 		FragmentedOutput: true,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := input["extra_hw_frames"]; got != 8 {
-		t.Errorf("input extra_hw_frames = %v, want 8 (NVENC previews need spare hardware frames)", got)
+	for _, key := range []string{"hwaccel", "hwaccel_output_format", "extra_hw_frames"} {
+		if _, ok := input[key]; ok {
+			t.Errorf("input unexpectedly retains %s: %v", key, input[key])
+		}
+	}
+	if got := output["vf"]; got != "format=yuv420p,hwupload_cuda,scale_cuda=-2:720" {
+		t.Errorf("output vf = %v, want software normalization, GPU upload, then GPU scaling", got)
 	}
 	if got := output["rc"]; got != "constqp" {
 		t.Errorf("output rc = %v, want constqp when no QP is requested", got)
@@ -146,6 +148,54 @@ func TestTranscodeArgsNVENCDefaults(t *testing.T) {
 	}
 	if got := output["b:v"]; got != "0K" {
 		t.Errorf("output b:v = %v, want 0K under constqp", got)
+	}
+}
+
+func TestTranscodeArgsNVENCSubtitlePipelines(t *testing.T) {
+	tests := []struct {
+		name, file          string
+		index, height       int
+		offset              int64
+		wantVF, wantComplex string
+		wantMap             bool
+	}{
+		{name: "none_height0", index: -1, wantVF: "format=yuv420p,hwupload_cuda"},
+		{name: "none_height720", index: -1, height: 720, wantVF: "format=yuv420p,hwupload_cuda,scale_cuda=-2:720"},
+		{name: "text_height0", file: "/tmp/sub.srt", index: -1, wantVF: "subtitles=filename='/tmp/sub.srt',format=yuv420p,hwupload_cuda"},
+		{name: "text_height720", file: "/tmp/sub.srt", index: -1, height: 720, wantVF: "subtitles=filename='/tmp/sub.srt',format=yuv420p,hwupload_cuda,scale_cuda=-2:720"},
+		{name: "pgs_positive", index: 2, height: 720, offset: 250, wantComplex: "[0:s:2]setpts=PTS+250/1000/TB[sub];[0:v][sub]overlay,format=yuv420p,hwupload_cuda,scale_cuda=-2:720[out]", wantMap: true},
+		{name: "pgs_negative_height0", index: 2, offset: -125, wantComplex: "[0:s:2]setpts=PTS-125/1000/TB[sub];[0:v][sub]overlay,format=yuv420p,hwupload_cuda[out]", wantMap: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			input := ffmpeg.KwArgs{"hwaccel": "cuda", "hwaccel_output_format": "cuda", "extra_hw_frames": 8}
+			output := ffmpeg.KwArgs{}
+			err := buildTranscodeArgs(transcodeSpec{Codec: CodecH264NVENC, Height: tt.height, SubtitleFile: tt.file, SubtitleIndex: tt.index, SubtitleOffsetMs: tt.offset}, input, output)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if output["vcodec"] != CodecH264NVENC {
+				t.Errorf("vcodec = %v", output["vcodec"])
+			}
+			for _, key := range []string{"hwaccel", "hwaccel_output_format", "extra_hw_frames"} {
+				if _, ok := input[key]; ok {
+					t.Errorf("input retains %s=%v", key, input[key])
+				}
+			}
+			if tt.wantVF != "" && output["vf"] != tt.wantVF {
+				t.Errorf("vf = %q, want %q", output["vf"], tt.wantVF)
+			}
+			if tt.wantComplex != "" && output["filter_complex"] != tt.wantComplex {
+				t.Errorf("filter_complex = %q, want %q", output["filter_complex"], tt.wantComplex)
+			}
+			if tt.wantMap {
+				if fmt.Sprint(output["map"]) != "[[out] 0:a:0?]" {
+					t.Errorf("map = %v", output["map"])
+				}
+			} else if _, ok := output["map"]; ok {
+				t.Errorf("unexpected map: %v", output["map"])
+			}
+		})
 	}
 }
 
