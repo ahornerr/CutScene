@@ -346,11 +346,6 @@ func buildTranscodeArgs(spec transcodeSpec, inputArgs, outputArgs ffmpeg.KwArgs)
 		inputArgs["hwaccel"] = "vaapi"
 		inputArgs["hwaccel_device"] = "/dev/dri/renderD128"
 		inputArgs["hwaccel_output_format"] = "vaapi"
-	case CodecH264NVENC:
-		inputArgs["hwaccel"] = "cuda"
-		// Extra hardware frames keep subtitle and scale filters from starving
-		// the decoder on long clips.
-		inputArgs["extra_hw_frames"] = 8
 	case CodecLibx264:
 		fallthrough
 	default:
@@ -370,16 +365,27 @@ func buildTranscodeArgs(spec transcodeSpec, inputArgs, outputArgs ffmpeg.KwArgs)
 		}
 		outputArgs["compression_level"] = "0"
 	case CodecH264NVENC:
+		// NVENC consumes CUDA frames, but CUDA/NVDEC decoding is not reliable
+		// for every source. Decode and perform subtitle work in software, then
+		// normalize to 8-bit before uploading for GPU scaling and encoding.
+		delete(inputArgs, "hwaccel")
+		delete(inputArgs, "hwaccel_output_format")
+		delete(inputArgs, "extra_hw_frames")
 		if spec.SubtitleIndex >= 0 {
-			outputArgs["filter_complex"] = subtitleOverlayFilter(spec.SubtitleIndex, spec.SubtitleOffsetMs, ",hwupload_cuda,"+scaleCUDAFilter(spec.Height)+"[out]")
+			suffix := ",format=yuv420p,hwupload_cuda"
+			if filter := scaleCUDAFilter(spec.Height); filter != "" {
+				suffix += "," + filter
+			}
+			outputArgs["filter_complex"] = subtitleOverlayFilter(spec.SubtitleIndex, spec.SubtitleOffsetMs, suffix+"[out]")
 			outputArgs["map"] = []string{"[out]", "0:a:0?"}
 		} else if spec.SubtitleFile != "" {
 			configureNVENCTextSubtitle(inputArgs, outputArgs, spec.SubtitleFile, spec.Height)
 		} else {
-			inputArgs["hwaccel_output_format"] = "cuda"
+			vf := "format=yuv420p,hwupload_cuda"
 			if filter := scaleCUDAFilter(spec.Height); filter != "" {
-				outputArgs["vf"] = filter
+				vf += "," + filter
 			}
+			outputArgs["vf"] = vf
 		}
 		if spec.QP == 0 {
 			// Without an explicit QP, pin NVENC to constant quantization so a
