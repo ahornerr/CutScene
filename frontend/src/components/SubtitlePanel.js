@@ -1,4 +1,4 @@
-import {Box, FormControl, InputLabel, MenuItem, Select, Typography} from "@mui/material";
+import {Box, FormControl, IconButton, InputLabel, MenuItem, Select, Tooltip, Typography} from "@mui/material";
 import SubtitleList from "./SubtitleList";
 import SubtitleOffsetControl from "./SubtitleOffsetControl";
 import {orderSubtitleStreams, subtitleFormat} from "./subtitle-formats";
@@ -8,7 +8,7 @@ import {orderSubtitleStreams, subtitleFormat} from "./subtitle-formats";
 // timing controls sit together; the offset is retained across subtitle
 // selections and applied to both preview and render requests.
 export default function SubtitlePanel({
-  streams, selectedSubtitle, onSubtitleChange, streamsLoading, streamsError,
+  streams, selectedSubtitle, onSubtitleChange, downloadUrl, streamsLoading, streamsError,
   subtitleOffsetMs, onSubtitleOffsetChange,
   listMode, listEntries, totalCount, anchor, selectionRange,
   onPick, search, onSearchChange, onClearSearch,
@@ -53,6 +53,15 @@ export default function SubtitlePanel({
             })}
           </Select>
         </FormControl>
+        {downloadUrl && (
+          <Tooltip title="Download subtitle (.srt)">
+            <IconButton component="a" href={downloadUrl} download size="small" aria-label="Download subtitle">
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+                <path d="M5 20h14v-2H5v2zM19 9h-4V3H9v6H5l7 7 7-7z"/>
+              </svg>
+            </IconButton>
+          </Tooltip>
+        )}
         {currentFormat && (
           <Typography variant="caption" sx={{fontFamily: 'var(--cs-mono-font)', color: 'text.secondary'}}>
             {currentFormat}

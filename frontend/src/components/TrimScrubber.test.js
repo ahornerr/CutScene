@@ -50,6 +50,17 @@ test('exactly the minimum 500ms range is accepted for typed timestamps', () => {
   expect(baseProps.onStartChange).toHaveBeenCalledWith(59500);
 });
 
+test('typed timestamps accept an SRT comma before the milliseconds', () => {
+  render(<TrimScrubber {...baseProps}/>);
+  const start = screen.getByRole('textbox', {name: 'Start time as hours minutes seconds milliseconds'});
+
+  fireEvent.focus(start);
+  fireEvent.change(start, {target: {value: '00:00:12,300'}});
+  fireEvent.blur(start);
+
+  expect(baseProps.onStartChange).toHaveBeenCalledWith(12300);
+});
+
 test('nudge controls disable at the exact minimum boundary', () => {
   render(<TrimScrubber {...baseProps} startPosition={59500} endPosition={60000}/>);
 

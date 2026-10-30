@@ -147,7 +147,8 @@ function Timeline({label, detail, min, max, value, step, shiftStep, onChange, on
 
 function parseTimeToMillis(input) {
   if (input == null) return null
-  const parts = String(input).trim().split(':')
+  // SRT timestamps use a comma before the milliseconds; accept it like a dot.
+  const parts = String(input).trim().replace(',', '.').split(':')
   if (!parts[0] || parts.length > 3 || parts.some(part => part.trim() === '')) return null
   const nums = parts.map(p => Number(p))
   if (nums.some(n => !Number.isFinite(n) || n < 0)) return null

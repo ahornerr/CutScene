@@ -1275,33 +1275,11 @@ func (a *Application) GetSubtitleEntriesForSource(ctx context.Context, ratingKey
 		return entries, nil
 	}
 
-	fileURL := ""
-	var releaseCapability func()
-	if AuthTokenFromContext(operationCtx) != nil {
-		access, resolver, accessErr := a.callerPlexAccess(operationCtx, "")
-		if accessErr != nil {
-			return nil, errors.New("caller Plex access is unavailable")
-		}
-		proxy, proxyErr := a.ensureMediaProxy()
-		if proxyErr != nil {
-			return nil, errors.New("Plex capability proxy is unavailable")
-		}
-		_ = resolver
-		fileURL, releaseCapability, err = proxy.Issue(operationCtx, access, part.Key)
-		if err != nil {
-			return nil, err
-		}
-		defer releaseCapability()
-	} else {
-		if localPath, ok := a.resolveLocalPartFile(part); ok {
-			fileURL = localPath
-		} else {
-			fileURL, err = a.buildPlexSourceURL(part.Key, a.plexSourceToken(operationCtx, false))
-			if err != nil {
-				return nil, err
-			}
-		}
+	fileURL, releaseCapability, err := a.subtitleMediaURL(operationCtx, part)
+	if err != nil {
+		return nil, err
 	}
+	defer releaseCapability()
 
 	release, err := a.acquireFFmpeg(operationCtx)
 	if err != nil {
@@ -1327,6 +1305,108 @@ func (a *Application) GetSubtitleEntriesForSource(ctx context.Context, ratingKey
 	a.subtitleCache.setForCaller(cacheKey, entries, callerID)
 
 	return entries, nil
+}
+
+// DownloadSubtitleForSource returns the selected subtitle track as SRT bytes
+// (comma millisecond separators) so it can be inspected or fixed by hand. When
+// an external subtitle can't be parsed, the raw upstream file is returned
+// instead, since that is exactly the case where manual inspection is needed.
+func (a *Application) DownloadSubtitleForSource(ctx context.Context, ratingKeyStr, mediaIdStr, partIdStr string, subtitleIndex int) ([]byte, error) {
+	operationCtx, cancelOperation := a.operationContext(ctx)
+	defer cancelOperation()
+
+	metadata, err := a.getMetadataItem(operationCtx, ratingKeyStr, AuthTokenFromContext(operationCtx) != nil)
+	if err != nil {
+		return nil, fmt.Errorf("could not get library metadata: %w", err)
+	}
+	_, part, err := resolveRequestedSource(metadata, mediaIdStr, partIdStr)
+	if err != nil {
+		return nil, err
+	}
+	if part == nil {
+		return nil, errors.New("subtitle source is unavailable")
+	}
+	source, err := selectSubtitleSource(part.Stream, subtitleIndex)
+	if err != nil {
+		return nil, err
+	}
+	if source.PGS {
+		return nil, fmt.Errorf("PGS subtitles cannot be extracted as text")
+	}
+
+	if source.External {
+		if !isSupportedTextSubtitle(source) {
+			return nil, fmt.Errorf("external subtitle codec is not supported")
+		}
+		var body []byte
+		if AuthTokenFromContext(operationCtx) != nil {
+			access, resolver, accessErr := a.callerPlexAccess(operationCtx, "")
+			if accessErr != nil {
+				return nil, errors.New("caller Plex access is unavailable")
+			}
+			body, err = a.fetchSubtitleBodyWithAccess(operationCtx, source.StreamKey, access, resolver)
+		} else {
+			body, err = a.fetchSubtitleBodyWithToken(operationCtx, source.StreamKey, a.plexSourceToken(operationCtx, false))
+		}
+		if err != nil {
+			return nil, fmt.Errorf("could not download external subtitle: %w", err)
+		}
+		entries, parseErr := parseSubtitleBody(body, subtitleSourceCodec(source))
+		if parseErr != nil || len(entries) == 0 {
+			return body, nil
+		}
+		return renderSRT(entries), nil
+	}
+
+	fileURL, releaseCapability, err := a.subtitleMediaURL(operationCtx, part)
+	if err != nil {
+		return nil, err
+	}
+	defer releaseCapability()
+
+	release, err := a.acquireFFmpeg(operationCtx)
+	if err != nil {
+		return nil, fmt.Errorf("could not acquire encoder: %w", err)
+	}
+	tmpFile, err := extractSubtitleFullContextFn(operationCtx, fileURL, source.EmbeddedIndex)
+	release()
+	if err != nil {
+		return nil, fmt.Errorf("could not extract subtitle: %w", err)
+	}
+	defer os.Remove(tmpFile)
+	return os.ReadFile(tmpFile)
+}
+
+func renderSRT(entries []SubtitleEntry) []byte {
+	var b strings.Builder
+	for i, e := range entries {
+		fmt.Fprintf(&b, "%d\n%s --> %s\n%s\n\n", i+1, formatSRTTimestamp(e.Start), formatSRTTimestamp(e.End), e.Text)
+	}
+	return []byte(b.String())
+}
+
+// subtitleMediaURL resolves the media location ffmpeg reads embedded subtitle
+// streams from. The returned release func is always non-nil on success.
+func (a *Application) subtitleMediaURL(ctx context.Context, part *components.Part) (string, func(), error) {
+	if AuthTokenFromContext(ctx) != nil {
+		access, _, err := a.callerPlexAccess(ctx, "")
+		if err != nil {
+			return "", nil, errors.New("caller Plex access is unavailable")
+		}
+		proxy, err := a.ensureMediaProxy()
+		if err != nil {
+			return "", nil, errors.New("Plex capability proxy is unavailable")
+		}
+		return proxy.Issue(ctx, access, part.Key)
+	}
+	if localPath, ok := a.resolveLocalPartFile(part); ok {
+		return localPath, func() {}, nil
+	}
+	fileURL, err := a.buildPlexSourceURL(part.Key, a.plexSourceToken(ctx, false))
+	if err != nil {
+		return "", nil, err
+	}
+	return fileURL, func() {}, nil
 }
 
 // resolveLocalRawPath applies any configured path mappings to rawPath and
@@ -1394,6 +1474,14 @@ func (a *Application) downloadSubtitle(ctx context.Context, streamKey, codec str
 }
 
 func (a *Application) downloadSubtitleWithAccess(ctx context.Context, streamKey, codec string, access *PlexAccess, resolver *PlexResourceResolver) ([]SubtitleEntry, error) {
+	body, err := a.fetchSubtitleBodyWithAccess(ctx, streamKey, access, resolver)
+	if err != nil {
+		return nil, err
+	}
+	return parseSubtitleBody(body, codec)
+}
+
+func (a *Application) fetchSubtitleBodyWithAccess(ctx context.Context, streamKey string, access *PlexAccess, resolver *PlexResourceResolver) ([]byte, error) {
 	request, err := newPlexRequest(ctx, access, http.MethodGet, streamKey)
 	if err != nil {
 		return nil, err
@@ -1410,10 +1498,18 @@ func (a *Application) downloadSubtitleWithAccess(ctx context.Context, streamKey,
 	if err != nil || len(body) > maxLibraryResponseBytes {
 		return nil, errors.New("subtitle response exceeds size limit")
 	}
-	return parseSubtitleBody(body, codec)
+	return body, nil
 }
 
 func (a *Application) downloadSubtitleWithToken(ctx context.Context, streamKey, codec, token string) ([]SubtitleEntry, error) {
+	body, err := a.fetchSubtitleBodyWithToken(ctx, streamKey, token)
+	if err != nil {
+		return nil, err
+	}
+	return parseSubtitleBody(body, codec)
+}
+
+func (a *Application) fetchSubtitleBodyWithToken(ctx context.Context, streamKey, token string) ([]byte, error) {
 	if strings.TrimSpace(streamKey) == "" {
 		return nil, errors.New("subtitle stream key is required")
 	}
@@ -1469,7 +1565,7 @@ func (a *Application) downloadSubtitleWithToken(ctx context.Context, streamKey, 
 		return nil, errors.New("subtitle response exceeds size limit")
 	}
 
-	return parseSubtitleBody(body, codec)
+	return body, nil
 }
 
 func parseSubtitleBody(body []byte, codec string) ([]SubtitleEntry, error) {

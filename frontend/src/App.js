@@ -1435,6 +1435,7 @@ const handleLibraryAuthRequired = useCallback(() => setNeedsAuth(true), [])
               streams={subtitleStreams}
               selectedSubtitle={selectedSubtitle}
               onSubtitleChange={setSelectedSubtitle}
+              downloadUrl={selectedSubtitle >= 0 ? `/subtitles/${selectedSession.ratingKey}/download?subtitle=${selectedSubtitle}&mediaId=${selectedSession.Media[0].Part[0].id}${partIdParam(selectedSession)}` : null}
               streamsLoading={streamsLoading}
               streamsError={streamsError}
               listMode={subtitleSearch.trim() ? 'search' : 'full'}

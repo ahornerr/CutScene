@@ -121,6 +121,7 @@ func NewAPI(config Config, app *Application) (*API, error) {
 	api.http.Get("/library/metadata/:ratingKey/children", api.getLibraryMetadataChildren, api.authMiddlewareJSON)
 	api.http.Get("/thumb", api.thumb, api.authMiddleware)
 	api.http.Get("/streams/:ratingKey", api.getStreams, api.authMiddleware)
+	api.http.Get("/subtitles/:ratingKey/download", api.downloadSubtitle, api.authMiddleware)
 	api.http.Get("/subtitles/:ratingKey", api.getSubtitleEntries, api.authMiddleware)
 	api.http.Post("/subtitle-search/index", api.indexSubtitleSearch, api.authMiddlewareJSON)
 	api.http.Post("/subtitle-search/index-all", api.indexAllSubtitleSearch, api.authMiddlewareJSON)
@@ -675,6 +676,29 @@ func (a *API) getSubtitleEntries(ctx fiber.Ctx) error {
 	}
 
 	return ctx.JSON(entries)
+}
+
+func (a *API) downloadSubtitle(ctx fiber.Ctx) error {
+	ratingKeyStr := ctx.Params("ratingKey")
+	if ratingKeyStr == "" || len(ratingKeyStr) > 512 {
+		return renderAPIErrorCode(ctx, http.StatusUnprocessableEntity, "validation_error", "ratingKey is required")
+	}
+	if _, _, err := parseSourceQuery(ctx); err != nil {
+		return renderAPIErrorCode(ctx, http.StatusUnprocessableEntity, "validation_error", err.Error())
+	}
+	subtitleIndex, err := strconv.Atoi(ctx.Query("subtitle", "-1"))
+	if err != nil || subtitleIndex < 0 {
+		return renderAPIErrorCode(ctx, http.StatusUnprocessableEntity, "validation_error", "subtitle must be a non-negative integer")
+	}
+
+	body, err := a.app.DownloadSubtitleForSource(ctx.UserContext(), ratingKeyStr, ctx.Query("mediaId"), ctx.Query("partId"), subtitleIndex)
+	if err != nil {
+		return renderSourceAPIError(ctx, err)
+	}
+	ctx.Set("Content-Type", "application/x-subrip; charset=utf-8")
+	ctx.Set("Content-Disposition", fmt.Sprintf(`attachment; filename="subtitle-%d.srt"`, subtitleIndex))
+	ctx.Set("Cache-Control", "no-store")
+	return ctx.Send(body)
 }
 
 func (a *API) thumb(ctx fiber.Ctx) error {
